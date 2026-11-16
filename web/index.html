@@ -841,8 +841,16 @@ const SETTINGS = [
 ];
 let settingsSig = "";
 const settingOf = (key) => key.split(".").reduce((o, k) => o && o[k], data && data.settings);
+// a click shows at once; saves go one at a time, and a setting changed again while one is saving waits with
+// its latest value, so the last click wins (a save finishing late can't undo it)
+let settingsSaving = false;
+const settingsQueue = new Map();
 async function setSetting(key, value) {
   if (offline()) { toast("Settings are paused until the server is back"); return; }
+  const st = settingOf(key);
+  if (st) { st.value = value; settingsSig = ""; renderSettings(); focusKey("set:" + key + (typeof value === "boolean" ? "" : ":" + value)); }
+  if (settingsSaving) { settingsQueue.delete(key); settingsQueue.set(key, value); return; }
+  settingsSaving = true;
   try {
     const r = await fetch("/api/action", {
       method: "POST", headers: { "X-CC-Token": TOKEN, "Content-Type": "application/json" },
@@ -850,10 +858,15 @@ async function setSetting(key, value) {
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
-    data.settings = j.settings; settingsSig = ""; renderSettings(); focusKey("set:" + key + (typeof value === "boolean" ? "" : ":" + value));
-    toast("Saved");
-    etag = ""; load();
-  } catch (e) { toast("Failed: " + e.message); }
+    if (!settingsQueue.size) { data.settings = j.settings; settingsSig = ""; renderSettings(); toast("Saved"); }
+  } catch (e) {
+    settingsQueue.clear(); toast("Failed: " + e.message);
+  } finally {
+    settingsSaving = false;
+    const next = settingsQueue.entries().next().value;
+    if (next) { settingsQueue.delete(next[0]); setSetting(next[0], next[1]); }
+    else { etag = ""; load(); } // the server's view of every setting, also after a failure
+  }
 }
 function openSettings() { ui.settings = true; if (ui.drawer) closeDrawer(); settingsSig = ""; renderSettings(); setTimeout(() => focusKey("set-close"), 0); }
 function closeSettings() { ui.settings = false; settingsSig = ""; renderSettings(); focusKey("settings"); }
@@ -865,6 +878,7 @@ function renderSettings() {
   if (sig === settingsSig) return;
   settingsSig = sig;
   const body = host.querySelector(".dr-body"), scroll = body ? body.scrollTop : 0;
+  const a = document.activeElement, keep = a && host.contains(a) && a.dataset ? a.dataset.key : ""; // redrawn: focus it again
   const locked = (st) => st && st.locked ? h("p", { class: "cutnote" }, "Set by " + st.locked + " in the dashboard's environment; that wins over this setting.") : null;
   host.replaceChildren(
     h("div", { class: "scrim", onclick: closeSettings }),
@@ -891,6 +905,7 @@ function renderSettings() {
           locked(st));
       }))));
   const d = host.querySelector(".dr-body"); if (d) d.scrollTop = scroll;
+  if (keep) focusKey(keep);
 }
 
 // ---- interactions ----
@@ -926,6 +941,17 @@ document.addEventListener("keydown", (e) => {
     else if (ui.drawer) closeDrawer();
     else if (ui.hint || ui.legend) { ui.hint = ui.legend = false; renderHint(); renderLegend(); }
     else if (t === $("q") && ui.q) { $("q").value = ""; ui.q = ""; render(); }
+    return;
+  }
+  // the settings panel and the session drawer are modal: the page's shortcuts (/, j/k, r, .) would act on
+  // sessions behind them, and Tab would leave them, so Tab cycles inside the open one and nothing else runs
+  const dialog = ui.settings ? document.querySelector("#settingsHost .drawer") : ui.drawer ? document.querySelector("#drawerHost .drawer") : null;
+  if (dialog) {
+    if (e.key === "Tab") {
+      const f = [...dialog.querySelectorAll("button:not([disabled]), a[href], textarea, input, [tabindex]:not([tabindex='-1'])")];
+      const i = f.indexOf(document.activeElement);
+      if (f.length && (i < 0 || (e.shiftKey ? i === 0 : i === f.length - 1))) { e.preventDefault(); f[e.shiftKey ? f.length - 1 : 0].focus(); }
+    }
     return;
   }
   if (typing || e.ctrlKey || e.metaKey || e.altKey) return;

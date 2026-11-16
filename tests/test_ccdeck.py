@@ -231,8 +231,9 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual([r["number"] for r in cc.review_requests([])], [6])
         cc.save_json(cc.CONFIG_FILE, {"review_requests": "off"})
         self.assertIsNone(cc.fetch_review_requests())
-        cc.save_json(cc.CONFIG_FILE, {"review_requests": "bogus"})
-        self.assertEqual(cc.review_scope(), "all")
+        for bad in ("bogus", [], {}, ["mine"], 1):  # lists and dicts aren't hashable: they must not crash
+            cc.save_json(cc.CONFIG_FILE, {"review_requests": bad})
+            self.assertEqual(cc.review_scope(), "all", bad)
         with mock.patch.dict(os.environ, {"CCDECK_REVIEW_REQUESTS": "0"}):
             self.assertEqual(cc.review_scope(), "off")
         self.assertEqual(self.state("s-pr-failing"), "ci_failing")
@@ -834,9 +835,29 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(set_("notifications.desktop", False)[0], 200)
         self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}),
                          {"review_requests": "mine", "approvals": True, "notifications": {"desktop": False}})
-        for key, value in (("review_requests", "team"), ("approvals", "yes"), ("notifications.sms", True), ("token", "x"), (None, 1)):
+        for key, value in (("review_requests", "team"), ("review_requests", []), ("review_requests", {}),
+                           ("approvals", "yes"), ("notifications.sms", True), ("token", "x"), (None, 1)):
             self.assertEqual(set_(key, value)[0], 400, key)
         self.assertEqual(self.req("/api/action", token=False, data={"action": "set_setting", "key": "approvals", "value": True})[0], 403)
+
+    def test_concurrent_settings_changes_all_kept(self):
+        """Each change reads config.json and saves it whole: without the lock, one would undo another."""
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        cc.CONFIG_FILE.unlink(missing_ok=True)
+        real_load = cc.load_json
+        def slow_load(path, default):  # widen the gap between reading and saving
+            v = real_load(path, default)
+            time.sleep(0.05)
+            return v
+        changes = [("review_requests", "mine"), ("approvals", True), ("notifications.desktop", False)] * 3
+        with mock.patch.object(cc, "load_json", slow_load):
+            threads = [threading.Thread(target=cc.set_setting, args=c) for c in changes]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}),
+                         {"review_requests": "mine", "approvals": True, "notifications": {"desktop": False}})
 
     def test_resume_of_an_open_session_never_starts_a_second_one(self):
         saved = cc.peer_sessions, cc.focus_terminal, cc.open_terminal

@@ -827,7 +827,7 @@ def review_scope():
         return "off"
     cfg = load_json(CONFIG_FILE, {})
     v = cfg.get("review_requests") if isinstance(cfg, dict) else None
-    return v if v in REVIEW_SCOPES else "all"
+    return v if isinstance(v, str) and v in REVIEW_SCOPES else "all"  # a list or dict there isn't hashable
 
 
 def fetch_review_requests(scope=None):
@@ -2279,18 +2279,24 @@ def settings_view():
 
 def set_setting(key, value):
     """Save one setting to config.json. key is review_requests, approvals or notifications.<channel>.
-    Raises ValueError for an unknown key or a value it can't take."""
-    cfg = load_json(CONFIG_FILE, {})
-    cfg = cfg if isinstance(cfg, dict) else {}
-    if key == "review_requests" and value in REVIEW_SCOPES:
-        cfg["review_requests"] = value
-    elif key == "approvals" and isinstance(value, bool):
-        cfg["approvals"] = value
-    elif key.startswith("notifications.") and key.split(".", 1)[1] in NOTIFY_CHANNELS and isinstance(value, bool):
-        cfg["notifications"] = {**notify_settings(cfg), key.split(".", 1)[1]: value}
-    else:
+    Raises ValueError for an unknown key or a value it can't take.
+    The dashboard (a thread per request) and the ccdeck commands (other processes) all write config.json,
+    each reading the whole file and saving it back, so a file lock keeps one from undoing another's change."""
+    import fcntl
+    if not (key == "review_requests" and isinstance(value, str) and value in REVIEW_SCOPES
+            or key == "approvals" and isinstance(value, bool)
+            or key.startswith("notifications.") and key.split(".", 1)[1] in NOTIFY_CHANNELS and isinstance(value, bool)):
         raise ValueError(f"can't set {key} to {value!r}")
-    save_json(CONFIG_FILE, cfg)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DATA_DIR / "config.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes
+        cfg = load_json(CONFIG_FILE, {})
+        cfg = cfg if isinstance(cfg, dict) else {}
+        if key.startswith("notifications."):
+            cfg["notifications"] = {**notify_settings(cfg), key.split(".", 1)[1]: value}
+        else:
+            cfg[key] = value
+        save_json(CONFIG_FILE, cfg)
 
 
 def cmd_approvals(args):
