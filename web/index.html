@@ -840,15 +840,19 @@ const SETTINGS = [
   { key: "approvals", title: "Approve from the dashboard", d: "Allow or deny permission prompts here as well as in the terminal" },
 ];
 let settingsSig = "";
-const settingOf = (key) => key.split(".").reduce((o, k) => o && o[k], data && data.settings);
-// a click shows at once; saves go one at a time, and a setting changed again while one is saving waits with
-// its latest value, so the last click wins (a save finishing late can't undo it)
+// a click shows at once and saves in order: a setting clicked again while one saves waits with its latest value,
+// so the last click wins. Clicked values wait in settingsPending until saved, laid over the snapshots load()
+// brings every 2 s: one taken before the save would otherwise undo the click (and make the next look like a no-op)
+const settingsPending = new Map();
+const settingOf = (key) => {
+  const st = key.split(".").reduce((o, k) => o && o[k], data && data.settings);
+  return st && settingsPending.has(key) ? Object.assign({}, st, { value: settingsPending.get(key) }) : st;
+};
 let settingsSaving = false;
 const settingsQueue = new Map();
 async function setSetting(key, value) {
   if (offline()) { toast("Settings are paused until the server is back"); return; }
-  const st = settingOf(key);
-  if (st) { st.value = value; settingsSig = ""; renderSettings(); focusKey("set:" + key + (typeof value === "boolean" ? "" : ":" + value)); }
+  settingsPending.set(key, value); settingsSig = ""; renderSettings(); focusKey("set:" + key + (typeof value === "boolean" ? "" : ":" + value));
   if (settingsSaving) { settingsQueue.delete(key); settingsQueue.set(key, value); return; }
   settingsSaving = true;
   try {
@@ -858,9 +862,11 @@ async function setSetting(key, value) {
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
-    if (!settingsQueue.size) { data.settings = j.settings; settingsSig = ""; renderSettings(); toast("Saved"); }
+    if (settingsPending.get(key) === value && !settingsQueue.has(key)) settingsPending.delete(key); // saved, nothing newer
+    data.settings = j.settings; settingsSig = ""; renderSettings();
+    if (!settingsQueue.size) toast("Saved");
   } catch (e) {
-    settingsQueue.clear(); toast("Failed: " + e.message);
+    settingsQueue.clear(); settingsPending.clear(); toast("Failed: " + e.message);
   } finally {
     settingsSaving = false;
     const next = settingsQueue.entries().next().value;
@@ -874,7 +880,7 @@ function renderSettings() {
   $("settingsBtn").setAttribute("aria-expanded", ui.settings ? "true" : "false");
   const host = $("settingsHost");
   if (!ui.settings || !data || !data.settings) { host.replaceChildren(); return; }
-  const sig = JSON.stringify(data.settings) + "|" + offline();
+  const sig = JSON.stringify(data.settings) + JSON.stringify([...settingsPending]) + "|" + offline();
   if (sig === settingsSig) return;
   settingsSig = sig;
   const body = host.querySelector(".dr-body"), scroll = body ? body.scrollTop : 0;
