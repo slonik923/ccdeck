@@ -2202,6 +2202,7 @@ def preview_config_dir():
     for link, real in ((cfg / "projects", PROJECTS_DIR), (cfg / "ccdeck" / "state", STATE_DIR),
                        (cfg / "sessions", CLAUDE_DIR / "sessions")):
         real.mkdir(parents=True, exist_ok=True)
+        real = real.resolve()  # a relative CLAUDE_CONFIG_DIR would make the link relative to the preview folder
         if link.is_symlink() or link.exists():
             if link.is_symlink() and os.readlink(link) == str(real):
                 continue
@@ -2219,6 +2220,10 @@ def stop_preview(quiet=False):
     """Stop the running preview and wait until it has (so its port is free). False if it wouldn't stop."""
     info = load_json(PREVIEW_DIR / "preview.json", {})
     pid, start = info.get("pid"), info.get("pid_start")
+    if pid and not start:  # pid_alive(pid, None) accepts any process that has the pid now: don't signal it
+        print(f"Can't tell whether pid {pid} is still the preview; if it is, stop it yourself.", file=sys.stderr)
+        (PREVIEW_DIR / "preview.json").unlink(missing_ok=True)
+        return False
     if not (pid and pid_alive(pid, start)):
         if not quiet:
             print("No preview is running.")
@@ -2244,8 +2249,18 @@ def stop_preview(quiet=False):
 
 
 def cmd_preview(args):
-    if args.target == "stop":
-        return stop_preview()
+    """Stop and start go one at a time: two at once could both find the port free, and preview.json end up
+    naming the one that failed, so `stop` couldn't stop the one running."""
+    import fcntl
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PREVIEW_DIR / "preview.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes
+        if args.target == "stop":
+            return stop_preview()
+        return start_preview(args)
+
+
+def start_preview(args):
     try:
         src, label = resolve_preview(args.target, args.repo, args.trust)
     except (OSError, ValueError, RuntimeError) as e:  # network, GitHub or archive problems
@@ -2273,7 +2288,16 @@ def cmd_preview(args):
     log = open(PREVIEW_DIR / "serve.log", "w")
     proc = subprocess.Popen([sys.executable, str(src / "ccdeck"), "serve", "--port", str(args.port)], env=env,
                             stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-    save_json(PREVIEW_DIR / "preview.json", {"pid": proc.pid, "pid_start": proc_start_time(proc.pid), "port": args.port,
+    start = None
+    for _ in range(20):  # without /proc, ps is cached for a second and may predate the child: read it afresh
+        _ps_cache["t"] = 0
+        if (start := proc_start_time(proc.pid)) or proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    if not start:
+        proc.terminate()
+        sys.exit(f"The preview didn't start; see {short_path(PREVIEW_DIR / 'serve.log')}.")
+    save_json(PREVIEW_DIR / "preview.json", {"pid": proc.pid, "pid_start": start, "port": args.port,
                                              "label": label, "source": str(src), "started": time.time()})
     import urllib.request
     url = f"http://localhost:{args.port}"

@@ -1140,6 +1140,39 @@ class PreviewTest(unittest.TestCase):
         self.assertIn("in use", str(e.exception.code))
         self.assertEqual(started, [])
 
+    def test_config_dir_links_resolve_with_a_relative_config_dir(self):
+        """CLAUDE_CONFIG_DIR=.claude: the links must lead to the real folders, not to paths inside the preview."""
+        cwd = os.getcwd()
+        os.chdir(TMP)
+        self.addCleanup(os.chdir, cwd)
+        rel = Path("rel-claude") / "projects"
+        with mock.patch.object(cc, "PROJECTS_DIR", rel):
+            cfg = cc.preview_config_dir()
+        self.assertEqual((cfg / "projects").resolve(), (TMP / rel).resolve())
+
+    def test_stop_never_signals_a_pid_it_cant_identify(self):
+        cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": os.getpid(), "pid_start": None, "label": "x"})
+        with mock.patch.object(cc.os, "kill") as kill, mock.patch("builtins.print"):
+            self.assertFalse(cc.stop_preview())
+        kill.assert_not_called()
+
+    def test_preview_commands_run_one_at_a_time(self):
+        active, overlap = [], []
+        def start(args):
+            active.append(1)
+            if len(active) > 1:
+                overlap.append(1)
+            time.sleep(0.2)
+            active.pop()
+        with mock.patch.object(cc, "start_preview", start):
+            threads = [threading.Thread(target=cc.cmd_preview, args=(mock.Mock(target="34"),)) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(overlap, [])
+
     def test_config_dir_drops_a_stale_copy(self):
         """No config.json of yours: the preview starts without one, not with the last preview's changes."""
         cc.CONFIG_FILE.unlink(missing_ok=True)
@@ -1185,9 +1218,9 @@ class PreviewTest(unittest.TestCase):
         cc.save_json(cc.CONFIG_FILE, {"review_requests": "mine"})
         self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
         cfg = cc.preview_config_dir()
-        self.assertEqual(os.readlink(cfg / "projects"), str(cc.PROJECTS_DIR))
-        self.assertEqual(os.readlink(cfg / "ccdeck" / "state"), str(cc.STATE_DIR))
-        self.assertEqual(os.readlink(cfg / "sessions"), str(cc.CLAUDE_DIR / "sessions"))  # which sessions are open
+        self.assertEqual((cfg / "projects").resolve(), cc.PROJECTS_DIR.resolve())
+        self.assertEqual((cfg / "ccdeck" / "state").resolve(), cc.STATE_DIR.resolve())
+        self.assertEqual((cfg / "sessions").resolve(), (cc.CLAUDE_DIR / "sessions").resolve())  # which sessions are open
         copied = cfg / "ccdeck" / "config.json"
         self.assertFalse(copied.is_symlink())
         self.assertEqual(cc.load_json(copied, {}), {"review_requests": "mine"})
