@@ -82,7 +82,7 @@ ccdeck notifications setup
 
 It goes through these steps, and you can run it again any time to check:
 
-1. **Install.** If `terminal-notifier` is missing, it offers to run `brew install terminal-notifier`.
+1. **Install.** If `terminal-notifier` is missing, it offers to run `brew install terminal-notifier`. It needs version 3 or later; if you have 2.x, it offers `brew upgrade terminal-notifier`.
 2. **Allow notifications.** It opens `terminal-notifier` once as an app, so macOS asks whether it may send notifications: choose **Allow**. Started from a script, it can't ask, and its notifications are dropped.
 3. **If macOS says no,** or the prompt didn't appear, it opens **System Settings > Notifications**. Find **terminal-notifier**, turn on **Allow notifications**, and set the style to **Banners**.
 4. **First click.** macOS may ask whether `terminal-notifier` can control Terminal (or iTerm): choose **OK**. That's how it switches to the tab.
@@ -204,7 +204,7 @@ ccdeck preview 16      try PR #16 next to your dashboard (ccdeck preview stop)
 - **Dashboard autostart.** With the plugin, the `SessionStart` hook starts `ccdeck serve` in the background when nothing answers on the port; it logs to `~/.claude/ccdeck/serve.log`. It doesn't do this when the systemd service or launchd agent is installed. To turn it off, set `CCDECK_AUTOSTART=0`.
 - **Notifications** appear when a session moves into *Needs you*, *PRs to fix* or *Your turn*. Clicking one goes to that session's terminal tab:
   - **Linux:** it raises the window in gnome-terminal (or selects the tmux pane). That needs PyGObject (`python3-gi`, preinstalled on GNOME); without it, notifications come from `notify-send` and clicking them does nothing.
-  - **macOS:** it switches to the tab in Terminal or iTerm. That needs `terminal-notifier`, which `ccdeck notifications setup` installs and gets allowed (see [Clickable notifications on macOS](#clickable-notifications-on-macos)). Without it, notifications come from `osascript`, and clicking one only opens Script Editor.
+  - **macOS:** it switches to the tab in Terminal or iTerm. That needs `terminal-notifier` 3 or later, which `ccdeck notifications setup` installs (or upgrades) and gets allowed (see [Clickable notifications on macOS](#clickable-notifications-on-macos)). Without it, notifications come from `osascript`, and clicking one only opens Script Editor.
 
   Turn them off or on with `ccdeck notifications off|on`, or one channel at a time with `ccdeck notifications desktop off` (desktop is the only channel so far). The setting lives in ccdeck's `config.json`; `CCDECK_NOTIFY=0` turns them all off whatever it says.
 - **Running or closed.** A session counts as running in one of two ways:

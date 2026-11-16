@@ -1355,6 +1355,16 @@ def terminal_notifier_app():
     return Path(m.group(1)) if m and Path(m.group(1)).is_dir() else None
 
 
+def terminal_notifier_version():
+    """(major, minor) of the installed terminal-notifier ("terminal-notifier (3.1.0) is a …"), or None."""
+    try:
+        out = subprocess.run(["terminal-notifier", "-help"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"terminal-notifier \((\d+)\.(\d+)", out.stdout + out.stderr)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def terminal_notifier_authorization():
     """What macOS allows terminal-notifier: "authorized", "denied", "not requested yet", …; None if unknown."""
     try:
@@ -1383,6 +1393,16 @@ def setup_notifications(interactive):
             return
         if subprocess.run(["brew", "install", "terminal-notifier"]).returncode != 0 or not shutil.which("terminal-notifier"):
             print(f"Homebrew couldn't install it. Try: {hint}.")
+            return
+    ver = terminal_notifier_version()
+    if ver and ver < (3, 0):  # 2.x can't say whether macOS allows it (-diagnose) or be opened to ask
+        upgrade = "brew upgrade terminal-notifier, then ccdeck notifications setup"
+        if not (interactive and shutil.which("brew")) or input(
+                f"terminal-notifier {ver[0]}.{ver[1]} is too old; upgrade it to 3.x with Homebrew? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print(f"Clickable notifications need terminal-notifier 3.x (this is {ver[0]}.{ver[1]}): {upgrade}.")
+            return
+        if subprocess.run(["brew", "upgrade", "terminal-notifier"]).returncode != 0 or (terminal_notifier_version() or (0,)) < (3, 0):
+            print(f"Homebrew couldn't upgrade it. Try: {upgrade}.")
             return
     auth = terminal_notifier_authorization()
     if auth == "not requested yet" and (app := terminal_notifier_app()):

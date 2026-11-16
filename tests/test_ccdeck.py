@@ -956,10 +956,10 @@ class ServerTest(unittest.TestCase):
     def test_notification_setup_on_mac(self):
         """`ccdeck notifications setup`: a hint without terminal-notifier, macOS's prompt when it was never
         asked, System Settings when it's denied."""
-        def setup(which, auths, interactive=False):
+        def setup(which, auths, interactive=False, version=(3, 1)):
             opened, out = [], []
             auths = iter(auths)
-            with mock.patch.object(cc, "IS_MAC", True), \
+            with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "terminal_notifier_version", lambda: version), \
                     mock.patch.object(cc.shutil, "which", lambda b: which if b == "terminal-notifier" else None), \
                     mock.patch.object(cc, "terminal_notifier_authorization", lambda: next(auths)), \
                     mock.patch.object(cc, "terminal_notifier_app", lambda: Path("/Apps/terminal-notifier.app")), \
@@ -980,6 +980,11 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(opened, [cc.NOTIFY_SETTINGS_URL])
         opened, out = setup("/opt/bin/terminal-notifier", ["denied"])  # not interactive: say it, open nothing
         self.assertIn("System Settings", out)
+        self.assertEqual(opened, [])
+        # 2.x has no -diagnose: ask for an upgrade instead of reading "not allowed" into its silence
+        opened, out = setup("/opt/bin/terminal-notifier", [], version=(2, 0))
+        self.assertIn("brew upgrade terminal-notifier", out)
+        self.assertNotIn("System Settings", out)
         self.assertEqual(opened, [])
 
     def test_terminal_notifier_app_behind_homebrews_script(self):
