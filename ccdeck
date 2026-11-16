@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -65,7 +65,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -515,7 +515,7 @@ def parse_transcript(path):
         "refs": [], "linear": {}, "issue_keys": [], "usage": empty_usage(), "context": 0, "model": None,
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
-    refs, linear, keys, tool_titles = {}, {}, {}, {}
+    refs, linear, keys, tool_titles, not_created = {}, {}, {}, {}, {}
     seen_msgs = set()
 
     def note_ref(url, kind, title, source):
@@ -609,6 +609,8 @@ def parse_transcript(path):
                             pending.pop(tid, None)
                             name = tool_names.get(tid, "")
                             body = block_text(b.get("content"))
+                            for u in not_created.pop(tid, ()):  # the type an artifact was made from isn't ours
+                                body = body.replace(u, "")
                             creating = any(h in name for h in CREATING_TOOL_HINTS)
                             if creating or "linear" in name.lower():
                                 src = "created" if creating else "tool"
@@ -657,6 +659,14 @@ def parse_transcript(path):
                         for v in inp.values():
                             if isinstance(v, str) and ISSUE_KEY_RE.fullmatch(v.upper()):
                                 note_issue(v, None, None, "tool")
+                    if name == "Artifact" and inp.get("action", "publish") != "publish":
+                        # quickstart, list, read, open...: their results name other accounts'
+                        # artifacts (Artifact types, shared pages), never one this session made
+                        tool_names[b.get("id")] = "artifact-lookup"
+                    elif name == "Artifact":
+                        theirs = [inp[k] for k in ("type_url", "from_url") if isinstance(inp.get(k), str)]
+                        if theirs:
+                            not_created[b.get("id")] = theirs
                     if name == "Artifact" or name.endswith("__create"):
                         t = inp.get("title") or inp.get("name")
                         if isinstance(t, str) and t.strip():

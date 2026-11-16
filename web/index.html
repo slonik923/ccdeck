@@ -758,7 +758,7 @@ function renderDrawer(all) {
   const active = document.activeElement;
   if (active && active.id === "dr-note" && host.contains(active)) return; // don't clobber typing
   drawerSig = sig;
-  const scroll = host.querySelector(".drawer") ? host.querySelector(".drawer").scrollTop : 0;
+  const body = host.querySelector(".dr-body"), scroll = body ? body.scrollTop : 0; // .dr-body is what scrolls
   const msgHead = s.g === "need" ? s.stateLabel : "Claude’s last message";
   const hint = s.k === "perm" ? "Approve or deny in the terminal. " + resumeHint(s)
     : s.k === "question" || s.k === "decision" ? "Answer in the terminal. " + resumeHint(s)
@@ -818,7 +818,7 @@ function renderDrawer(all) {
           h("dt", {}, "Running"), h("dd", {}, (s.run ? "Yes" : "No") + " · " + (s.raw.live_source === "hook"
             ? "reported by the session's hooks" : "guessed: no hook has reported for this session")),
           h("dt", {}, "Last activity"), h("dd", {}, new Date(s.ts * 1000).toLocaleString()))))));
-  const d = host.querySelector(".drawer"); if (d) d.scrollTop = scroll;
+  const d = host.querySelector(".dr-body"); if (d) d.scrollTop = scroll;
 }
 
 // ---- interactions ----

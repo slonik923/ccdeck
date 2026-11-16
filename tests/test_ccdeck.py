@@ -287,6 +287,10 @@ class LinksTest(unittest.TestCase):
             result("n1", 28, json.dumps({"pages": [{"id": "b" * 32, "url": created_notion, "title": "Rollout plan"}]})),
             asst([tool("a1", "Artifact", {"file_path": "/tmp/x.html", "title": "Queue comparison"})], 27),
             result("a1", 27, "Published https://claude.ai/artifact/abc123XYZ (private)"),
+            asst([tool("q1", "Artifact", {"action": "quickstart", "intent": "other"})], 27),
+            result("q1", 27, "Types: Data https://claude.ai/artifact/TypeData1 and Docs https://claude.ai/artifact/TypeDocs1"),
+            asst([tool("t1", "Artifact", {"type_url": "https://claude.ai/artifact/TypeData1", "title": "Burn-down"})], 27),
+            result("t1", 27, "Created https://claude.ai/artifact/ourDash9 from https://claude.ai/artifact/TypeData1"),
             asst([text("Done. See ENG-42 and the plan. Also OPS-9 is unrelated.")], 26),
         ]
         for e in entries:
@@ -305,6 +309,13 @@ class LinksTest(unittest.TestCase):
         self.assertEqual((self.refs[self.created_notion]["source"], self.refs[self.created_notion]["title"]), ("created", "Rollout plan"))
         art = self.refs["https://claude.ai/artifact/abc123XYZ"]
         self.assertEqual((art["kind"], art["source"], art["title"]), ("artifact", "created", "Queue comparison"))
+
+    def test_artifact_types_and_lookups_are_not_ours(self):
+        """Quickstart lists other accounts' Artifact types; a type_url publish names the type it used."""
+        self.assertNotIn("https://claude.ai/artifact/TypeData1", self.refs)
+        self.assertNotIn("https://claude.ai/artifact/TypeDocs1", self.refs)
+        dash = self.refs["https://claude.ai/artifact/ourDash9"]
+        self.assertEqual((dash["source"], dash["title"]), ("created", "Burn-down"))
 
     def test_linear_from_tool_branch_and_mentions(self):
         self.assertEqual(self.linear["ENG-42"]["title"], "Stripe webhooks")
