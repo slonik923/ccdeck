@@ -851,7 +851,11 @@ const settingOf = (key) => {
 let settingsSaving = false;
 const settingsQueue = new Map();
 async function setSetting(key, value) {
-  if (offline()) { toast("Settings are paused until the server is back"); return; }
+  if (offline()) {
+    // a queued click that can't be saved now: show what the server has, not a value that was never saved
+    if (settingsPending.delete(key)) { settingsSig = ""; renderSettings(); }
+    toast("Settings are paused until the server is back"); return;
+  }
   settingsPending.set(key, value); settingsSig = ""; renderSettings(); focusKey("set:" + key + (typeof value === "boolean" ? "" : ":" + value));
   if (settingsSaving) { settingsQueue.delete(key); settingsQueue.set(key, value); return; }
   settingsSaving = true;
