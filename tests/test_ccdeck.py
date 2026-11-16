@@ -170,6 +170,17 @@ def by_id(rows):
     return {r["id"]: r for r in rows}
 
 
+
+def registry_start(pid):
+    """A process's start time as Claude Code's registry (procStart) saves it: /proc's start ticks on Linux,
+    otherwise `ps` lstart in UTC (ccdeck's own reader gives local time)."""
+    if cc.USE_PROC:
+        return cc.proc_start_time(pid)
+    import subprocess
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                         env=dict(os.environ, TZ="UTC", LC_ALL="C")).stdout
+    return " ".join(out.split()) or None
+
 class ClassifyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -422,7 +433,7 @@ class HookTest(unittest.TestCase):
         reg = cc.CLAUDE_DIR / "sessions"
         reg.mkdir(parents=True, exist_ok=True)
         me = os.getpid()
-        (reg / f"{me}.json").write_text(json.dumps({"pid": me, "procStart": cc.proc_start_time(me),
+        (reg / f"{me}.json").write_text(json.dumps({"pid": me, "procStart": registry_start(me),
                                                     "sessionId": "s-closed", "name": "work-2d"}))
         (reg / "1.json").write_text(json.dumps({"pid": 1, "procStart": "stale", "sessionId": "s-midtask", "name": "old"}))
         try:
@@ -443,6 +454,7 @@ class HookTest(unittest.TestCase):
                     mock.patch.object(cc, "proc_start_time", lambda pid: "Thu Nov 12 09:23:03 2026"):
                 self.assertTrue(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))              # ccdeck's own, local
                 self.assertTrue(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026", utc=True))    # the registry's, UTC
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026", utc=True))   # local string read as UTC
                 self.assertFalse(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026"))             # local: an hour off
                 self.assertFalse(cc.pid_alive(7, "Thu Nov 12 07:23:03 2026", utc=True))   # another process
                 self.assertFalse(cc.pid_alive(7, "stale", utc=True))
@@ -483,7 +495,7 @@ class HookTest(unittest.TestCase):
     def test_malformed_registry_records_are_skipped(self):
         reg = cc.CLAUDE_DIR / "sessions"
         reg.mkdir(parents=True, exist_ok=True)
-        me, start = os.getpid(), cc.proc_start_time(os.getpid())
+        me, start = os.getpid(), registry_start(os.getpid())
         for i, rec in enumerate(({"pid": me, "procStart": start, "sessionId": ["A"]},
                                  {"pid": me, "procStart": start, "sessionId": ""},
                                  {"pid": str(me), "procStart": start, "sessionId": "B"},
@@ -513,7 +525,7 @@ class HookTest(unittest.TestCase):
         reg.mkdir(parents=True, exist_ok=True)
         me, parent = os.getpid(), os.getppid()
         for pid in (me, parent):
-            (reg / f"{pid}.json").write_text(json.dumps({"pid": pid, "procStart": cc.proc_start_time(pid), "sessionId": "B"}))
+            (reg / f"{pid}.json").write_text(json.dumps({"pid": pid, "procStart": registry_start(pid), "sessionId": "B"}))
         try:
             self.assertEqual(sorted(cc.peer_sessions()["B"]["pids"]), sorted([me, parent]))
         finally:

@@ -313,11 +313,11 @@ def pid_alive(pid, start, utc=False):
     in local time, as ccdeck saves it; utc: in UTC, as Claude Code's registry (procStart) saves it. Only that
     one is converted: read as UTC, a local time would also match a process started one UTC offset later."""
     st = proc_start_time(pid) if pid else None
-    if st is None or start is None or st == start:
+    if st is None or start is None:
         return st is not None
     if USE_PROC or not isinstance(start, str):
-        return False
-    want = lstart_local(start) if utc else start
+        return st == start  # /proc start ticks: the same on both sides, no time zone
+    want = lstart_local(start) if utc else start  # a UTC string equal to the local one is another moment
     return bool(want) and " ".join(st.split()) == " ".join(want.split())
 
 
