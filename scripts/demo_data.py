@@ -129,6 +129,9 @@ def build(home, pid):
         S("d-rate", "Rate-limit the public API", "billing-api", "feat/rate-limit", "rate limit ENG-38", 35)
         .created_pr("billing-api", 88, 34).say([text("Pushed the rate limiter; review asked for a per-key override.")], 34),
         S("d-pdf", "Refactor invoice PDF renderer", "billing-api", "refactor/pdf-renderer", "refactor the renderer", 1)
+        # a refactor touches many files: a long "Files written" list, for the drawer's "Show all"
+        .say([tool(f"w{i}", "Write", {"file_path": WORK + f"billing-api/src/pdf/{f}.ts"}) for i, f in enumerate(
+            ("fonts", "table", "header", "footer", "totals", "currency", "page-break", "qr-code", "watermark", "theme", "index"))], 1)
         .say([tool("e1", "Edit", {"file_path": WORK + "billing-api/src/pdf/layout.ts"})], 0, ctx=156000),
         S("d-node", "Bump Node to 22 LTS", "web-app", "chore/node-22", "bump node", 4)
         .created_pr("web-app", 301, 3).say([text("Pushed fixes; CI is running.")], 3, ctx=97000),

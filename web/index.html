@@ -742,7 +742,12 @@ function capped(s, key, items, n, render, inList) {
   const shown = open ? items : items.slice(0, n);
   const more = items.length - n;
   const btn = more > 0 ? h("button", { class: "linkbtn showall", "data-key": "more:" + key,
-    onclick: () => { expanded[s.id + ":" + key] = !open; drawerSig = ""; renderDrawer(lastAll); focusKey("more:" + key); } },
+    onclick: () => {
+      expanded[s.id + ":" + key] = !open; drawerSig = ""; renderDrawer(lastAll); focusKey("more:" + key);
+      // collapsing moves the button up, maybe above the kept scroll position: keep it (and the focus) in view.
+      // Expanding doesn't scroll: the list grows below and you stay where you were
+      const b = open && document.querySelector('[data-key="more:' + CSS.escape(key) + '"]'); if (b) b.scrollIntoView({ block: "nearest" });
+    } },
     open ? "Show fewer" : "Show all " + items.length) : null;
   return [shown.map(render), btn && inList ? h("li", { class: "showall-li" }, btn) : btn];
 }

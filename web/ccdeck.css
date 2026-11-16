@@ -732,7 +732,7 @@ body { background: #0B1621; }
 .ccd .ref-title { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: none; }
 a.ref-title:hover { text-decoration: underline; }
 .ccd .ref-src { font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
-.ccd .showall { align-self: flex-start; margin-top: 2px; font-size: 12px; }
+.ccd .showall { align-self: flex-start; margin-top: 2px; font-size: 12px; scroll-margin-block: var(--s-8); }
 .ccd .reflist .showall-li, .ccd .files .showall-li { display: block; }
 
 /* Cards and rows open the details on click */
