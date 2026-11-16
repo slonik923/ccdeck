@@ -918,23 +918,67 @@ class ServerTest(unittest.TestCase):
             cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv = saved
 
     def test_mac_notification_click_runs_focus(self):
-        """With terminal-notifier, a click runs `ccdeck focus <sid>`; without it, osascript (not clickable)."""
-        calls = []
-        with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
-                mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)), \
-                mock.patch.object(cc.shutil, "which", lambda b: "/opt/bin/terminal-notifier" if b == "terminal-notifier" else None):
-            cc.notify("Permission needed · Deploy", "Bash: deploy.sh", urgent=True, sid="s-closed")
+        """With terminal-notifier, a click runs `ccdeck focus <sid>`; if it fails (not allowed: exit 3) or is
+        missing, the notification goes out through osascript instead (not clickable, but not lost)."""
+        def send(which, code):
+            calls = []
+            def run(cmd, **kw):
+                calls.append(cmd)
+                return mock.Mock(returncode=code)
+            with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
+                    mock.patch.object(cc.subprocess, "run", run), \
+                    mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)), \
+                    mock.patch.object(cc.shutil, "which", lambda b: which if b == "terminal-notifier" else None):
+                cc.notify("Permission needed · Deploy", "Bash: deploy.sh", urgent=True, sid="s-closed")
+            return calls
+        calls = send("/opt/bin/terminal-notifier", 0)
+        self.assertEqual(len(calls), 1)
         cmd = calls[0]
         self.assertEqual(cmd[0], "/opt/bin/terminal-notifier")
         self.assertEqual(cmd[cmd.index("-group") + 1], "ccdeck-s-closed")
         self.assertEqual(cmd[cmd.index("-sound") + 1], "Glass")
         self.assertEqual(shlex.split(cmd[cmd.index("-execute") + 1])[-2:], ["focus", "s-closed"])
-        calls.clear()
-        with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
-                mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)), \
-                mock.patch.object(cc.shutil, "which", lambda b: None):
-            cc.notify("Finished", "done", sid="s-closed")
-        self.assertEqual(calls[0][0], "osascript")
+        self.assertEqual([c[0] for c in send("/opt/bin/terminal-notifier", 3)], ["/opt/bin/terminal-notifier", "osascript"])
+        self.assertEqual([c[0] for c in send(None, 0)], ["osascript"])
+
+    def test_notification_setup_on_mac(self):
+        """`ccdeck notifications setup`: a hint without terminal-notifier, macOS's prompt when it was never
+        asked, System Settings when it's denied."""
+        def setup(which, auths, interactive=False):
+            opened, out = [], []
+            auths = iter(auths)
+            with mock.patch.object(cc, "IS_MAC", True), \
+                    mock.patch.object(cc.shutil, "which", lambda b: which if b == "terminal-notifier" else None), \
+                    mock.patch.object(cc, "terminal_notifier_authorization", lambda: next(auths)), \
+                    mock.patch.object(cc, "terminal_notifier_app", lambda: Path("/Apps/terminal-notifier.app")), \
+                    mock.patch.object(cc.subprocess, "run", lambda cmd, **kw: opened.append(cmd)), \
+                    mock.patch.object(cc, "open_path", lambda t: opened.append(t)), \
+                    mock.patch.object(cc.time, "sleep", lambda s: None), \
+                    mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+                cc.setup_notifications(interactive)
+            return opened, "\n".join(out)
+        opened, out = setup(None, [])
+        self.assertIn("brew install terminal-notifier", out)
+        self.assertEqual(opened, [])
+        opened, out = setup("/opt/bin/terminal-notifier", ["not requested yet", "authorized"], interactive=True)
+        self.assertEqual(opened[0][:4], ["open", "-W", "-a", "/Apps/terminal-notifier.app"])
+        self.assertIn("clickable", out)
+        opened, out = setup("/opt/bin/terminal-notifier", ["denied"], interactive=True)
+        self.assertIn("System Settings", out)
+        self.assertEqual(opened, [cc.NOTIFY_SETTINGS_URL])
+        opened, out = setup("/opt/bin/terminal-notifier", ["denied"])  # not interactive: say it, open nothing
+        self.assertIn("System Settings", out)
+        self.assertEqual(opened, [])
+
+    def test_terminal_notifier_app_behind_homebrews_script(self):
+        root = TMP / "tn-brew"
+        app = root / "Cellar" / "terminal-notifier" / "3.1.0" / "terminal-notifier.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+        script = root / "Cellar" / "terminal-notifier" / "3.1.0" / "bin" / "terminal-notifier"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(f'#!/bin/bash\nexec "{app}/Contents/MacOS/terminal-notifier" "$@"\n')
+        with mock.patch.object(cc.shutil, "which", lambda b: str(script)):
+            self.assertEqual(cc.terminal_notifier_app().resolve(), app.resolve())  # /var is /private/var on macOS
 
     def test_focus_command(self):
         focused = []

@@ -1300,10 +1300,14 @@ def notify(title, body, urgent=False, sid=None):
         if sid:
             cmd += ["-execute", shlex.join([sys.executable, str(Path(__file__).resolve()), "focus", sid])]
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            # it exits once the notification is delivered (a click relaunches it); not 0 means it wasn't,
+            # e.g. 3 when notifications aren't allowed for it: send it the old way rather than lose it
+            if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            return  # still running: it was delivered, or will be
         except OSError:
             pass
-        return
     if IS_MAC:
         script = f"display notification {applescript_str(body[:200])} with title {applescript_str(title[:120])}"
         if urgent:
@@ -1325,6 +1329,83 @@ def notify(title, body, urgent=False, sid=None):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+NOTIFY_SETTINGS_URL = "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+
+
+def terminal_notifier_app():
+    """terminal-notifier's .app bundle (Homebrew's command is a script that runs the binary inside it), or None."""
+    tn = shutil.which("terminal-notifier")
+    if not tn:
+        return None
+    real = Path(os.path.realpath(tn))
+    for p in (real, *real.parents):
+        if p.suffix == ".app":
+            return p
+    if (app := real.parent.parent / "terminal-notifier.app").is_dir():
+        return app
+    try:
+        m = re.search(r'"([^"]+\.app)/Contents/MacOS/', real.read_text(errors="replace")[:4000])
+    except OSError:
+        return None
+    return Path(m.group(1)) if m and Path(m.group(1)).is_dir() else None
+
+
+def terminal_notifier_authorization():
+    """What macOS allows terminal-notifier: "authorized", "denied", "not requested yet", …; None if unknown."""
+    try:
+        out = subprocess.run(["terminal-notifier", "-diagnose"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"^\s*authorization\s+(.+?)\s*$", out, re.M)
+    return m.group(1) if m else None
+
+
+def setup_notifications(interactive):
+    """Make notifications clickable: on macOS, install terminal-notifier and get macOS to allow it."""
+    if not IS_MAC:
+        if importlib.util.find_spec("gi"):
+            print("Notifications are clickable: a click goes to the session's terminal tab.")
+        else:
+            print("To make notifications clickable, install PyGObject (sudo apt install python3-gi).")
+        return
+    if not shutil.which("terminal-notifier"):
+        hint = "brew install terminal-notifier, then ccdeck notifications setup"
+        if not (interactive and shutil.which("brew")):
+            print(f"  Tip: to make notifications clickable (a click goes to the session's tab): {hint}.")
+            return
+        if input("Install terminal-notifier with Homebrew, so clicking a notification goes to its session's tab? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print(f"Skipped. Later: {hint}.")
+            return
+        if subprocess.run(["brew", "install", "terminal-notifier"]).returncode != 0 or not shutil.which("terminal-notifier"):
+            print(f"Homebrew couldn't install it. Try: {hint}.")
+            return
+    auth = terminal_notifier_authorization()
+    if auth == "not requested yet" and (app := terminal_notifier_app()):
+        # started from a shell it can't ask for permission (it exits with 3); opened as an app, macOS asks
+        print("macOS will ask whether terminal-notifier may send notifications: choose Allow.")
+        try:
+            subprocess.run(["open", "-W", "-a", str(app), "--args", "-title", "ccdeck",
+                            "-message", "Notifications from ccdeck are on. Clicking one goes to its session's tab."],
+                           timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for _ in range(30 if interactive else 0):  # give the prompt a moment to be answered
+            if (auth := terminal_notifier_authorization()) == "authorized":
+                break
+            time.sleep(1)
+        else:
+            auth = terminal_notifier_authorization()
+    if auth == "authorized":
+        print("Notifications are clickable: a click goes to the session's Terminal or iTerm tab.")
+        print("  The first click may ask whether terminal-notifier can control Terminal: choose OK.")
+        return
+    print("macOS doesn't allow terminal-notifier's notifications yet. In System Settings > Notifications >")
+    print("terminal-notifier, turn on Allow notifications (style: Banners). Until then they come from osascript,")
+    print("and clicking one opens Script Editor. Check with: ccdeck notifications setup")
+    if interactive:
+        open_path(NOTIFY_SETTINGS_URL)
 
 
 TERMINALS = [  # (binary, args before the command)
@@ -2664,8 +2745,10 @@ def cmd_review_requests(args):
 
 def cmd_notifications(args):
     words = args.words
+    if words == ["setup"]:
+        return setup_notifications(sys.stdin.isatty())
     if words and words[-1] not in ("on", "off"):
-        sys.exit("usage: ccdeck notifications [CHANNEL] [on|off]")
+        sys.exit("usage: ccdeck notifications [CHANNEL] [on|off] | setup")
     if words:
         channels = words[:-1] or list(NOTIFY_CHANNELS)
         if any(c not in NOTIFY_CHANNELS for c in channels):
@@ -2953,6 +3036,8 @@ def cmd_install(args):
         install_service(args.port)
     if not shutil.which("gh"):
         print(f"  Tip: install the GitHub CLI (`{GH_INSTALL}`, then `gh auth login`) for PR states.")
+    if notify_enabled("desktop"):
+        setup_notifications(sys.stdin.isatty())
 
 
 def cmd_uninstall(_args):
@@ -3018,9 +3103,9 @@ def main():
     s = sub.add_parser("review-requests", help="which PR review requests to list: all (yours and your teams'), "
                        "mine (asked of you by name) or off")
     s.add_argument("mode", nargs="?", choices=["all", "mine", "off", "status"], default="status")
-    s = sub.add_parser("notifications", help="turn notifications on or off, all or one channel ("
+    s = sub.add_parser("notifications", help="turn notifications on or off, all or one channel; setup makes them clickable ("
                        + ", ".join(NOTIFY_CHANNELS) + ")")
-    s.add_argument("words", nargs="*", metavar="[CHANNEL] [on|off]")
+    s.add_argument("words", nargs="*", metavar="[CHANNEL] [on|off] | setup")
     s = sub.add_parser("preview", help="try a PR or branch of ccdeck on your sessions, next to your own dashboard")
     s.add_argument("target", help="PR number, ccdeck version (0.8.5), branch, tag or commit, a local checkout, or 'stop'")
     s.add_argument("--port", type=int, default=PREVIEW_PORT)
