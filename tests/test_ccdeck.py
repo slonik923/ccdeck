@@ -448,6 +448,15 @@ class HookTest(unittest.TestCase):
             with mock.patch.object(cc, "USE_PROC", False), \
                     mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Mar 1 00:30:00 2026"):
                 self.assertTrue(cc.pid_alive(7, "Sat Feb 28 23:30:00 2026"))   # across a day and month
+            # clocks going back repeat an hour: 08:00 and 09:00 UTC are both 01:00 in Los Angeles that night,
+            # and `ps` can't say which; a registry record of either moment is that process
+            os.environ["TZ"] = "America/Los_Angeles"
+            time.tzset()
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Nov 1 01:00:00 2020"):
+                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 08:00:00 2020"))
+                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 09:00:00 2020"))
+                self.assertFalse(cc.pid_alive(7, "Sun Nov 1 10:00:00 2020"))
         finally:
             if saved_tz is None:
                 os.environ.pop("TZ", None)
@@ -924,6 +933,8 @@ class ServerTest(unittest.TestCase):
             calls = []
             def run(cmd, **kw):
                 calls.append(cmd)
+                if code == "timeout":  # subprocess.run kills it before raising: nothing was delivered
+                    raise cc.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
                 return mock.Mock(returncode=code)
             with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
                     mock.patch.object(cc.subprocess, "run", run), \
@@ -939,6 +950,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-sound") + 1], "Glass")
         self.assertEqual(shlex.split(cmd[cmd.index("-execute") + 1])[-2:], ["focus", "s-closed"])
         self.assertEqual([c[0] for c in send("/opt/bin/terminal-notifier", 3)], ["/opt/bin/terminal-notifier", "osascript"])
+        self.assertEqual([c[0] for c in send("/opt/bin/terminal-notifier", "timeout")], ["/opt/bin/terminal-notifier", "osascript"])
         self.assertEqual([c[0] for c in send(None, 0)], ["osascript"])
 
     def test_notification_setup_on_mac(self):

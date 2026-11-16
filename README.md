@@ -35,7 +35,7 @@ Open it at `http://localhost:7799`, or with `/ccdeck:dashboard`.
 
 For PR states, also install the GitHub CLI (`sudo apt install gh` on Ubuntu, `brew install gh` on macOS) and run `gh auth login`.
 
-On macOS, run `ccdeck notifications setup` once in a terminal, so that clicking a notification goes to its session's tab (see [Clickable notifications on macOS](#clickable-notifications-on-macos)).
+On macOS, make notifications clickable, so that a click goes to its session's tab (see [Clickable notifications on macOS](#clickable-notifications-on-macos)): run `/ccdeck:install` first, which adds the `ccdeck` terminal command, then run `ccdeck notifications setup` once in a terminal. It asks before installing anything, so run it in a terminal rather than through Claude.
 
 The plugin adds these commands to Claude Code:
 
