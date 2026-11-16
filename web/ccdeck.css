@@ -351,7 +351,7 @@
 /* ---------- Header ---------- */
 .ccd .hdr { position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
 .ccd .hdr-in { display: flex; align-items: center; gap: var(--s-5); height: 60px; }
-.ccd .brand { display: flex; align-items: center; gap: var(--s-4); font-weight: 700; font-size: var(--t-16); letter-spacing: -.01em; }
+.ccd .brand { min-width: 0; display: flex; align-items: center; gap: var(--s-4); font-weight: 700; font-size: var(--t-16); letter-spacing: -.01em; }
 .ccd .brand-mark { width: 28px; height: 28px; border-radius: var(--r-md); background: var(--primary); color: var(--on-primary); display: grid; place-items: center; position: relative; }
 .ccd .brand-badge { position: absolute; top: -5px; right: -7px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: var(--r-pill); background: var(--need-strong); color: var(--on-need); font: 700 11px/18px var(--font); text-align: center; box-shadow: 0 0 0 2px var(--bg); }
 .ccd .host { font: 400 var(--t-12) var(--mono); color: var(--text-3); }
@@ -769,6 +769,6 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .settings button:disabled { opacity: .55; cursor: not-allowed; }
 
 /* `ccdeck preview`: make it obvious this isn't your normal dashboard */
-.ccd .previewtag { font: 700 12px/1 var(--mono); color: #111; background: #ffb020; border-radius: 999px; padding: 5px 10px; white-space: nowrap; max-width: 46ch; overflow: hidden; text-overflow: ellipsis; }
+.ccd .previewtag { font: 700 12px/1 var(--mono); color: #111; background: #ffb020; border-radius: 999px; padding: 5px 10px; white-space: nowrap; max-width: 24ch; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ccd .previewtag[hidden] { display: none; }
 .ccd .host { white-space: nowrap; }

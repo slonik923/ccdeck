@@ -626,7 +626,7 @@ function render() {
   document.title = (needN ? `(${needN}) ` : "") + (data.preview ? "ccdeck preview" : "ccdeck");
   $("previewTag").hidden = !data.preview;
   $("previewTag").textContent = data.preview ? "Preview · " + data.preview : "";
-  $("previewTag").title = data.preview ? "A preview started with `ccdeck preview`. Notes and marks changed here aren't kept. Stop it with `ccdeck preview stop`." : "";
+  $("previewTag").title = data.preview ? data.preview + "\n\nA preview started with `ccdeck preview`. Notes and marks changed here aren't kept. Stop it with `ccdeck preview stop`." : "";
   setFavicon(needN, needN ? "#E9887D" : prN ? "#C393C2" : count("turn") ? "#10b981" : count("work") ? "#F0B44C" : "#10b981");
   $("needBadge").hidden = !needN || isOff; $("needBadge").textContent = needN;
   $("host").textContent = "localhost:" + data.port + " · v" + data.version;
