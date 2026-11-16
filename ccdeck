@@ -2135,7 +2135,9 @@ def preview_config_dir():
     """A Claude config folder that sees your transcripts and hook states but keeps its own caches."""
     cfg = PREVIEW_DIR / "claude"
     (cfg / "ccdeck").mkdir(parents=True, exist_ok=True)
-    for link, real in ((cfg / "projects", PROJECTS_DIR), (cfg / "ccdeck" / "state", STATE_DIR)):
+    # sessions: Claude Code's registry of open sessions, which "Go to tab" and resume need
+    for link, real in ((cfg / "projects", PROJECTS_DIR), (cfg / "ccdeck" / "state", STATE_DIR),
+                       (cfg / "sessions", CLAUDE_DIR / "sessions")):
         real.mkdir(parents=True, exist_ok=True)
         if link.is_symlink() or link.exists():
             if link.is_symlink() and os.readlink(link) == str(real):

@@ -147,7 +147,7 @@ ccdeck preview stop
 ```
 
 `preview` downloads that version and runs its dashboard on `http://localhost:7798`, next to your normal one. The header shows which version it is.
-- **Shared with your dashboard:** your real transcripts and the live states your hooks report.
+- **Shared with your dashboard:** your real transcripts, the live states your hooks report, and which sessions are open in a terminal.
 - **Its own:** caches, token and notifications, so it doesn't disturb your normal dashboard.
 - **Marks, notes and settings:** it gets a copy of yours, and changes made in the preview aren't kept.
 

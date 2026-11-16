@@ -1119,6 +1119,7 @@ class PreviewTest(unittest.TestCase):
         cfg = cc.preview_config_dir()
         self.assertEqual(os.readlink(cfg / "projects"), str(cc.PROJECTS_DIR))
         self.assertEqual(os.readlink(cfg / "ccdeck" / "state"), str(cc.STATE_DIR))
+        self.assertEqual(os.readlink(cfg / "sessions"), str(cc.CLAUDE_DIR / "sessions"))  # which sessions are open
         copied = cfg / "ccdeck" / "config.json"
         self.assertFalse(copied.is_symlink())
         self.assertEqual(cc.load_json(copied, {}), {"review_requests": "mine"})
