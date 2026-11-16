@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
@@ -31,11 +32,12 @@ FAKE_GH.parent.mkdir(parents=True)
 FAKE_GH.write_text("""#!/usr/bin/env python3
 import json, sys
 if sys.argv[1:3] == ["search", "prs"]:
+    direct = "user-review-requested:@me" in sys.argv  # PR 7 asked a team, not you by name
     print(json.dumps([
         {"number": 6, "title": "Colleague's change", "url": "https://github.com/me/app/pull/6", "isDraft": False,
          "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "pat"}, "updatedAt": "2026-01-01T10:00:00Z"},
         {"number": 7, "title": "Mine, reviewer added me", "url": "https://github.com/me/app/pull/7", "isDraft": False,
-         "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "me"}, "updatedAt": "2026-01-01T09:00:00Z"}]))
+         "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "me"}, "updatedAt": "2026-01-01T09:00:00Z"}][:1 if direct else 2]))
     sys.exit(0)
 url = sys.argv[3]
 n = int(url.rsplit("/", 1)[1])
@@ -214,6 +216,25 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(cc.review_requests(list(self.rows.values())), [])
         self.assertEqual([r["number"] for r in cc.review_requests([])], [6, 7])
         cc.REVIEWS_FILE.unlink()
+
+    def test_review_requests_setting(self):
+        """mine leaves out team requests; a cache fetched for another setting isn't shown; off fetches nothing."""
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        self.addCleanup(lambda: cc.REVIEWS_FILE.unlink(missing_ok=True))
+        self.assertEqual(cc.review_scope(), "all")
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests()})
+        cc.save_json(cc.CONFIG_FILE, {"review_requests": "mine"})
+        self.assertEqual(cc.review_requests([]), [])  # fetched for "all": wait for the refetch
+        items = cc.fetch_review_requests()
+        self.assertEqual([r["number"] for r in items], [6])
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "mine", "items": items})
+        self.assertEqual([r["number"] for r in cc.review_requests([])], [6])
+        cc.save_json(cc.CONFIG_FILE, {"review_requests": "off"})
+        self.assertIsNone(cc.fetch_review_requests())
+        cc.save_json(cc.CONFIG_FILE, {"review_requests": "bogus"})
+        self.assertEqual(cc.review_scope(), "all")
+        with mock.patch.dict(os.environ, {"CCDECK_REVIEW_REQUESTS": "0"}):
+            self.assertEqual(cc.review_scope(), "off")
         self.assertEqual(self.state("s-pr-failing"), "ci_failing")
         self.assertEqual(self.state("s-pr-merged"), "pr_merged")
         self.assertEqual(self.state("s-pr-changes"), "changes_requested")
@@ -798,6 +819,24 @@ class ServerTest(unittest.TestCase):
         snap = json.loads(self.req("/api/sessions")[1])
         self.assertEqual({s["id"]: s for s in snap["sessions"]}["s-closed"]["mark"]["note"], "QA")
         self.req("/api/action", data={"id": "s-closed", "action": "note", "text": ""})
+
+    def test_settings_from_the_dashboard(self):
+        """The settings panel reads settings from the snapshot and saves them with set_setting."""
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        snap = json.loads(self.req("/api/sessions")[1])
+        self.assertEqual(snap["settings"]["review_requests"], {"value": "all", "locked": None})
+        self.assertEqual(snap["settings"]["notifications"]["desktop"]["locked"], "CCDECK_NOTIFY=0")  # set by the tests
+        set_ = lambda key, value: self.req("/api/action", data={"action": "set_setting", "key": key, "value": value})
+        code, body = set_("review_requests", "mine")
+        self.assertEqual((code, json.loads(body)["settings"]["review_requests"]["value"]), (200, "mine"))
+        self.assertEqual(json.loads(self.req("/api/sessions")[1])["settings"]["review_requests"]["value"], "mine")
+        self.assertEqual(set_("approvals", True)[0], 200)
+        self.assertEqual(set_("notifications.desktop", False)[0], 200)
+        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}),
+                         {"review_requests": "mine", "approvals": True, "notifications": {"desktop": False}})
+        for key, value in (("review_requests", "team"), ("approvals", "yes"), ("notifications.sms", True), ("token", "x"), (None, 1)):
+            self.assertEqual(set_(key, value)[0], 400, key)
+        self.assertEqual(self.req("/api/action", token=False, data={"action": "set_setting", "key": "approvals", "value": True})[0], 403)
 
     def test_resume_of_an_open_session_never_starts_a_second_one(self):
         saved = cc.peer_sessions, cc.focus_terminal, cc.open_terminal

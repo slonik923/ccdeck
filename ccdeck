@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -814,13 +814,30 @@ def fetch_pr(url):
     }
 
 
-def fetch_review_requests():
+REVIEW_SCOPES = {  # config.json's review_requests: which requests the dashboard lists
+    "all": "--review-requested=@me",  # asked of you, or of a team you're in
+    "mine": "user-review-requested:@me",  # asked of you by name; team requests are left out
+    "off": None,
+}
+
+
+def review_scope():
+    """config.json's review_requests (default all); CCDECK_REVIEW_REQUESTS=0 turns it off whatever it says."""
+    if os.environ.get("CCDECK_REVIEW_REQUESTS") == "0":
+        return "off"
+    cfg = load_json(CONFIG_FILE, {})
+    v = cfg.get("review_requests") if isinstance(cfg, dict) else None
+    return v if v in REVIEW_SCOPES else "all"
+
+
+def fetch_review_requests(scope=None):
     """Open PRs where your review is requested. They aren't tied to a session, so the dashboard
-    lists them on their own. Off with CCDECK_REVIEW_REQUESTS=0."""
-    if os.environ.get("CCDECK_REVIEW_REQUESTS") == "0" or not shutil.which("gh"):
+    lists them on their own. None when off, or when gh is missing or fails."""
+    query = REVIEW_SCOPES[scope or review_scope()]
+    if not query or not shutil.which("gh"):
         return None
     try:
-        r = subprocess.run(["gh", "search", "prs", "--review-requested=@me", "--state=open", "--limit", "30",
+        r = subprocess.run(["gh", "search", "prs", query, "--state=open", "--limit", "30",
                             "--json", "number,title,url,repository,author,isDraft,updatedAt"],
                            capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
@@ -845,9 +862,13 @@ def fetch_review_requests():
 
 
 def review_requests(sessions):
-    """Cached review requests, less PRs that one of your sessions made."""
+    """Cached review requests, less PRs that one of your sessions made. Nothing while the cache
+    was fetched for another setting (the PR loop fetches again within seconds)."""
     own = {p["url"] for s in sessions for p in s.get("pr_details") or [] if p.get("own")}
-    items = (load_json(REVIEWS_FILE, {}) or {}).get("items") or []
+    cache = load_json(REVIEWS_FILE, {}) or {}
+    if cache.get("scope", "all") != review_scope():
+        return []
+    items = cache.get("items") or []
     return [r for r in items if r.get("url") not in own]
 
 
@@ -1529,7 +1550,7 @@ class Dashboard:
             "states": {k: {"group": g, "label": l} for k, (g, l) in STATES.items()},
             "gh": bool(shutil.which("gh")), "hooks": hooks_active(),
             "default_days": DEFAULT_DAYS, "port": self.port, "gh_install": GH_INSTALL,
-            "reviews": review_requests(sessions),
+            "reviews": review_requests(sessions), "settings": settings_view(),
         }
         etag = hashlib.sha1(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:16]
         snap["generated"] = time.time()
@@ -1587,14 +1608,15 @@ class Dashboard:
     def pr_loop(self):
         last_reviews = 0
         while True:
-            if time.time() - last_reviews > 300:
+            scope = review_scope()
+            cached = load_json(REVIEWS_FILE, {}) or {}
+            if time.time() - last_reviews > 300 or cached.get("scope", "all") != scope:
                 last_reviews = time.time()
                 try:
-                    items = fetch_review_requests()
-                    if items is not None:
-                        old = (load_json(REVIEWS_FILE, {}) or {}).get("items")
-                        save_json(REVIEWS_FILE, {"fetched": time.time(), "items": items})
-                        if items != old:
+                    items = fetch_review_requests(scope)
+                    if items is not None or scope == "off":
+                        save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or []})
+                        if items != cached.get("items") or scope != cached.get("scope", "all"):
                             self.wake.set()
                 except Exception as e:
                     print(f"review requests error: {e!r}", file=sys.stderr)
@@ -1620,6 +1642,14 @@ class Dashboard:
 
     def handle_action(self, body):
         sid, action = body.get("id"), body.get("action")
+        if action == "set_setting":  # the settings panel: not about a session
+            key = body.get("key")
+            try:
+                set_setting(key if isinstance(key, str) else "", body.get("value"))
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            self.refresh()
+            return 200, {"ok": True, "settings": settings_view()}
         s = self.find(sid) if isinstance(sid, str) else None
         if not s:
             return 404, {"error": "unknown session"}
@@ -2232,16 +2262,56 @@ def wait_for_approval(sid, data, state):
         cleanup_request(req["id"])
 
 
+def settings_view():
+    """The settings the dashboard's settings panel shows: each one's value, and the environment
+    variable that overrides it in the server's environment, if one does."""
+    env = os.environ.get
+    return {
+        "review_requests": {"value": review_scope(),
+                            "locked": "CCDECK_REVIEW_REQUESTS=0" if env("CCDECK_REVIEW_REQUESTS") == "0" else None},
+        "approvals": {"value": approvals_enabled(),
+                      "locked": f"CCDECK_APPROVALS={env('CCDECK_APPROVALS')}" if env("CCDECK_APPROVALS") is not None else None},
+        "notifications": {c: {"value": notify_enabled(c),
+                              "locked": "CCDECK_NOTIFY=0" if env("CCDECK_NOTIFY") == "0" else None}
+                          for c in NOTIFY_CHANNELS},
+    }
+
+
+def set_setting(key, value):
+    """Save one setting to config.json. key is review_requests, approvals or notifications.<channel>.
+    Raises ValueError for an unknown key or a value it can't take."""
+    cfg = load_json(CONFIG_FILE, {})
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if key == "review_requests" and value in REVIEW_SCOPES:
+        cfg["review_requests"] = value
+    elif key == "approvals" and isinstance(value, bool):
+        cfg["approvals"] = value
+    elif key.startswith("notifications.") and key.split(".", 1)[1] in NOTIFY_CHANNELS and isinstance(value, bool):
+        cfg["notifications"] = {**notify_settings(cfg), key.split(".", 1)[1]: value}
+    else:
+        raise ValueError(f"can't set {key} to {value!r}")
+    save_json(CONFIG_FILE, cfg)
+
+
 def cmd_approvals(args):
     if args.mode in ("on", "off"):
-        cfg = load_json(CONFIG_FILE, {})
-        cfg["approvals"] = args.mode == "on"
-        save_json(CONFIG_FILE, cfg)
+        set_setting("approvals", args.mode == "on")
     on = approvals_enabled()
     print(f"Approvals from the dashboard: {'on' if on else 'off'}"
           + (" (CCDECK_APPROVALS overrides the setting)" if "CCDECK_APPROVALS" in os.environ else ""))
     if on:
         print("Permission prompts can now be allowed or denied in the dashboard; the terminal still works too.")
+
+
+def cmd_review_requests(args):
+    if args.mode != "status":
+        set_setting("review_requests", args.mode)
+    scope = review_scope()
+    print("Review requests: " + {"all": "all (asked of you or of a team you're in)",
+                                 "mine": "mine (asked of you by name; team requests left out)",
+                                 "off": "off"}[scope])
+    if os.environ.get("CCDECK_REVIEW_REQUESTS") == "0":
+        print("(CCDECK_REVIEW_REQUESTS=0 turns them off, whatever the setting)")
 
 
 def cmd_notifications(args):
@@ -2252,10 +2322,8 @@ def cmd_notifications(args):
         channels = words[:-1] or list(NOTIFY_CHANNELS)
         if any(c not in NOTIFY_CHANNELS for c in channels):
             sys.exit(f"Unknown channel; channels: {', '.join(NOTIFY_CHANNELS)}")
-        cfg = load_json(CONFIG_FILE, {})
-        cfg = cfg if isinstance(cfg, dict) else {}
-        cfg["notifications"] = {**notify_settings(cfg), **{c: words[-1] == "on" for c in channels}}
-        save_json(CONFIG_FILE, cfg)
+        for c in channels:
+            set_setting("notifications." + c, words[-1] == "on")
     for c in NOTIFY_CHANNELS:
         print(f"{c} notifications: {'on' if notify_enabled(c) else 'off'}")
     if os.environ.get("CCDECK_NOTIFY") == "0":
@@ -2599,6 +2667,9 @@ def main():
     sub.add_parser("uninstall", help="remove hooks, service and launcher")
     s = sub.add_parser("approvals", help="allow/deny permission prompts from the dashboard (opt-in)")
     s.add_argument("mode", nargs="?", choices=["on", "off", "status"], default="status")
+    s = sub.add_parser("review-requests", help="which PR review requests to list: all (yours and your teams'), "
+                       "mine (asked of you by name) or off")
+    s.add_argument("mode", nargs="?", choices=["all", "mine", "off", "status"], default="status")
     s = sub.add_parser("notifications", help="turn notifications on or off, all or one channel ("
                        + ", ".join(NOTIFY_CHANNELS) + ")")
     s.add_argument("words", nargs="*", metavar="[CHANNEL] [on|off]")
@@ -2614,7 +2685,7 @@ def main():
         None: cmd_list, "list": cmd_list, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
-        "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,
+        "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,
         "notify-click": cmd_notify_click,
     }
     handlers[args.cmd](args)

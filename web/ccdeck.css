@@ -757,3 +757,13 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .rr-repo, .ccd .rr-by { color: var(--text-3); font-size: 12px; white-space: nowrap; }
 .ccd .rrlist .ago { text-align: right; }
 @media (max-width: 640px) { .ccd .rrlist li { grid-template-columns: auto minmax(0, 1fr) 40px; } .ccd .rr-repo, .ccd .rr-by { display: none; } }
+
+/* ---------- Settings panel (reuses the drawer) ---------- */
+.ccd .seg { display: flex; flex-wrap: wrap; gap: var(--s-3); }
+.ccd .seg .fchip { padding: 0 14px; }
+.ccd .set-d { margin: 0; font-size: var(--t-12); line-height: 1.5; color: var(--text-3); white-space: normal; }
+.ccd .set-toggle { height: auto; width: 100%; padding: var(--s-3) 0; justify-content: space-between; gap: var(--s-6); text-align: left; white-space: normal; }
+.ccd .set-toggle:hover { background: none; }
+.ccd .set-text { display: flex; flex-direction: column; gap: 2px; }
+.ccd .set-text b { font-size: var(--t-14); font-weight: 600; color: var(--text); }
+.ccd .settings button:disabled { opacity: .55; cursor: not-allowed; }

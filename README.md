@@ -106,7 +106,9 @@ The groups say what you have to do, most urgent first:
 
 "In progress" means someone else is on it: Claude, CI or your reviewers. A PR waiting for review counts as in progress, because you can't approve your own (or your agent's) PR.
 
-**Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs --review-requested=@me`. Your own sessions' PRs are left out. To turn it off, set `CCDECK_REVIEW_REQUESTS=0`.
+**Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs`. Your own sessions' PRs are left out. By default the list includes requests made to a team you're in. If your teams get many of those, `ccdeck review-requests mine` lists only the PRs where you were asked by name; `ccdeck review-requests all` goes back. `ccdeck review-requests off` (or `CCDECK_REVIEW_REQUESTS=0`) turns the list off.
+
+**Settings.** The gear button in the dashboard's header opens a settings panel for review requests, desktop notifications and approvals from the dashboard. It saves to `~/.claude/ccdeck/config.json`, the same file the `ccdeck review-requests`, `ccdeck notifications` and `ccdeck approvals` commands change.
 
 Each card shows:
 - the title, folder, branch and number of prompts
@@ -146,6 +148,7 @@ ccdeck park 3          set aside               ccdeck unpark 3
 ccdeck note 3 text     attach a note
 ccdeck open            open the dashboard
 ccdeck serve           run the dashboard in the foreground (instead of the service)
+ccdeck review-requests mine   list only PRs where you were asked to review by name (all | mine | off)
 ```
 
 `3` is the row number from the last list. A prefix of the session id also works.
