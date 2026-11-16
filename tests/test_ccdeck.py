@@ -1113,6 +1113,47 @@ class DemoDataTest(unittest.TestCase):
 class PreviewTest(unittest.TestCase):
     """`ccdeck preview` runs another ccdeck on the same sessions, with its own caches."""
 
+    def test_config_dir_drops_a_stale_copy(self):
+        """No config.json of yours: the preview starts without one, not with the last preview's changes."""
+        cc.CONFIG_FILE.unlink(missing_ok=True)
+        stale = cc.PREVIEW_DIR / "claude" / "ccdeck" / "config.json"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text('{"review_requests": "off"}')
+        cc.preview_config_dir()
+        self.assertFalse(stale.exists())
+
+    def test_stop_waits_until_the_preview_is_gone(self):
+        import subprocess
+        # detached like a real preview (its parent exits), so the system reaps it rather than leaving a zombie
+        pid = int(subprocess.run(["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout)
+        self.addCleanup(lambda: os.kill(pid, 9) if cc.pid_alive(pid, None) else None)
+        cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        cc._ps_cache["t"] = 0
+        cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": pid, "pid_start": cc.proc_start_time(pid), "label": "x"})
+        t = time.monotonic()
+        with mock.patch("builtins.print"):
+            self.assertTrue(cc.stop_preview())
+        cc._ps_cache["t"] = 0
+        self.assertFalse(cc.pid_alive(pid, None))  # gone by the time it returns
+        self.assertLess(time.monotonic() - t, 5)  # SIGTERM was enough
+        self.assertFalse((cc.PREVIEW_DIR / "preview.json").exists())
+
+    def test_version_target_finds_main_or_the_open_pr(self):
+        def gh(path):
+            if path.startswith("repos/o/r/commits/"):
+                raise RuntimeError("no such tag")
+            if path.startswith("repos/o/r/pulls?"):
+                return [{"number": 7, "head": {"sha": "aaa", "repo": {"full_name": "o/r"}}},
+                        {"number": 8, "head": {"sha": "bbb", "repo": {"full_name": "fork/r"}}}]
+            import base64
+            ver = {"main": "0.8.1", "aaa": "0.8.5", "bbb": "0.8.6"}[path.rsplit("ref=", 1)[1]]
+            return {"content": base64.b64encode(json.dumps({"version": ver}).encode()).decode()}
+        with mock.patch.object(cc, "github_json", gh):
+            self.assertEqual(cc.find_version("0.8.1", "o/r"), "main")
+            self.assertEqual(cc.find_version("0.8.5", "o/r"), "#7")
+            self.assertIsNone(cc.find_version("0.8.6", "o/r"))  # only in a fork's PR: not looked at
+            self.assertIsNone(cc.find_version("9.9.9", "o/r"))
+
     def test_config_dir_shares_sessions_and_copies_marks_and_settings(self):
         cc.save_json(cc.CONFIG_FILE, {"review_requests": "mine"})
         self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))

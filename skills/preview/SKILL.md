@@ -1,8 +1,8 @@
 ---
 name: preview
-description: Try an unreleased version of ccdeck (a PR number, branch or commit) on your own sessions, next to your normal dashboard. Use when the user wants to see a ccdeck PR or change before it's merged or released.
+description: Try an unreleased version of ccdeck (a PR number, version such as 0.8.5, branch or commit) on your own sessions, next to your normal dashboard. Use when the user wants to see a ccdeck PR or change before it's merged or released.
 disable-model-invocation: true
-argument-hint: "<PR number | branch | stop>"
+argument-hint: "<PR number | version | branch | stop>"
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/ccdeck *)
 ---
 

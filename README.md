@@ -43,7 +43,7 @@ The plugin adds these commands to Claude Code:
 | `/ccdeck:install` | Adds the background service (the dashboard starts at login) and the `ccdeck` terminal command |
 | `/ccdeck:done [note]` | Marks the current session done, with an optional note |
 | `/ccdeck:park [note]` | Sets the current session aside for later |
-| `/ccdeck:preview <PR>` | Tries an unreleased ccdeck PR or branch on your sessions, next to your dashboard (see below) |
+| `/ccdeck:preview <PR or version>` | Tries an unreleased ccdeck PR, version (`0.8.5`) or branch on your sessions, next to your dashboard (see below) |
 
 `/ccdeck:install` copies ccdeck to `~/.local/share/ccdeck`, and the service and command run from that copy. Nothing points at the plugin's versioned cache folder.
 
@@ -141,6 +141,7 @@ Any other terminal works through `CCDECK_TERMINAL`, for example `CCDECK_TERMINAL
 
 ```bash
 ccdeck preview 16          # PR #16 of slonik923/ccdeck
+ccdeck preview 0.8.5       # the version 0.8.5: a tag, main, or the open PR that bumps to it
 ccdeck preview my-branch   # a branch, tag or commit
 ccdeck preview ~/ccdeck    # a local checkout
 ccdeck preview stop

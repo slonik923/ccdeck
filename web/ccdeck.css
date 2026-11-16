@@ -607,9 +607,18 @@
   .ccd .row { grid-template-columns: 164px minmax(0, 1fr) 160px 116px 44px 104px; }
   .ccd .row .row-loc { display: none; }
 }
+/* the header: its least needed text goes first, then the search box takes a row of its own, before it shrinks to nothing */
+@container ccd (max-width: 1180px) {
+  .ccd .host, .ccd .live-text-long { display: none; }
+}
+@container ccd (max-width: 900px) {
+  .ccd .hdr-in { flex-wrap: wrap; height: auto; padding-block: 10px; row-gap: 10px; }  /* keep .wrap's side padding */
+  .ccd .search { order: 10; flex: 1 1 100%; margin: 0; }
+  .ccd .hdr-tools { margin-left: auto; }
+}
 @container ccd (max-width: 760px) {
   .ccd .wrap { padding: 0 var(--s-6); }
-  .ccd .hdr-in { flex-wrap: wrap; height: auto; padding: 10px 0; row-gap: 10px; }
+  .ccd .hdr-in { flex-wrap: wrap; height: auto; padding-block: 10px; row-gap: 10px; }
   .ccd .host { display: none; }
   .ccd .search { order: 10; flex: 1 1 100%; margin: 0; }
   .ccd .hdr-tools { margin-left: auto; }
@@ -769,6 +778,6 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .settings button:disabled { opacity: .55; cursor: not-allowed; }
 
 /* `ccdeck preview`: make it obvious this isn't your normal dashboard */
-.ccd .previewtag { font: 700 12px/1 var(--mono); color: #111; background: #ffb020; border-radius: 999px; padding: 5px 10px; white-space: nowrap; flex: none; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; }
+.ccd .previewtag { font: 700 12px/1 var(--mono); color: var(--work-fg); background: var(--work-tint); border: 1px solid var(--work-line); border-radius: 999px; padding: 4px 10px; white-space: nowrap; flex: none; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; }
 .ccd .previewtag[hidden] { display: none; }
 .ccd .host { white-space: nowrap; }

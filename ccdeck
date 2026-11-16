@@ -30,6 +30,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -2101,8 +2102,50 @@ def unpack_tarball(data, dest):
     tmp.rename(dest)
 
 
+VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
+
+
+def version_at(repo, ref):
+    """The ccdeck version (.claude-plugin/plugin.json) at a ref of repo, or None."""
+    try:
+        d = github_json(f"repos/{repo}/contents/.claude-plugin/plugin.json?ref={ref}")
+        import base64
+        return json.loads(base64.b64decode(d.get("content") or "")).get("version")
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        return None
+
+
+def find_version(version, repo):
+    """What has ccdeck `version`: a tag, main, or an open PR (they don't share one: version-bumping PRs are
+    stacked). Returns a target resolve_preview takes (a tag, "main", or "#N"), or None."""
+    for tag in ("v" + version, version):
+        try:
+            if github_json(f"repos/{repo}/commits/{tag}").get("sha"):
+                return tag
+        except (OSError, ValueError, RuntimeError):
+            pass
+    if version_at(repo, "main") == version:
+        return "main"
+    try:
+        prs = github_json(f"repos/{repo}/pulls?state=open&per_page=50")
+    except (OSError, ValueError, RuntimeError):
+        prs = []
+    for pr in prs if isinstance(prs, list) else []:
+        head = pr.get("head") or {}
+        if ((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower() \
+                and version_at(repo, head.get("sha")) == version:
+            return f"#{pr['number']}"
+    return None
+
+
 def resolve_preview(target, repo, trust):
-    """(source folder, label) for a PR number, branch, tag, commit, or local checkout."""
+    """(source folder, label) for a PR number, ccdeck version (0.8.5), branch, tag, commit, or local checkout."""
+    if (m := VERSION_RE.fullmatch(target)) and not os.path.isdir(target):
+        found = find_version(m.group(1), repo)
+        if not found:
+            sys.exit(f"No ccdeck {m.group(1)} in {repo}: not a tag, not on main, not in an open PR.")
+        print(f"ccdeck {m.group(1)} is {'PR ' + found if found.startswith('#') else found}.")
+        target = found
     if os.path.isdir(target):
         src = Path(target).resolve()
         if not (src / "ccdeck").is_file():
@@ -2147,22 +2190,37 @@ def preview_config_dir():
     for real in (MARKS_FILE, CONFIG_FILE):  # copies: marks and settings changed in the preview don't change yours
         if real.exists():
             shutil.copy(real, cfg / "ccdeck" / real.name)
+        else:  # none of yours: start without one, not with what the last preview changed
+            (cfg / "ccdeck" / real.name).unlink(missing_ok=True)
     return cfg
 
 
 def stop_preview(quiet=False):
+    """Stop the running preview and wait until it has (so its port is free). False if it wouldn't stop."""
     info = load_json(PREVIEW_DIR / "preview.json", {})
-    pid = info.get("pid")
-    if pid and pid_alive(pid, info.get("pid_start")):
+    pid, start = info.get("pid"), info.get("pid_start")
+    if not (pid and pid_alive(pid, start)):
+        if not quiet:
+            print("No preview is running.")
+        (PREVIEW_DIR / "preview.json").unlink(missing_ok=True)
+        return True
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
         try:
-            os.kill(pid, 15)
+            os.kill(pid, sig)
         except OSError:
             pass
-        if not quiet:
-            print(f"Stopped the preview of {info.get('label')}.")
-    elif not quiet:
-        print("No preview is running.")
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and pid_alive(pid, start):
+            time.sleep(0.1)
+        if not pid_alive(pid, start):
+            break
+    else:
+        print(f"The preview (pid {pid}) didn't stop; stop it yourself, then try again.", file=sys.stderr)
+        return False
+    if not quiet:
+        print(f"Stopped the preview of {info.get('label')}.")
     (PREVIEW_DIR / "preview.json").unlink(missing_ok=True)
+    return True
 
 
 def cmd_preview(args):
@@ -2173,7 +2231,15 @@ def cmd_preview(args):
     except (OSError, ValueError, RuntimeError) as e:  # network, GitHub or archive problems
         sys.exit(f"Couldn't get {args.target} from {args.repo}: {e}. "
                  "Install and log in to the GitHub CLI (gh auth login), or pass a local checkout.")
-    stop_preview(quiet=True)
+    if not stop_preview(quiet=True):
+        sys.exit(1)
+    try:
+        knows_preview = "CCDECK_PREVIEW" in (src / "ccdeck").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        knows_preview = False
+    if not knows_preview:  # it runs its own code, so it ignores what this version does for previews
+        print(f"Note: {label} predates `ccdeck preview`. Its page has no preview tag, and if the ccdeck your\n"
+              "hooks run is newer, it may switch itself to that version. Check the version in the page's header.")
     cfg = preview_config_dir()
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CCDECK_PREVIEW=label, CCDECK_NOTIFY="0", CCDECK_AUTOSTART="0")
     log = open(PREVIEW_DIR / "serve.log", "w")
@@ -2846,7 +2912,7 @@ def main():
                        + ", ".join(NOTIFY_CHANNELS) + ")")
     s.add_argument("words", nargs="*", metavar="[CHANNEL] [on|off]")
     s = sub.add_parser("preview", help="try a PR or branch of ccdeck on your sessions, next to your own dashboard")
-    s.add_argument("target", help="PR number, branch, tag or commit of ccdeck, a local checkout, or 'stop'")
+    s.add_argument("target", help="PR number, ccdeck version (0.8.5), branch, tag or commit, a local checkout, or 'stop'")
     s.add_argument("--port", type=int, default=PREVIEW_PORT)
     s.add_argument("--repo", default=PREVIEW_REPO, help="GitHub repository (default %(default)s)")
     s.add_argument("--trust", action="store_true", help="allow a PR from a fork (its code runs on your machine)")
