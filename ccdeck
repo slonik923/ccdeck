@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.8.4"
+VERSION = "0.8.5"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -291,9 +291,28 @@ def find_claude_ancestor():
     return None
 
 
+_DAYS, _MONTHS = "Mon Tue Wed Thu Fri Sat Sun".split(), "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+
+def lstart_utc(lstart):
+    """A local `ps` lstart ("Thu Nov 12 09:23:03 2026") as the same moment in UTC ("Thu Nov 12 08:23:03 2026"),
+    the form Claude Code's registry (procStart) uses on macOS. None if it doesn't parse."""
+    try:
+        _, mon, day, hms, year = lstart.split()
+        h, mi, s = (int(x) for x in hms.split(":"))
+        t = time.gmtime(time.mktime((int(year), _MONTHS.index(mon) + 1, int(day), h, mi, s, 0, 0, -1)))
+    except (ValueError, OverflowError, AttributeError):
+        return None
+    return f"{_DAYS[t.tm_wday]} {_MONTHS[t.tm_mon - 1]} {t.tm_mday} {t.tm_hour:02}:{t.tm_min:02}:{t.tm_sec:02} {t.tm_year}"
+
+
 def pid_alive(pid, start):
+    """pid runs and is the process that started at start (None: any). Without /proc, start is a `ps` lstart:
+    ccdeck saves local time, Claude Code's registry UTC, so either matches."""
     st = proc_start_time(pid) if pid else None
-    return st is not None and (start is None or st == start)
+    if st is None or start is None or st == start:
+        return st is not None
+    return not USE_PROC and isinstance(start, str) and " ".join(start.split()) in (" ".join(st.split()), lstart_utc(st))
 
 
 def running_claude_processes():
@@ -1272,6 +1291,19 @@ def notify_enabled(channel):
 def notify(title, body, urgent=False, sid=None):
     if not notify_enabled("desktop"):
         return
+    if IS_MAC and (tn := shutil.which("terminal-notifier")):
+        # clickable: on click, terminal-notifier runs `ccdeck focus <sid>`, which goes to the session's tab.
+        # osascript's notifications belong to Script Editor, so clicking one only opens Script Editor
+        cmd = [tn, "-title", title[:120], "-message", body[:200] or " ", "-group", "ccdeck-" + (sid or "ccdeck")]
+        if urgent:
+            cmd += ["-sound", "Glass"]
+        if sid:
+            cmd += ["-execute", shlex.join([sys.executable, str(Path(__file__).resolve()), "focus", sid])]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+        return
     if IS_MAC:
         script = f"display notification {applescript_str(body[:200])} with title {applescript_str(title[:120])}"
         if urgent:
@@ -1504,6 +1536,17 @@ def cmd_notify_click(args):
         return
     if clicked and (peer := peer_sessions().get(args.sid)):
         focus_terminal(peer["pid"], token)
+
+
+def cmd_focus(args):
+    """Go to the terminal tab of an open session (what a clicked macOS notification runs)."""
+    peer = peer_sessions().get(args.sid)
+    if not peer:
+        sys.exit("That session isn't open in a terminal.")
+    label = focus_terminal(peer["pid"])
+    if not label:
+        sys.exit("Couldn't switch to its tab (supported: Terminal, iTerm, gnome-terminal, tmux).")
+    print(f"Switched to its {label} tab.")
 
 
 def open_path(target):
@@ -2985,6 +3028,8 @@ def main():
     s.add_argument("--trust", action="store_true", help="allow a PR from a fork (its code runs on your machine)")
     s.add_argument("--no-open", action="store_true", help="don't open the browser")
     sub.add_parser("hook", help=argparse.SUPPRESS)
+    s = sub.add_parser("focus", help=argparse.SUPPRESS)  # run by a clicked macOS notification
+    s.add_argument("sid")
     s = sub.add_parser("notify-click", help=argparse.SUPPRESS)
     s.add_argument("sid")
     s.add_argument("title")
@@ -2997,7 +3042,7 @@ def main():
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
         "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,
-        "notify-click": cmd_notify_click, "preview": cmd_preview,
+        "notify-click": cmd_notify_click, "focus": cmd_focus, "preview": cmd_preview,
     }
     handlers[args.cmd](args)
 

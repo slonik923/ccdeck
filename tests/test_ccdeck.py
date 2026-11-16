@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -430,6 +431,29 @@ class HookTest(unittest.TestCase):
             self.assertIsNone(rows["s-midtask"]["peer_name"])  # reused pid: not that session any more
         finally:
             shutil.rmtree(reg)
+
+    def test_mac_registry_start_time_is_utc(self):
+        """Without /proc, ccdeck reads `ps` lstart in local time, while Claude Code's registry writes it in UTC:
+        both must match the live process, a different time must not (a reused pid)."""
+        saved_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Europe/Bratislava"  # UTC+1 in November; the bug only shows off UTC
+        time.tzset()
+        try:
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Thu Nov 12 09:23:03 2026"):
+                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))   # ccdeck's own, local
+                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026"))   # Claude Code's, UTC
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 07:23:03 2026"))  # another process
+                self.assertFalse(cc.pid_alive(7, "stale"))
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Mar 1 00:30:00 2026"):
+                self.assertTrue(cc.pid_alive(7, "Sat Feb 28 23:30:00 2026"))   # across a day and month
+        finally:
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
 
     def test_registry_record_without_start_time_is_ignored(self):
         build_fixtures()
@@ -892,6 +916,36 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(focused, [(42, "tok")])
         finally:
             cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv = saved
+
+    def test_mac_notification_click_runs_focus(self):
+        """With terminal-notifier, a click runs `ccdeck focus <sid>`; without it, osascript (not clickable)."""
+        calls = []
+        with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
+                mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)), \
+                mock.patch.object(cc.shutil, "which", lambda b: "/opt/bin/terminal-notifier" if b == "terminal-notifier" else None):
+            cc.notify("Permission needed · Deploy", "Bash: deploy.sh", urgent=True, sid="s-closed")
+        cmd = calls[0]
+        self.assertEqual(cmd[0], "/opt/bin/terminal-notifier")
+        self.assertEqual(cmd[cmd.index("-group") + 1], "ccdeck-s-closed")
+        self.assertEqual(cmd[cmd.index("-sound") + 1], "Glass")
+        self.assertEqual(shlex.split(cmd[cmd.index("-execute") + 1])[-2:], ["focus", "s-closed"])
+        calls.clear()
+        with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
+                mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)), \
+                mock.patch.object(cc.shutil, "which", lambda b: None):
+            cc.notify("Finished", "done", sid="s-closed")
+        self.assertEqual(calls[0][0], "osascript")
+
+    def test_focus_command(self):
+        focused = []
+        with mock.patch.object(cc, "peer_sessions", lambda: {"s-closed": {"name": "w", "pid": 42, "pids": [42]}}), \
+                mock.patch.object(cc, "focus_terminal", lambda pid: focused.append(pid) or "Terminal"), \
+                mock.patch.object(sys, "argv", ["ccdeck", "focus", "s-closed"]):
+            cc.main()
+        self.assertEqual(focused, [42])
+        with mock.patch.object(cc, "peer_sessions", lambda: {}), mock.patch.object(sys, "argv", ["ccdeck", "focus", "gone"]):
+            with self.assertRaises(SystemExit):
+                cc.main()
 
     def test_activation_token_goes_to_gnome_terminal_first(self):
         saved = cc.gnome_terminal_window
