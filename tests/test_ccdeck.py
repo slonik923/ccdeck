@@ -1150,6 +1150,21 @@ class PreviewTest(unittest.TestCase):
             cfg = cc.preview_config_dir()
         self.assertEqual((cfg / "projects").resolve(), (TMP / rel).resolve())
 
+    def test_stop_counts_an_unreaped_preview_as_stopped(self):
+        """A preview whose parent never reaps it stays a zombie: its start time is still there, but it has
+        stopped, and stop must say so rather than time out (and block every later start)."""
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])  # never waited for: a zombie
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        cc._ps_cache["t"] = 0
+        cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": proc.pid, "pid_start": cc.proc_start_time(proc.pid), "label": "x"})
+        t = time.monotonic()
+        with mock.patch("builtins.print"):
+            self.assertTrue(cc.stop_preview())
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertTrue(cc.proc_zombie(proc.pid))  # still unreaped: it was the state that counted
+
     def test_stop_never_signals_a_pid_it_cant_identify(self):
         cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
         cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": os.getpid(), "pid_start": None, "label": "x"})

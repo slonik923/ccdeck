@@ -2216,6 +2216,20 @@ def preview_config_dir():
     return cfg
 
 
+def proc_zombie(pid):
+    """pid has exited but its parent hasn't reaped it yet: its start time stays readable, but it's gone."""
+    if USE_PROC:
+        try:
+            return _stat_fields(pid)[0] == "Z"
+        except (OSError, IndexError, ValueError, TypeError):
+            return False
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+    return out.strip().startswith("Z")
+
+
 def stop_preview(quiet=False):
     """Stop the running preview and wait until it has (so its port is free). False if it wouldn't stop."""
     info = load_json(PREVIEW_DIR / "preview.json", {})
@@ -2234,10 +2248,11 @@ def stop_preview(quiet=False):
             os.kill(pid, sig)
         except OSError:
             pass
+        running = lambda: pid_alive(pid, start) and not proc_zombie(pid)  # noqa: E731  a zombie has stopped
         deadline = time.monotonic() + wait
-        while time.monotonic() < deadline and pid_alive(pid, start):
+        while time.monotonic() < deadline and running():
             time.sleep(0.1)
-        if not pid_alive(pid, start):
+        if not running():
             break
     else:
         print(f"The preview (pid {pid}) didn't stop; stop it yourself, then try again.", file=sys.stderr)
