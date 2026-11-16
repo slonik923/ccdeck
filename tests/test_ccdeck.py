@@ -433,30 +433,35 @@ class HookTest(unittest.TestCase):
             shutil.rmtree(reg)
 
     def test_mac_registry_start_time_is_utc(self):
-        """Without /proc, ccdeck reads `ps` lstart in local time, while Claude Code's registry writes it in UTC:
-        both must match the live process, a different time must not (a reused pid)."""
+        """Without /proc, `ps` gives local time. Claude Code's registry saves UTC (utc=True); ccdeck saves local
+        time, which must only match exactly: read as UTC, it would match a process started an offset later."""
         saved_tz = os.environ.get("TZ")
         os.environ["TZ"] = "Europe/Bratislava"  # UTC+1 in November; the bug only shows off UTC
         time.tzset()
         try:
             with mock.patch.object(cc, "USE_PROC", False), \
                     mock.patch.object(cc, "proc_start_time", lambda pid: "Thu Nov 12 09:23:03 2026"):
-                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))   # ccdeck's own, local
-                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026"))   # Claude Code's, UTC
-                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 07:23:03 2026"))  # another process
-                self.assertFalse(cc.pid_alive(7, "stale"))
+                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))              # ccdeck's own, local
+                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026", utc=True))    # the registry's, UTC
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026"))             # local: an hour off
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 07:23:03 2026", utc=True))   # another process
+                self.assertFalse(cc.pid_alive(7, "stale", utc=True))
+            # a reused pid that started one UTC offset after a saved local time is not that process
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Thu Nov 12 10:23:03 2026"):
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))
             with mock.patch.object(cc, "USE_PROC", False), \
                     mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Mar 1 00:30:00 2026"):
-                self.assertTrue(cc.pid_alive(7, "Sat Feb 28 23:30:00 2026"))   # across a day and month
+                self.assertTrue(cc.pid_alive(7, "Sat Feb 28 23:30:00 2026", utc=True))   # across a day and month
             # clocks going back repeat an hour: 08:00 and 09:00 UTC are both 01:00 in Los Angeles that night,
             # and `ps` can't say which; a registry record of either moment is that process
             os.environ["TZ"] = "America/Los_Angeles"
             time.tzset()
             with mock.patch.object(cc, "USE_PROC", False), \
                     mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Nov 1 01:00:00 2020"):
-                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 08:00:00 2020"))
-                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 09:00:00 2020"))
-                self.assertFalse(cc.pid_alive(7, "Sun Nov 1 10:00:00 2020"))
+                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 08:00:00 2020", utc=True))
+                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 09:00:00 2020", utc=True))
+                self.assertFalse(cc.pid_alive(7, "Sun Nov 1 10:00:00 2020", utc=True))
         finally:
             if saved_tz is None:
                 os.environ.pop("TZ", None)

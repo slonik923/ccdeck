@@ -87,7 +87,7 @@ It goes through these steps, and you can run it again any time to check:
 3. **If macOS says no,** or the prompt didn't appear, it opens **System Settings > Notifications**. Find **terminal-notifier**, turn on **Allow notifications**, and set the style to **Banners**.
 4. **First click.** macOS may ask whether `terminal-notifier` can control Terminal (or iTerm): choose **OK**. That's how it switches to the tab.
 
-If notifications still open Script Editor, `terminal-notifier -diagnose` shows what macOS allows it. Until it's allowed, ccdeck sends notifications the old way, so you don't miss any.
+If notifications still open Script Editor, `terminal-notifier -diagnose` shows what macOS allows it. Until it's allowed, ccdeck sends notifications the old way (through `osascript`, which macOS lists as Script Editor), so you still get them, as long as notifications from Script Editor are allowed too.
 
 ## The dashboard
 

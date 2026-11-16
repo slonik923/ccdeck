@@ -308,15 +308,17 @@ def lstart_local(utc_lstart):
     return f"{_DAYS[t.tm_wday]} {_MONTHS[t.tm_mon - 1]} {t.tm_mday} {t.tm_hour:02}:{t.tm_min:02}:{t.tm_sec:02} {t.tm_year}"
 
 
-def pid_alive(pid, start):
-    """pid runs and is the process that started at start (None: any). Without /proc, start is a `ps` lstart:
-    ccdeck saves local time, Claude Code's registry UTC, so either matches."""
+def pid_alive(pid, start, utc=False):
+    """pid runs and is the process that started at start (None: any). Without /proc, start is a `ps` lstart
+    in local time, as ccdeck saves it; utc: in UTC, as Claude Code's registry (procStart) saves it. Only that
+    one is converted: read as UTC, a local time would also match a process started one UTC offset later."""
     st = proc_start_time(pid) if pid else None
     if st is None or start is None or st == start:
         return st is not None
     if USE_PROC or not isinstance(start, str):
         return False
-    return " ".join(st.split()) in (" ".join(start.split()), lstart_local(start))
+    want = lstart_local(start) if utc else start
+    return bool(want) and " ".join(st.split()) == " ".join(want.split())
 
 
 def running_claude_processes():
@@ -1060,7 +1062,7 @@ def peer_sessions():
         sid, pid, start, name = d.get("sessionId"), d.get("pid"), d.get("procStart"), d.get("name")
         # the format is Claude Code's and undocumented: skip records that don't look as expected.
         # procStart is required: without it pid_alive accepts any process that reused the pid
-        if isinstance(sid, str) and sid and isinstance(pid, int) and start and pid_alive(pid, start):
+        if isinstance(sid, str) and sid and isinstance(pid, int) and start and pid_alive(pid, start, utc=True):
             e = out.setdefault(sid, {"name": None, "pid": pid, "pids": []})
             e["pids"].append(pid)
             e["name"] = e["name"] or (name if isinstance(name, str) else None)
