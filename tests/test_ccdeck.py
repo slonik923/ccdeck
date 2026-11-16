@@ -1113,6 +1113,33 @@ class DemoDataTest(unittest.TestCase):
 class PreviewTest(unittest.TestCase):
     """`ccdeck preview` runs another ccdeck on the same sessions, with its own caches."""
 
+    def test_resume_from_a_preview_gets_your_environment(self):
+        """The preview's own config folder and CCDECK_NOTIFY=0 must not reach a `claude --resume` it starts."""
+        saved = json.dumps({"CLAUDE_CONFIG_DIR": None, "CCDECK_PREVIEW": None, "CCDECK_NOTIFY": "1", "CCDECK_AUTOSTART": None})
+        env = cc.user_env({"CLAUDE_CONFIG_DIR": "/p/claude", "CCDECK_PREVIEW": "#35", "CCDECK_NOTIFY": "0",
+                           "CCDECK_AUTOSTART": "0", "CCDECK_PREVIEW_SAVED_ENV": saved, "PATH": "/bin"})
+        self.assertEqual(env, {"CCDECK_NOTIFY": "1", "PATH": "/bin"})
+        env = cc.user_env({"CLAUDE_CONFIG_DIR": "/p/claude", "CCDECK_PREVIEW_SAVED_ENV": json.dumps({"CLAUDE_CONFIG_DIR": "/me/.claude"})})
+        self.assertEqual(env, {"CLAUDE_CONFIG_DIR": "/me/.claude"})
+        self.assertEqual(cc.user_env({"CLAUDE_CONFIG_DIR": "/mine"}), {"CLAUDE_CONFIG_DIR": "/mine"})  # not a preview: as is
+
+    def test_preview_refuses_a_port_another_program_has(self):
+        import socket
+        other = socket.socket()
+        other.bind(("127.0.0.1", 0))
+        other.listen()
+        self.addCleanup(other.close)
+        args = mock.Mock(target="34", repo="o/r", trust=False, port=other.getsockname()[1], no_open=True)
+        started = []
+        with mock.patch.object(cc, "resolve_preview", lambda *a: (TMP, "#34 x")), \
+                mock.patch.object(cc, "stop_preview", lambda quiet=False: True), \
+                mock.patch.object(cc.subprocess, "Popen", lambda *a, **k: started.append(a)), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit) as e:
+                cc.cmd_preview(args)
+        self.assertIn("in use", str(e.exception.code))
+        self.assertEqual(started, [])
+
     def test_config_dir_drops_a_stale_copy(self):
         """No config.json of yours: the preview starts without one, not with the last preview's changes."""
         cc.CONFIG_FILE.unlink(missing_ok=True)

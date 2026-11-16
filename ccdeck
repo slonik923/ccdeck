@@ -1212,6 +1212,26 @@ GRAPHICAL_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_
                   "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP")
 
 
+PREVIEW_ENV = ("CLAUDE_CONFIG_DIR", "CCDECK_PREVIEW", "CCDECK_NOTIFY", "CCDECK_AUTOSTART")  # what a preview overrides
+
+
+def user_env(env):
+    """env as you had it before `ccdeck preview` overrode it, for what a preview starts on your behalf (claude
+    --resume): its config folder has no settings or hooks, and CCDECK_NOTIFY=0 would silence that session."""
+    saved = env.pop("CCDECK_PREVIEW_SAVED_ENV", None)
+    try:
+        orig = json.loads(saved) if saved else {}
+    except ValueError:
+        orig = {}
+    for k, v in (orig.items() if isinstance(orig, dict) else ()):
+        if k in PREVIEW_ENV:
+            if isinstance(v, str):
+                env[k] = v
+            else:
+                env.pop(k, None)
+    return env
+
+
 def desktop_env():
     """Environment with the graphical session's variables (a systemd service may start before them)."""
     env = dict(os.environ)
@@ -1320,7 +1340,7 @@ def open_terminal(cwd, argv):
     cmd = terminal_command(cwd, argv)
     if not cmd:
         raise RuntimeError("No terminal emulator found; set CCDECK_TERMINAL")
-    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=desktop_env(),
+    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=user_env(desktop_env()),
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     if cmd[0] == "osascript":
         return "iTerm" if 'tell application "iTerm"' in cmd else "Terminal"
@@ -2240,8 +2260,16 @@ def cmd_preview(args):
     if not knows_preview:  # it runs its own code, so it ignores what this version does for previews
         print(f"Note: {label} predates `ccdeck preview`. Its page has no preview tag, and if the ccdeck your\n"
               "hooks run is newer, it may switch itself to that version. Check the version in the page's header.")
+    import socket
+    with socket.socket() as sock:  # bound like the server binds it: free, or another program's
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", args.port))
+        except OSError:
+            sys.exit(f"Port {args.port} is in use by another program; pick another with --port.")
     cfg = preview_config_dir()
-    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CCDECK_PREVIEW=label, CCDECK_NOTIFY="0", CCDECK_AUTOSTART="0")
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CCDECK_PREVIEW=label, CCDECK_NOTIFY="0", CCDECK_AUTOSTART="0",
+               CCDECK_PREVIEW_SAVED_ENV=json.dumps({k: os.environ.get(k) for k in PREVIEW_ENV}))
     log = open(PREVIEW_DIR / "serve.log", "w")
     proc = subprocess.Popen([sys.executable, str(src / "ccdeck"), "serve", "--port", str(args.port)], env=env,
                             stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
