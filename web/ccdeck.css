@@ -798,4 +798,9 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .ib-open:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .ccd .ib-open:hover .rr-title { text-decoration: underline; }
 .ccd .ib-body { color: var(--text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 640px) { .ccd .inbox li { grid-template-columns: auto minmax(0, 1fr) 32px; } .ccd .inbox .ago { display: none; } }
+@media (max-width: 640px) {
+  .ccd .inbox li { grid-template-columns: auto minmax(0, 1fr) 32px; } .ccd .inbox .ago { display: none; }
+  /* the bell isn't the last button: hang the menu off the header, full width, rather than off the bell */
+  .ccd .menu-wrap:has(> .bellbtn) { position: static; }
+  .ccd .inboxpop { top: 100%; left: 16px; right: 16px; width: auto; max-width: none; }
+}

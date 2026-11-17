@@ -175,6 +175,17 @@ def build(home, pid):
         if msg:
             st["message"] = msg
         (data / "state" / f"{sid}.json").write_text(json.dumps(st))
+    # the bell's notifications: one per session, each in the state that raised it (else the dashboard drops it)
+    (data / "inbox").mkdir(exist_ok=True)
+    now = __import__("time").time()
+    for i, (sid, state, title, body, ago) in enumerate((
+            ("d-deploy", "permission", "Permission needed · Ship Stripe webhook handler to staging",
+             "Claude needs your permission to use Bash", 2),
+            ("d-auth", "question", "Question for you · Migrate auth to Lucia v4",
+             "Should sessions created before the migration be invalidated, or should I write a shim that upgrades them?", 5))):
+        nid = f"{int((now - ago * 60) * 1000)}-demo{i}"
+        (data / "inbox" / f"{nid}.json").write_text(json.dumps(
+            {"id": nid, "sid": sid, "state": state, "title": title, "body": body, "ts": now - ago * 60}))
     (data / "marks.json").write_text(json.dumps({
         "d-bun": {"parked": True, "note": "after Q4 freeze"},
         "d-node": {"note": "waiting on QA"},

@@ -112,6 +112,7 @@ STATES = {
     "done": ("done", "Done"),
 }
 GROUP_ORDER = {g: i for i, (g, _) in enumerate(GROUPS)}
+PR_STATES = {"ci_failing", "changes_requested", "pr_conflict", "pr_approved", "pr_draft"}
 NOTIFY_STATES = {"permission", "question", "plan", "decision", "error",
                  "ci_failing", "changes_requested", "pr_conflict", "pr_approved", "pr_draft", "idle"}
 
@@ -1324,18 +1325,30 @@ def inbox_clear(nid):
         (INBOX_DIR / f"{nid}.json").unlink(missing_ok=True)
 
 
+def inbox_clear_session(sid):
+    for d in inbox_items():
+        if d["sid"] == sid:
+            inbox_clear(d["id"])
+
+
 def inbox_sweep(rows):
     """Drop notifications that were acted on: the session left the state that raised it (you sent a
-    message, answered the permission prompt, the session closed), or the session is gone."""
+    message, answered the permission prompt, the session closed), or the session is gone. A closed session
+    keeps the state of a question it never answered, so closing has to count on its own; a PR's state is
+    about the PR, though, and stays news after the session closes."""
     cur = {r["id"]: r["state"] for r in rows}
+    closed = {r["id"] for r in rows if not r.get("alive", True)}
     for d in inbox_items():
-        if cur.get(d["sid"]) != d.get("state"):
+        if cur.get(d["sid"]) != d.get("state") or (d["sid"] in closed and d.get("state") not in PR_STATES):
             inbox_clear(d["id"])
 
 
 def notify(title, body, urgent=False, sid=None, state=None, text=None):
     """body: the short line for the desktop popup; text: the whole message, kept in the inbox."""
-    nid = inbox_add(sid, state, title, text or body) if sid else None
+    try:
+        nid = inbox_add(sid, state, title, text or body) if sid else None
+    except OSError:  # an unwritable inbox loses the bell entry, not the desktop notification (or the hook)
+        nid = None
     if not notify_enabled("desktop"):
         return
     if IS_MAC and (tn := shutil.which("terminal-notifier")):
@@ -1365,7 +1378,7 @@ def notify(title, body, urgent=False, sid=None, state=None, text=None):
         return
     if sid and importlib.util.find_spec("gi"):
         # a detached helper sends it and waits for a click, which goes to the session's tab
-        cmd = ([sys.executable, str(Path(__file__).resolve()), "notify-click", sid, "--id", nid]
+        cmd = ([sys.executable, str(Path(__file__).resolve()), "notify-click", sid] + (["--id", nid] if nid else [])
                + (["--urgent"] if urgent else []) + ["--", title, body])
     elif shutil.which("notify-send"):
         cmd = ["notify-send", "-a", "Claude Code", "-i", "utilities-terminal"] + (["-u", "critical"] if urgent else []) + [title, body]
@@ -1702,6 +1715,10 @@ def cmd_notify_click(args):
 
 def cmd_focus(args):
     """Go to the terminal tab of an open session (what a clicked macOS notification runs)."""
+    try:
+        inbox_clear_session(args.sid)  # clicking the notification is acting on it
+    except OSError:
+        pass
     peer = peer_sessions().get(args.sid)
     if not peer:
         sys.exit("That session isn't open in a terminal.")
@@ -2548,6 +2565,12 @@ def start_preview(args):
 
 # ------------------------------------------------------------------------ hook
 
+# events that mean you acted on what the session's notification asked: you replied, or the prompt was
+# answered (a tool ran or was denied), or the session ended. The dashboard's 2 s sweep can miss one: a
+# prompt approved and the next one asked between two scans both read as "permission"
+INBOX_ACTED = ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "PermissionDenied", "SessionEnd")
+
+
 def cmd_hook(_args):
     try:
         data = json.load(sys.stdin)
@@ -2606,6 +2629,11 @@ def cmd_hook(_args):
                 and not daemon_running()):
             notify(f"Claude needs you · {short_path(state.get('cwd'))}", msg or ntype, urgent=True, sid=sid,
                    state=state.get("status"))
+    if event in INBOX_ACTED:
+        try:
+            inbox_clear_session(sid)
+        except OSError:
+            pass
     save_json(path, state)
     close_requests(sid, event, data)
     if event == "PermissionRequest":

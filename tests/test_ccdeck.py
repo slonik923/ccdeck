@@ -382,6 +382,36 @@ class HookTest(unittest.TestCase):
         finally:
             sys.stdin = old
 
+    def test_hook_clears_the_notification_you_acted_on(self):
+        """Approving prompt A and getting prompt B between two dashboard scans reads as "permission" both
+        times; the hook's PostToolUse is what says A was answered."""
+        build_fixtures()
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        cc.inbox_add("s-closed", "permission", "Needs approval", "Claude wants to use Bash")
+        keep = cc.inbox_add("s-midtask", "permission", "Needs approval", "Claude wants to use Edit")
+        self.run_hook({"session_id": "s-closed", "hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+        self.assertEqual(len(cc.inbox_items()), 2)  # asking again isn't acting on it
+        with mock.patch.object(cc, "wait_for_approval", lambda *a: None):
+            self.run_hook({"session_id": "s-closed", "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+        self.assertEqual([d["id"] for d in cc.inbox_items()], [keep])
+
+    def test_unwritable_inbox_keeps_the_notification_and_the_hook(self):
+        build_fixtures()
+        (cc.STATE_DIR / "s-noinbox.json").unlink(missing_ok=True)
+        sent = []
+        def fail(*a):
+            raise PermissionError("inbox/.lock")
+        with mock.patch.object(cc, "inbox_add", fail), mock.patch.object(cc, "IS_MAC", False), \
+                mock.patch.object(cc, "notify_enabled", lambda c: True), mock.patch.object(cc, "daemon_running", lambda: False), \
+                mock.patch.object(cc.importlib.util, "find_spec", lambda n: object()), \
+                mock.patch.object(cc, "desktop_env", lambda: {}), \
+                mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: sent.append(cmd) or mock.MagicMock()):
+            self.run_hook({"session_id": "s-noinbox", "hook_event_name": "Notification",
+                           "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"})
+        (click,) = [c for c in sent if "notify-click" in c]  # the desktop notification still went out
+        self.assertNotIn("--id", click)  # nothing in the inbox for the click helper to watch
+        self.assertEqual(cc.load_json(cc.STATE_DIR / "s-noinbox.json", {}).get("status"), "permission")  # state saved
+
     def test_live_states_from_hooks(self):
         build_fixtures()
         sid = "s-closed"
@@ -855,12 +885,24 @@ class ServerTest(unittest.TestCase):
         rows[1]["state"] = "working"  # you replied in b
         rows[2]["state"] = "closed"   # c was closed
         cc.inbox_sweep(rows)
+        cq = cc.inbox_add("c", "question", "Question · c", "Which one?")
+        rows[2].update(state="question", alive=False)  # closed with the question unanswered: same state
+        cc.inbox_sweep(rows)
+        self.assertNotIn(cq, [d["id"] for d in cc.inbox_items()])
+        ci = cc.inbox_add("c", "ci_failing", "CI failing · c", "")
+        rows[2]["state"] = "ci_failing"  # its PR failed after it closed: news about the PR, it stays
+        cc.inbox_sweep(rows)
+        self.assertIn(ci, [d["id"] for d in cc.inbox_items()])
+        cc.inbox_clear(ci)
         self.assertEqual([d["id"] for d in cc.inbox_items()], [na])
         na2 = cc.inbox_add("a", "permission", "Needs approval · a", "Bash: make deploy")
         self.assertEqual([d["id"] for d in cc.inbox_items()], [na2])  # one per session, the newest
 
-        # through the dashboard, whose own sweep sees this server's sessions
+        # dismissing through the API (the fixture's sessions are closed: keep the sweep, tested above, out of it)
         shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        sweep = mock.patch.object(cc, "inbox_sweep", lambda rows: None)
+        sweep.start()
+        self.addCleanup(sweep.stop)
         st = {x["id"]: x["state"] for x in json.loads(self.req("/api/sessions")[1])["sessions"]}
         n1, n2 = cc.inbox_add("s-closed", st["s-closed"], "One", ""), cc.inbox_add("s-midtask", st["s-midtask"], "Two", "")
         self.assertEqual(self.req("/api/action", token=False, data={"action": "dismiss", "nid": n1})[0], 403)
@@ -1045,11 +1087,14 @@ class ServerTest(unittest.TestCase):
 
     def test_focus_command(self):
         focused = []
+        cc.inbox_add("s-closed", "permission", "Needs approval", "Bash: deploy")
+        keep = cc.inbox_add("other", "idle", "Your turn", "")
         with mock.patch.object(cc, "peer_sessions", lambda: {"s-closed": {"name": "w", "pid": 42, "pids": [42]}}), \
                 mock.patch.object(cc, "focus_terminal", lambda pid: focused.append(pid) or "Terminal"), \
                 mock.patch.object(sys, "argv", ["ccdeck", "focus", "s-closed"]):
             cc.main()
         self.assertEqual(focused, [42])
+        self.assertEqual([d["id"] for d in cc.inbox_items()], [keep])  # clicking it on macOS is acting on it
         with mock.patch.object(cc, "peer_sessions", lambda: {}), mock.patch.object(sys, "argv", ["ccdeck", "focus", "gone"]):
             with self.assertRaises(SystemExit):
                 cc.main()
