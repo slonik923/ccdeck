@@ -1209,7 +1209,8 @@ class PreviewTest(unittest.TestCase):
         with mock.patch("builtins.print"):
             self.assertTrue(cc.stop_preview())
         cc._ps_cache["t"] = 0
-        self.assertFalse(cc.pid_alive(pid, None))  # gone by the time it returns
+        # gone by the time it returns (a zombie has exited too: only its parent hasn't collected it)
+        self.assertTrue(not cc.pid_alive(pid, None) or cc.proc_zombie(pid))
         self.assertLess(time.monotonic() - t, 5)  # SIGTERM was enough
         self.assertFalse((cc.PREVIEW_DIR / "preview.json").exists())
 
