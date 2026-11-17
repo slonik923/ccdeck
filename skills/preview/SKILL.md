@@ -6,6 +6,6 @@ argument-hint: "<PR number | version | branch | stop>"
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/ccdeck *)
 ---
 
-!`python3 ${CLAUDE_PLUGIN_ROOT}/ccdeck preview $ARGUMENTS 2>&1`
+!`python3 "${CLAUDE_PLUGIN_ROOT}/ccdeck" preview $ARGUMENTS 2>&1`
 
 Tell the user, in one or two short lines, the preview URL printed above (or the problem it reports), and that `/ccdeck:preview stop` stops it. Don't do anything else.
