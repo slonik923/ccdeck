@@ -382,6 +382,169 @@ class HookTest(unittest.TestCase):
         finally:
             sys.stdin = old
 
+    def test_hook_clears_the_notification_you_acted_on(self):
+        """Approving prompt A and getting prompt B between two dashboard scans reads as "permission" both
+        times; the hook's PostToolUse is what says A was answered."""
+        build_fixtures()
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        cc.inbox_add("s-closed", "permission", "Needs approval", "Claude wants to use Bash")
+        keep = cc.inbox_add("s-midtask", "permission", "Needs approval", "Claude wants to use Edit")
+        self.run_hook({"session_id": "s-closed", "hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+        self.assertEqual(len(cc.inbox_items()), 2)  # asking again isn't acting on it
+        with mock.patch.object(cc, "wait_for_approval", lambda *a: None):
+            self.run_hook({"session_id": "s-closed", "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+        self.assertEqual([d["id"] for d in cc.inbox_items()], [keep])
+
+    def test_session_end_preserves_pr_notifications_and_clears_prompts(self):
+        build_fixtures()
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        states = cc.PR_STATES | {"question", "permission", "plan", "decision"}
+        kept = set()
+        for state in states:
+            sid = "s-end-" + state
+            nid = cc.inbox_add(sid, state, "Needs you", state)
+            if state in cc.PR_STATES:
+                kept.add(nid)
+            self.run_hook({"session_id": sid, "hook_event_name": "SessionEnd", "reason": "exit"})
+        self.assertEqual({d["id"] for d in cc.inbox_items()}, kept)
+
+    def test_question_notification_uses_pending_question_text(self):
+        build_fixtures()
+        long_q = "Which database should we use? " + "Context. " * 120  # past the 600-character summary
+        question = long_q + "\n\nAnd which region?"
+        write_session("s-question", [user("plan it", 200),
+                      asst([text("Let me ask you."), tool("t1", "AskUserQuestion",
+                            {"questions": [{"question": long_q}, {"question": "And which region?"}]})], 199)])
+        row = by_id(cc.collect(True, 10 ** 6))["s-question"]
+        row["alive"] = True
+        row["hook_message"] = "Generic hook message"
+        dash = cc.Dashboard(0)
+        dash.prev_states = {}
+        with mock.patch.object(cc, "notify") as notify:
+            dash._notify_changes([row])
+        self.assertEqual(notify.call_args.kwargs["text"], question)  # the bell: every question, whole
+        self.assertEqual(notify.call_args.args[1], cc.one_line(question, 160))  # the popup: one short line
+        self.assertLessEqual(len(row["pending_input"]), 600)  # the waiting-state summary is unchanged
+
+    def test_new_permission_between_scans_gets_a_fresh_notification(self):
+        build_fixtures()
+        sid = "s-closed"
+        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        dash = cc.Dashboard(0)
+        def scan():
+            rows = cc.collect(True, 10 ** 6)
+            dash._notify_changes(rows)
+        with mock.patch.object(cc, "pid_alive", return_value=True), \
+                mock.patch.object(cc, "wait_for_approval", return_value=None), \
+                mock.patch.object(cc, "daemon_running", return_value=True):
+            self.run_hook({"session_id": sid, "hook_event_name": "UserPromptSubmit"})
+            cc.save_json(cc.STATE_DIR / f"{sid}.json", dict(cc.load_json(cc.STATE_DIR / f"{sid}.json", {}), pid=123))
+            scan()  # first scan never replays notifications
+            self.run_hook({"session_id": sid, "hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+            scan()
+            first = next(d for d in cc.inbox_items() if d["sid"] == sid)
+            self.run_hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+            self.run_hook({"session_id": sid, "hook_event_name": "PermissionRequest", "tool_name": "Edit"})
+            scan()  # both dashboard scans see permission
+            second = next(d for d in cc.inbox_items() if d["sid"] == sid)
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertIn("Edit", second["body"])
+            scan()
+            self.assertEqual(next(d for d in cc.inbox_items() if d["sid"] == sid)["id"], second["id"])
+            cc.inbox_clear(second["id"])  # dismissal must survive another scan of the same prompt
+            scan()
+            self.assertFalse(any(d["sid"] == sid for d in cc.inbox_items()))
+
+    def test_closing_doesnt_bring_back_a_dismissed_pr_notification(self):
+        dash = cc.Dashboard(0)
+        dash.prev_states = {"s-pr": ("ci_failing", None)}  # notified, then dismissed
+        row = {"id": "s-pr", "state": "ci_failing", "group": "fix", "alive": False, "notification_epoch": 123.0}
+        with mock.patch.object(cc, "notify") as notify:
+            dash._notify_changes([row])  # SessionEnd moved the epoch; the PR's state didn't change
+        notify.assert_not_called()
+
+    def test_odd_question_input_doesnt_break_the_scan(self):
+        write_session("s-oddq", [user("plan it", 200), asst([tool("t1", "AskUserQuestion", {"questions": 1})], 199)])
+        self.assertIsNone(cc.parse_transcript(PROJ / "s-oddq.jsonl")["pending_question"])  # no TypeError
+
+    def test_each_question_is_its_own_notification(self):
+        """A question is its tool call: an answer's epoch alone doesn't repeat it, and the next question with
+        the same epoch (both read between two hook events) still gets its own."""
+        dash = cc.Dashboard(0)
+        row = lambda tid, epoch: {"id": "s-q", "state": "question", "group": "needs", "alive": True,
+                                  "pending_id": tid, "notification_epoch": epoch, "pending_question": tid}
+        sent = []
+        with mock.patch.object(cc, "notify", lambda *a, **k: sent.append(k["text"])):
+            dash.prev_states = {"s-q": ("working", None)}
+            for r in (row("A", 1), row("A", 2), row("B", 2)):
+                dash._notify_changes([r])
+        self.assertEqual(sent, ["A", "B"])
+
+    def test_a_held_inbox_lock_doesnt_hold_up_the_hook(self):
+        import fcntl
+        cc.INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cc.INBOX_DIR / ".lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)  # another hook, stuck while holding it
+            t = time.monotonic()
+            with self.assertRaises(OSError):  # notify() catches it: the popup goes out without a bell entry
+                cc.inbox_add("s-lock", "idle", "Your turn", "")
+            self.assertLess(time.monotonic() - t, 3)
+
+    def test_refreshes_take_turns(self):
+        """The scan loop and an action refreshing at once: the older one mustn't finish last."""
+        import threading
+        dash, running, overlap = cc.Dashboard(0), [], []
+        def collect(**kw):
+            running.append(1)
+            if len(running) > 1:
+                overlap.append(1)
+            time.sleep(0.05)
+            running.pop()
+            return []
+        with mock.patch.object(cc, "collect", collect), mock.patch.object(cc, "inbox_items", lambda: []), \
+                mock.patch.object(cc, "review_requests", lambda s: []), mock.patch.object(cc, "hooks_active", lambda: True):
+            threads = [threading.Thread(target=dash.refresh) for _ in range(4)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+        self.assertEqual(overlap, [])
+
+    def test_closed_pending_question_withdraws_the_desktop_notification(self):
+        build_fixtures()
+        sid = "s-question"
+        nid = cc.inbox_add(sid, "question", "Question", "Which one?")
+        def click(title, body, urgent, wanted):
+            self.assertTrue(wanted())
+            rows = cc.collect(True, 10 ** 6)
+            row = by_id(rows)[sid]
+            self.assertEqual((row["pending_tool"], row["state"], row["alive"]),
+                             ("AskUserQuestion", "question", False))
+            dash = cc.Dashboard(0)
+            dash.prev_states = {sid: ("question", 123)}  # last scan saw the open question
+            dash._notify_changes(rows)
+            self.assertFalse(wanted())
+            return False, None
+        with mock.patch.object(cc, "notification_click", side_effect=click):
+            cc.cmd_notify_click(type("Args", (), dict(sid=sid, id=nid, title="Question", body="Which one?", urgent=True)))
+
+    def test_unwritable_inbox_keeps_the_notification_and_the_hook(self):
+        build_fixtures()
+        (cc.STATE_DIR / "s-noinbox.json").unlink(missing_ok=True)
+        sent = []
+        def fail(*a):
+            raise PermissionError("inbox/.lock")
+        with mock.patch.object(cc, "inbox_add", fail), mock.patch.object(cc, "IS_MAC", False), \
+                mock.patch.object(cc, "notify_enabled", lambda c: True), mock.patch.object(cc, "daemon_running", lambda: False), \
+                mock.patch.object(cc.importlib.util, "find_spec", lambda n: object()), \
+                mock.patch.object(cc, "desktop_env", lambda: {}), \
+                mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: sent.append(cmd) or mock.MagicMock()):
+            self.run_hook({"session_id": "s-noinbox", "hook_event_name": "Notification",
+                           "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"})
+        (click,) = [c for c in sent if "notify-click" in c]  # the desktop notification still went out
+        self.assertNotIn("--id", click)  # nothing in the inbox for the click helper to watch
+        self.assertEqual(cc.load_json(cc.STATE_DIR / "s-noinbox.json", {}).get("status"), "permission")  # state saved
+
     def test_live_states_from_hooks(self):
         build_fixtures()
         sid = "s-closed"
@@ -843,6 +1006,47 @@ class ServerTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, e.read()
 
+    def test_inbox_keeps_only_what_wasnt_acted_on(self):
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        rows = [{"id": "a", "state": "permission"}, {"id": "b", "state": "idle"}, {"id": "c", "state": "question"}]
+        na = cc.inbox_add("a", "permission", "Needs approval · a", "Bash: rm -rf build")
+        cc.inbox_add("b", "idle", "Your turn · b", "Done.")
+        cc.inbox_add("c", "question", "Question · c", "Which one?")
+        cc.inbox_add("gone", "idle", "Your turn · gone", "")
+        cc.inbox_sweep(rows)
+        self.assertEqual({d["sid"] for d in cc.inbox_items()}, {"a", "b", "c"})  # the gone session's is dropped
+        rows[1]["state"] = "working"  # you replied in b
+        rows[2]["state"] = "closed"   # c was closed
+        cc.inbox_sweep(rows)
+        cq = cc.inbox_add("c", "question", "Question · c", "Which one?")
+        rows[2].update(state="question", alive=False)  # closed with the question unanswered: same state
+        cc.inbox_sweep(rows)
+        self.assertNotIn(cq, [d["id"] for d in cc.inbox_items()])
+        ci = cc.inbox_add("c", "ci_failing", "CI failing · c", "")
+        rows[2]["state"] = "ci_failing"  # its PR failed after it closed: news about the PR, it stays
+        cc.inbox_sweep(rows)
+        self.assertIn(ci, [d["id"] for d in cc.inbox_items()])
+        cc.inbox_clear(ci)
+        self.assertEqual([d["id"] for d in cc.inbox_items()], [na])
+        na2 = cc.inbox_add("a", "permission", "Needs approval · a", "Bash: make deploy")
+        self.assertEqual([d["id"] for d in cc.inbox_items()], [na2])  # one per session, the newest
+
+        # dismissing through the API (the fixture's sessions are closed: keep the sweep, tested above, out of it)
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        sweep = mock.patch.object(cc, "inbox_sweep", lambda rows: None)
+        sweep.start()
+        self.addCleanup(sweep.stop)
+        st = {x["id"]: x["state"] for x in json.loads(self.req("/api/sessions")[1])["sessions"]}
+        n1, n2 = cc.inbox_add("s-closed", st["s-closed"], "One", ""), cc.inbox_add("s-midtask", st["s-midtask"], "Two", "")
+        self.assertEqual(self.req("/api/action", token=False, data={"action": "dismiss", "nid": n1})[0], 403)
+        self.assertEqual(self.req("/api/action", data={"action": "dismiss", "nid": "../token"})[0], 200)  # ignored
+        self.assertTrue(cc.TOKEN_FILE.exists())
+        self.assertEqual(self.req("/api/action", data={"action": "dismiss", "nid": n1})[0], 200)
+        snap = json.loads(self.req("/api/sessions")[1])
+        self.assertEqual([n["id"] for n in snap["notifications"]], [n2])
+        self.assertEqual(self.req("/api/action", data={"action": "dismiss_all"})[0], 200)
+        self.assertEqual(cc.inbox_items(), [])
+
     def test_page_has_token(self):
         code, body = self.req("/", token=False)
         self.assertEqual(code, 200)
@@ -926,6 +1130,18 @@ class ServerTest(unittest.TestCase):
         finally:
             cc.peer_sessions, cc.focus_terminal, cc.open_terminal = saved
 
+    def test_notification_click_goes_to_the_tab_even_if_the_inbox_cant_be_written(self):
+        focused = []
+        def fail(nid):
+            raise PermissionError("inbox")
+        with mock.patch.object(cc, "peer_sessions", lambda: {"s-closed": {"name": "w", "pid": 42, "pids": [42]}}), \
+                mock.patch.object(cc, "focus_terminal", lambda pid, token: focused.append(pid)), \
+                mock.patch.object(cc, "notification_click", lambda *a: (True, "tok")), \
+                mock.patch.object(cc, "inbox_clear", fail), \
+                mock.patch.object(sys, "argv", ["ccdeck", "notify-click", "s-closed", "--id", "n1", "--", "t", "b"]):
+            cc.main()
+        self.assertEqual(focused, [42])
+
     def test_notification_click_goes_to_the_sessions_tab(self):
         saved = cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv
         focused = []
@@ -935,7 +1151,7 @@ class ServerTest(unittest.TestCase):
             raise RuntimeError("no session bus")
         try:
             for click, sid in ((lambda *a: (True, "tok"), "s-closed"), (lambda *a: (False, None), "s-closed"),
-                               (lambda *a: (True, None), "gone"), (boom, "s-closed")):
+                               (lambda *a: (True, None), "gone"), (boom, "s-closed")):  # *a: title, body, urgent, wanted
                 cc.notification_click = click
                 sys.argv = ["ccdeck", "notify-click", sid, "--", "-title", "body"]
                 cc.main()
@@ -1016,11 +1232,14 @@ class ServerTest(unittest.TestCase):
 
     def test_focus_command(self):
         focused = []
+        cc.inbox_add("s-closed", "permission", "Needs approval", "Bash: deploy")
+        keep = cc.inbox_add("other", "idle", "Your turn", "")
         with mock.patch.object(cc, "peer_sessions", lambda: {"s-closed": {"name": "w", "pid": 42, "pids": [42]}}), \
                 mock.patch.object(cc, "focus_terminal", lambda pid: focused.append(pid) or "Terminal"), \
                 mock.patch.object(sys, "argv", ["ccdeck", "focus", "s-closed"]):
             cc.main()
         self.assertEqual(focused, [42])
+        self.assertEqual([d["id"] for d in cc.inbox_items()], [keep])  # clicking it on macOS is acting on it
         with mock.patch.object(cc, "peer_sessions", lambda: {}), mock.patch.object(sys, "argv", ["ccdeck", "focus", "gone"]):
             with self.assertRaises(SystemExit):
                 cc.main()
@@ -1044,6 +1263,52 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(len(cmds), 1)
         finally:
             cc.gnome_terminal_window = saved
+
+
+class InboxClickTest(unittest.TestCase):
+    def test_concurrent_notifications_for_one_session_leave_one_entry(self):
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        threads = [threading.Thread(target=cc.inbox_add, args=("s7", "idle", f"n{i}", "")) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len([d for d in cc.inbox_items() if d["sid"] == "s7"]), 1)
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+
+    def test_the_inbox_keeps_the_whole_message(self):
+        long = "Should I roll back the canary?\n\n" + "Details. " * 2000  # well past the dashboard's message limit
+        cc.notify("Question · deploy", cc.one_line(long, 160), sid="s9", state="question", text=long)
+        (entry,) = [d for d in cc.inbox_items() if d["sid"] == "s9"]
+        self.assertEqual(entry["body"], long)  # CCDECK_NOTIFY=0 here: no popup, the entry is still kept
+        cc.inbox_clear(entry["id"])
+
+    def test_click_clears_the_entry_and_a_gone_entry_withdraws_the_popup(self):
+        saved = cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv
+        cc.peer_sessions = lambda: {}
+        cc.focus_terminal = lambda pid, token: None
+        seen = []
+        try:
+            nid = cc.inbox_add("s1", "idle", "Your turn · s1", "Done.")
+            def click(title, body, urgent, wanted):
+                seen.append(wanted())  # entry still there: keep showing it
+                return True, None
+            cc.notification_click = click
+            sys.argv = ["ccdeck", "notify-click", "s1", "--id", nid, "--", "t", "b"]
+            cc.main()
+            self.assertEqual(seen, [True])
+            self.assertFalse((cc.INBOX_DIR / f"{nid}.json").exists())  # clicking it is acting on it
+            nid = cc.inbox_add("s1", "idle", "Your turn · s1", "Done.")
+            def dismissed_elsewhere(title, body, urgent, wanted):
+                cc.inbox_clear(nid)  # e.g. you replied in the session
+                seen.append(wanted())
+                return False, None
+            cc.notification_click = dismissed_elsewhere
+            sys.argv = ["ccdeck", "notify-click", "s1", "--id", nid, "--", "t", "b"]
+            cc.main()
+            self.assertEqual(seen, [True, False])  # the helper withdraws the popup once wanted() is False
+        finally:
+            cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv = saved
 
 
 class NotificationSettingTest(unittest.TestCase):
