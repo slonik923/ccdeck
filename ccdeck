@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1188,6 +1188,7 @@ def collect(include_all=False, days=DEFAULT_DAYS):
         s["pr_details"] = pr_details(s, prc)
         st = classify(s, hook, alive)
         s["state"] = st
+        s["notification_epoch"] = (hook or {}).get("notification_epoch")
         s["group"], s["label"] = STATES[st]
         s["hook_message"] = (hook or {}).get("message") if st == "permission" else None
         s["display_title"] = title_of(s)
@@ -1807,15 +1808,16 @@ class Dashboard:
 
     def _notify_changes(self, rows):
         inbox_sweep(rows)
-        cur = {r["id"]: r["state"] for r in rows}
+        cur = {r["id"]: (r["state"], r.get("notification_epoch")) for r in rows}
         prev, self.prev_states = self.prev_states, cur
         if prev is None or PREVIEW:
             return  # first scan after start: don't replay everything
         for r in rows:
             st, before = r["state"], prev.get(r["id"])
-            if st == before or st not in NOTIFY_STATES:
+            if (cur[r["id"]] == before or st not in NOTIFY_STATES
+                    or not r.get("alive", True) and st not in PR_STATES):
                 continue
-            if st == "idle" and before != "working":
+            if st == "idle" and (before is None or before[0] != "working"):
                 continue
             text = r.get("hook_message") or r.get("last_text") or ""
             notify(f"{STATES[st][1]} · {title_of(r)[:60]}", one_line(text, 160), urgent=r["group"] == "needs",
@@ -2630,6 +2632,8 @@ def cmd_hook(_args):
             notify(f"Claude needs you · {short_path(state.get('cwd'))}", msg or ntype, urgent=True, sid=sid,
                    state=state.get("status"))
     if event in INBOX_ACTED:
+        # Preserve the answer across dashboard scans that both see the next prompt's state.
+        state["notification_epoch"] = state["ts"]
         try:
             inbox_clear_session(sid)
         except OSError:

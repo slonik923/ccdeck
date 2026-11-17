@@ -395,6 +395,53 @@ class HookTest(unittest.TestCase):
             self.run_hook({"session_id": "s-closed", "hook_event_name": "PostToolUse", "tool_name": "Bash"})
         self.assertEqual([d["id"] for d in cc.inbox_items()], [keep])
 
+    def test_new_permission_between_scans_gets_a_fresh_notification(self):
+        build_fixtures()
+        sid = "s-closed"
+        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        dash = cc.Dashboard(0)
+        def scan():
+            rows = cc.collect(True, 10 ** 6)
+            dash._notify_changes(rows)
+        with mock.patch.object(cc, "pid_alive", return_value=True), \
+                mock.patch.object(cc, "wait_for_approval", return_value=None), \
+                mock.patch.object(cc, "daemon_running", return_value=True):
+            self.run_hook({"session_id": sid, "hook_event_name": "UserPromptSubmit"})
+            cc.save_json(cc.STATE_DIR / f"{sid}.json", dict(cc.load_json(cc.STATE_DIR / f"{sid}.json", {}), pid=123))
+            scan()  # first scan never replays notifications
+            self.run_hook({"session_id": sid, "hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+            scan()
+            first = next(d for d in cc.inbox_items() if d["sid"] == sid)
+            self.run_hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+            self.run_hook({"session_id": sid, "hook_event_name": "PermissionRequest", "tool_name": "Edit"})
+            scan()  # both dashboard scans see permission
+            second = next(d for d in cc.inbox_items() if d["sid"] == sid)
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertIn("Edit", second["body"])
+            scan()
+            self.assertEqual(next(d for d in cc.inbox_items() if d["sid"] == sid)["id"], second["id"])
+            cc.inbox_clear(second["id"])  # dismissal must survive another scan of the same prompt
+            scan()
+            self.assertFalse(any(d["sid"] == sid for d in cc.inbox_items()))
+
+    def test_closed_pending_question_withdraws_the_desktop_notification(self):
+        build_fixtures()
+        sid = "s-question"
+        nid = cc.inbox_add(sid, "question", "Question", "Which one?")
+        def click(title, body, urgent, wanted):
+            self.assertTrue(wanted())
+            rows = cc.collect(True, 10 ** 6)
+            row = by_id(rows)[sid]
+            self.assertEqual((row["pending_tool"], row["state"], row["alive"]),
+                             ("AskUserQuestion", "question", False))
+            dash = cc.Dashboard(0)
+            dash.prev_states = {sid: ("question", 123)}  # last scan saw the open question
+            dash._notify_changes(rows)
+            self.assertFalse(wanted())
+            return False, None
+        with mock.patch.object(cc, "notification_click", side_effect=click):
+            cc.cmd_notify_click(type("Args", (), dict(sid=sid, id=nid, title="Question", body="Which one?", urgent=True)))
+
     def test_unwritable_inbox_keeps_the_notification_and_the_hook(self):
         build_fixtures()
         (cc.STATE_DIR / "s-noinbox.json").unlink(missing_ok=True)
