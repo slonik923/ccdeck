@@ -1797,6 +1797,9 @@ class Dashboard:
         self.port = port
         self.token = self._token()
         self.lock = threading.Lock()
+        # one refresh at a time (the scan loop and actions both refresh): an older one finishing last would
+        # put back a stale snapshot and stale prev_states, which brings back a notification you dismissed
+        self.refresh_lock = threading.Lock()
         self.snapshot = {"sessions": [], "generated": 0}
         self.etag = ""
         self.prev_states = None
@@ -1816,6 +1819,10 @@ class Dashboard:
         return tok
 
     def refresh(self):
+        with self.refresh_lock:
+            return self._refresh()
+
+    def _refresh(self):
         rows = collect(include_all=True, days=10 ** 6)
         sessions = [session_json(s) for s in rows]
         counts = {g: 0 for g, _ in GROUPS}

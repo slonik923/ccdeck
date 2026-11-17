@@ -490,6 +490,26 @@ class HookTest(unittest.TestCase):
                 cc.inbox_add("s-lock", "idle", "Your turn", "")
             self.assertLess(time.monotonic() - t, 3)
 
+    def test_refreshes_take_turns(self):
+        """The scan loop and an action refreshing at once: the older one mustn't finish last."""
+        import threading
+        dash, running, overlap = cc.Dashboard(0), [], []
+        def collect(**kw):
+            running.append(1)
+            if len(running) > 1:
+                overlap.append(1)
+            time.sleep(0.05)
+            running.pop()
+            return []
+        with mock.patch.object(cc, "collect", collect), mock.patch.object(cc, "inbox_items", lambda: []), \
+                mock.patch.object(cc, "review_requests", lambda s: []), mock.patch.object(cc, "hooks_active", lambda: True):
+            threads = [threading.Thread(target=dash.refresh) for _ in range(4)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+        self.assertEqual(overlap, [])
+
     def test_closed_pending_question_withdraws_the_desktop_notification(self):
         build_fixtures()
         sid = "s-question"
