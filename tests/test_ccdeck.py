@@ -1420,6 +1420,35 @@ class GuessLiveTest(unittest.TestCase):
         self.assertFalse({"s-headless", "s-sdk"} & ids)
         self.assertTrue({"s-resumed", "s-desktop", "s-closed"} <= ids)
 
+    def test_duplicate_sessions_filter_headless_after_selecting_latest(self):
+        for older_ep, newer_ep, has_prompt in (("cli", "sdk-cli", True),
+                                               ("sdk-cli", "cli", True),
+                                               ("cli", "sdk-cli", False)):
+            for newest_first in (False, True):
+                with self.subTest(older=older_ep, newer=newer_ep, prompt=has_prompt,
+                                  newest_first=newest_first), tempfile.TemporaryDirectory() as tmp:
+                    projects = Path(tmp) / "projects"
+                    paths = []
+                    for folder, ep, minutes in (("old", older_ep, 30), ("new", newer_ep, 10)):
+                        path = projects / folder / "duplicate.jsonl"
+                        path.parent.mkdir(parents=True)
+                        entry = user("hello", minutes) if folder == "old" or has_prompt else asst([text("Done.")], minutes)
+                        path.write_text(json.dumps(dict(entry, entrypoint=ep)) + "\n")
+                        paths.append(path)
+                    if newest_first:
+                        paths.reverse()
+                    with mock.patch.object(cc, "PROJECTS_DIR", projects), \
+                         mock.patch.object(cc, "CACHE_FILE", Path(tmp) / "cache.json"), \
+                         mock.patch.object(Path, "glob", lambda _, pattern: iter(paths) if pattern == "*/*.jsonl" else iter(())):
+                        for _ in range(2):  # parse first, then reuse cached transcripts
+                            sessions = cc.scan_transcripts()
+                            if has_prompt and newer_ep == "sdk-cli":
+                                self.assertNotIn("duplicate", sessions)
+                            else:
+                                selected = sessions["duplicate"]
+                                self.assertEqual(selected["entrypoint"], newer_ep if has_prompt else older_ep)
+                                self.assertEqual(selected["last_ts"], cc.parse_transcript(projects / ("new" if has_prompt else "old") / "duplicate.jsonl")["last_ts"])
+
     def test_registry_sessions_use_up_their_process(self):
         # registry session A is open in /w/app; B is newer and closed: one process, so only A
         sessions = {"A": {"id": "A", "cwd": "/w/app", "last_ts": 1}, "B": {"id": "B", "cwd": "/w/app", "last_ts": 2}}
