@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
@@ -31,11 +33,12 @@ FAKE_GH.parent.mkdir(parents=True)
 FAKE_GH.write_text("""#!/usr/bin/env python3
 import json, sys
 if sys.argv[1:3] == ["search", "prs"]:
+    direct = "user-review-requested:@me" in sys.argv  # PR 7 asked a team, not you by name
     print(json.dumps([
         {"number": 6, "title": "Colleague's change", "url": "https://github.com/me/app/pull/6", "isDraft": False,
          "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "pat"}, "updatedAt": "2026-01-01T10:00:00Z"},
         {"number": 7, "title": "Mine, reviewer added me", "url": "https://github.com/me/app/pull/7", "isDraft": False,
-         "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "me"}, "updatedAt": "2026-01-01T09:00:00Z"}]))
+         "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "me"}, "updatedAt": "2026-01-01T09:00:00Z"}][:1 if direct else 2]))
     sys.exit(0)
 url = sys.argv[3]
 n = int(url.rsplit("/", 1)[1])
@@ -167,6 +170,17 @@ def by_id(rows):
     return {r["id"]: r for r in rows}
 
 
+
+def registry_start(pid):
+    """A process's start time as Claude Code's registry (procStart) saves it: /proc's start ticks on Linux,
+    otherwise `ps` lstart in UTC (ccdeck's own reader gives local time)."""
+    if cc.USE_PROC:
+        return cc.proc_start_time(pid)
+    import subprocess
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                         env=dict(os.environ, TZ="UTC", LC_ALL="C")).stdout
+    return " ".join(out.split()) or None
+
 class ClassifyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -214,6 +228,26 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(cc.review_requests(list(self.rows.values())), [])
         self.assertEqual([r["number"] for r in cc.review_requests([])], [6, 7])
         cc.REVIEWS_FILE.unlink()
+
+    def test_review_requests_setting(self):
+        """mine leaves out team requests; a cache fetched for another setting isn't shown; off fetches nothing."""
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        self.addCleanup(lambda: cc.REVIEWS_FILE.unlink(missing_ok=True))
+        self.assertEqual(cc.review_scope(), "all")
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests()})
+        cc.save_json(cc.CONFIG_FILE, {"review_requests": "mine"})
+        self.assertEqual(cc.review_requests([]), [])  # fetched for "all": wait for the refetch
+        items = cc.fetch_review_requests()
+        self.assertEqual([r["number"] for r in items], [6])
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "mine", "items": items})
+        self.assertEqual([r["number"] for r in cc.review_requests([])], [6])
+        cc.save_json(cc.CONFIG_FILE, {"review_requests": "off"})
+        self.assertIsNone(cc.fetch_review_requests())
+        for bad in ("bogus", [], {}, ["mine"], 1):  # lists and dicts aren't hashable: they must not crash
+            cc.save_json(cc.CONFIG_FILE, {"review_requests": bad})
+            self.assertEqual(cc.review_scope(), "all", bad)
+        with mock.patch.dict(os.environ, {"CCDECK_REVIEW_REQUESTS": "0"}):
+            self.assertEqual(cc.review_scope(), "off")
         self.assertEqual(self.state("s-pr-failing"), "ci_failing")
         self.assertEqual(self.state("s-pr-merged"), "pr_merged")
         self.assertEqual(self.state("s-pr-changes"), "changes_requested")
@@ -287,6 +321,10 @@ class LinksTest(unittest.TestCase):
             result("n1", 28, json.dumps({"pages": [{"id": "b" * 32, "url": created_notion, "title": "Rollout plan"}]})),
             asst([tool("a1", "Artifact", {"file_path": "/tmp/x.html", "title": "Queue comparison"})], 27),
             result("a1", 27, "Published https://claude.ai/artifact/abc123XYZ (private)"),
+            asst([tool("q1", "Artifact", {"action": "quickstart", "intent": "other"})], 27),
+            result("q1", 27, "Types: Data https://claude.ai/artifact/TypeData1 and Docs https://claude.ai/artifact/TypeDocs1"),
+            asst([tool("t1", "Artifact", {"type_url": "https://claude.ai/artifact/TypeData1", "title": "Burn-down"})], 27),
+            result("t1", 27, "Created https://claude.ai/artifact/ourDash9 from https://claude.ai/artifact/TypeData1"),
             asst([text("Done. See ENG-42 and the plan. Also OPS-9 is unrelated.")], 26),
         ]
         for e in entries:
@@ -305,6 +343,13 @@ class LinksTest(unittest.TestCase):
         self.assertEqual((self.refs[self.created_notion]["source"], self.refs[self.created_notion]["title"]), ("created", "Rollout plan"))
         art = self.refs["https://claude.ai/artifact/abc123XYZ"]
         self.assertEqual((art["kind"], art["source"], art["title"]), ("artifact", "created", "Queue comparison"))
+
+    def test_artifact_types_and_lookups_are_not_ours(self):
+        """Quickstart lists other accounts' Artifact types; a type_url publish names the type it used."""
+        self.assertNotIn("https://claude.ai/artifact/TypeData1", self.refs)
+        self.assertNotIn("https://claude.ai/artifact/TypeDocs1", self.refs)
+        dash = self.refs["https://claude.ai/artifact/ourDash9"]
+        self.assertEqual((dash["source"], dash["title"]), ("created", "Burn-down"))
 
     def test_linear_from_tool_branch_and_mentions(self):
         self.assertEqual(self.linear["ENG-42"]["title"], "Stripe webhooks")
@@ -388,7 +433,7 @@ class HookTest(unittest.TestCase):
         reg = cc.CLAUDE_DIR / "sessions"
         reg.mkdir(parents=True, exist_ok=True)
         me = os.getpid()
-        (reg / f"{me}.json").write_text(json.dumps({"pid": me, "procStart": cc.proc_start_time(me),
+        (reg / f"{me}.json").write_text(json.dumps({"pid": me, "procStart": registry_start(me),
                                                     "sessionId": "s-closed", "name": "work-2d"}))
         (reg / "1.json").write_text(json.dumps({"pid": 1, "procStart": "stale", "sessionId": "s-midtask", "name": "old"}))
         try:
@@ -397,6 +442,44 @@ class HookTest(unittest.TestCase):
             self.assertIsNone(rows["s-midtask"]["peer_name"])  # reused pid: not that session any more
         finally:
             shutil.rmtree(reg)
+
+    def test_mac_registry_start_time_is_utc(self):
+        """Without /proc, `ps` gives local time. Claude Code's registry saves UTC (utc=True); ccdeck saves local
+        time, which must only match exactly: read as UTC, it would match a process started an offset later."""
+        saved_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Europe/Bratislava"  # UTC+1 in November; the bug only shows off UTC
+        time.tzset()
+        try:
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Thu Nov 12 09:23:03 2026"):
+                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))              # ccdeck's own, local
+                self.assertTrue(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026", utc=True))    # the registry's, UTC
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026", utc=True))   # local string read as UTC
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 08:23:03 2026"))             # local: an hour off
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 07:23:03 2026", utc=True))   # another process
+                self.assertFalse(cc.pid_alive(7, "stale", utc=True))
+            # a reused pid that started one UTC offset after a saved local time is not that process
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Thu Nov 12 10:23:03 2026"):
+                self.assertFalse(cc.pid_alive(7, "Thu Nov 12 09:23:03 2026"))
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Mar 1 00:30:00 2026"):
+                self.assertTrue(cc.pid_alive(7, "Sat Feb 28 23:30:00 2026", utc=True))   # across a day and month
+            # clocks going back repeat an hour: 08:00 and 09:00 UTC are both 01:00 in Los Angeles that night,
+            # and `ps` can't say which; a registry record of either moment is that process
+            os.environ["TZ"] = "America/Los_Angeles"
+            time.tzset()
+            with mock.patch.object(cc, "USE_PROC", False), \
+                    mock.patch.object(cc, "proc_start_time", lambda pid: "Sun Nov 1 01:00:00 2020"):
+                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 08:00:00 2020", utc=True))
+                self.assertTrue(cc.pid_alive(7, "Sun Nov 1 09:00:00 2020", utc=True))
+                self.assertFalse(cc.pid_alive(7, "Sun Nov 1 10:00:00 2020", utc=True))
+        finally:
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
 
     def test_registry_record_without_start_time_is_ignored(self):
         build_fixtures()
@@ -412,7 +495,7 @@ class HookTest(unittest.TestCase):
     def test_malformed_registry_records_are_skipped(self):
         reg = cc.CLAUDE_DIR / "sessions"
         reg.mkdir(parents=True, exist_ok=True)
-        me, start = os.getpid(), cc.proc_start_time(os.getpid())
+        me, start = os.getpid(), registry_start(os.getpid())
         for i, rec in enumerate(({"pid": me, "procStart": start, "sessionId": ["A"]},
                                  {"pid": me, "procStart": start, "sessionId": ""},
                                  {"pid": str(me), "procStart": start, "sessionId": "B"},
@@ -442,7 +525,7 @@ class HookTest(unittest.TestCase):
         reg.mkdir(parents=True, exist_ok=True)
         me, parent = os.getpid(), os.getppid()
         for pid in (me, parent):
-            (reg / f"{pid}.json").write_text(json.dumps({"pid": pid, "procStart": cc.proc_start_time(pid), "sessionId": "B"}))
+            (reg / f"{pid}.json").write_text(json.dumps({"pid": pid, "procStart": registry_start(pid), "sessionId": "B"}))
         try:
             self.assertEqual(sorted(cc.peer_sessions()["B"]["pids"]), sorted([me, parent]))
         finally:
@@ -788,6 +871,44 @@ class ServerTest(unittest.TestCase):
         self.assertEqual({s["id"]: s for s in snap["sessions"]}["s-closed"]["mark"]["note"], "QA")
         self.req("/api/action", data={"id": "s-closed", "action": "note", "text": ""})
 
+    def test_settings_from_the_dashboard(self):
+        """The settings panel reads settings from the snapshot and saves them with set_setting."""
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        snap = json.loads(self.req("/api/sessions")[1])
+        self.assertEqual(snap["settings"]["review_requests"], {"value": "all", "locked": None})
+        self.assertEqual(snap["settings"]["notifications"]["desktop"]["locked"], "CCDECK_NOTIFY=0")  # set by the tests
+        set_ = lambda key, value: self.req("/api/action", data={"action": "set_setting", "key": key, "value": value})
+        code, body = set_("review_requests", "mine")
+        self.assertEqual((code, json.loads(body)["settings"]["review_requests"]["value"]), (200, "mine"))
+        self.assertEqual(json.loads(self.req("/api/sessions")[1])["settings"]["review_requests"]["value"], "mine")
+        self.assertEqual(set_("approvals", True)[0], 200)
+        self.assertEqual(set_("notifications.desktop", False)[0], 200)
+        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}),
+                         {"review_requests": "mine", "approvals": True, "notifications": {"desktop": False}})
+        for key, value in (("review_requests", "team"), ("review_requests", []), ("review_requests", {}),
+                           ("approvals", "yes"), ("notifications.sms", True), ("token", "x"), (None, 1)):
+            self.assertEqual(set_(key, value)[0], 400, key)
+        self.assertEqual(self.req("/api/action", token=False, data={"action": "set_setting", "key": "approvals", "value": True})[0], 403)
+
+    def test_concurrent_settings_changes_all_kept(self):
+        """Each change reads config.json and saves it whole: without the lock, one would undo another."""
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        cc.CONFIG_FILE.unlink(missing_ok=True)
+        real_load = cc.load_json
+        def slow_load(path, default):  # widen the gap between reading and saving
+            v = real_load(path, default)
+            time.sleep(0.05)
+            return v
+        changes = [("review_requests", "mine"), ("approvals", True), ("notifications.desktop", False)] * 3
+        with mock.patch.object(cc, "load_json", slow_load):
+            threads = [threading.Thread(target=cc.set_setting, args=c) for c in changes]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}),
+                         {"review_requests": "mine", "approvals": True, "notifications": {"desktop": False}})
+
     def test_resume_of_an_open_session_never_starts_a_second_one(self):
         saved = cc.peer_sessions, cc.focus_terminal, cc.open_terminal
         opened = []
@@ -821,6 +942,88 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(focused, [(42, "tok")])
         finally:
             cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv = saved
+
+    def test_mac_notification_click_runs_focus(self):
+        """With terminal-notifier, a click runs `ccdeck focus <sid>`; if it fails (not allowed: exit 3) or is
+        missing, the notification goes out through osascript instead (not clickable, but not lost)."""
+        def send(which, code):
+            calls = []
+            def run(cmd, **kw):
+                calls.append(cmd)
+                if code == "timeout":  # subprocess.run kills it before raising: nothing was delivered
+                    raise cc.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+                return mock.Mock(returncode=code)
+            with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "notify_enabled", lambda c: True), \
+                    mock.patch.object(cc.subprocess, "run", run), \
+                    mock.patch.object(cc.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd)), \
+                    mock.patch.object(cc.shutil, "which", lambda b: which if b == "terminal-notifier" else None):
+                cc.notify("Permission needed · Deploy", "Bash: deploy.sh", urgent=True, sid="s-closed")
+            return calls
+        calls = send("/opt/bin/terminal-notifier", 0)
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0]
+        self.assertEqual(cmd[0], "/opt/bin/terminal-notifier")
+        self.assertEqual(cmd[cmd.index("-group") + 1], "ccdeck-s-closed")
+        self.assertEqual(cmd[cmd.index("-sound") + 1], "Glass")
+        self.assertEqual(shlex.split(cmd[cmd.index("-execute") + 1])[-2:], ["focus", "s-closed"])
+        self.assertEqual([c[0] for c in send("/opt/bin/terminal-notifier", 3)], ["/opt/bin/terminal-notifier", "osascript"])
+        self.assertEqual([c[0] for c in send("/opt/bin/terminal-notifier", "timeout")], ["/opt/bin/terminal-notifier", "osascript"])
+        self.assertEqual([c[0] for c in send(None, 0)], ["osascript"])
+
+    def test_notification_setup_on_mac(self):
+        """`ccdeck notifications setup`: a hint without terminal-notifier, macOS's prompt when it was never
+        asked, System Settings when it's denied."""
+        def setup(which, auths, interactive=False, version=(3, 1)):
+            opened, out = [], []
+            auths = iter(auths)
+            with mock.patch.object(cc, "IS_MAC", True), mock.patch.object(cc, "terminal_notifier_version", lambda: version), \
+                    mock.patch.object(cc.shutil, "which", lambda b: which if b == "terminal-notifier" else None), \
+                    mock.patch.object(cc, "terminal_notifier_authorization", lambda: next(auths)), \
+                    mock.patch.object(cc, "terminal_notifier_app", lambda: Path("/Apps/terminal-notifier.app")), \
+                    mock.patch.object(cc.subprocess, "run", lambda cmd, **kw: opened.append(cmd)), \
+                    mock.patch.object(cc, "open_path", lambda t: opened.append(t)), \
+                    mock.patch.object(cc.time, "sleep", lambda s: None), \
+                    mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+                cc.setup_notifications(interactive)
+            return opened, "\n".join(out)
+        opened, out = setup(None, [])
+        self.assertIn("brew install terminal-notifier", out)
+        self.assertEqual(opened, [])
+        opened, out = setup("/opt/bin/terminal-notifier", ["not requested yet", "authorized"], interactive=True)
+        self.assertEqual(opened[0][:4], ["open", "-W", "-a", "/Apps/terminal-notifier.app"])
+        self.assertIn("clickable", out)
+        opened, out = setup("/opt/bin/terminal-notifier", ["denied"], interactive=True)
+        self.assertIn("System Settings", out)
+        self.assertEqual(opened, [cc.NOTIFY_SETTINGS_URL])
+        opened, out = setup("/opt/bin/terminal-notifier", ["denied"])  # not interactive: say it, open nothing
+        self.assertIn("System Settings", out)
+        self.assertEqual(opened, [])
+        # 2.x has no -diagnose: ask for an upgrade instead of reading "not allowed" into its silence
+        opened, out = setup("/opt/bin/terminal-notifier", [], version=(2, 0))
+        self.assertIn("brew upgrade terminal-notifier", out)
+        self.assertNotIn("System Settings", out)
+        self.assertEqual(opened, [])
+
+    def test_terminal_notifier_app_behind_homebrews_script(self):
+        root = TMP / "tn-brew"
+        app = root / "Cellar" / "terminal-notifier" / "3.1.0" / "terminal-notifier.app"
+        (app / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+        script = root / "Cellar" / "terminal-notifier" / "3.1.0" / "bin" / "terminal-notifier"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(f'#!/bin/bash\nexec "{app}/Contents/MacOS/terminal-notifier" "$@"\n')
+        with mock.patch.object(cc.shutil, "which", lambda b: str(script)):
+            self.assertEqual(cc.terminal_notifier_app().resolve(), app.resolve())  # /var is /private/var on macOS
+
+    def test_focus_command(self):
+        focused = []
+        with mock.patch.object(cc, "peer_sessions", lambda: {"s-closed": {"name": "w", "pid": 42, "pids": [42]}}), \
+                mock.patch.object(cc, "focus_terminal", lambda pid: focused.append(pid) or "Terminal"), \
+                mock.patch.object(sys, "argv", ["ccdeck", "focus", "s-closed"]):
+            cc.main()
+        self.assertEqual(focused, [42])
+        with mock.patch.object(cc, "peer_sessions", lambda: {}), mock.patch.object(sys, "argv", ["ccdeck", "focus", "gone"]):
+            with self.assertRaises(SystemExit):
+                cc.main()
 
     def test_activation_token_goes_to_gnome_terminal_first(self):
         saved = cc.gnome_terminal_window
@@ -1037,3 +1240,224 @@ class DemoDataTest(unittest.TestCase):
         gh = subprocess.run([str(home / "bin" / "gh"), "pr", "view", "https://github.com/acme/dashboard/pull/212", "--json", "x"],
                             capture_output=True, text=True)
         self.assertEqual(json.loads(gh.stdout)["number"], 212)
+
+
+class PreviewTest(unittest.TestCase):
+    """`ccdeck preview` runs another ccdeck on the same sessions, with its own caches."""
+
+    def test_resume_from_a_preview_gets_your_environment(self):
+        """The preview's own config folder and CCDECK_NOTIFY=0 must not reach a `claude --resume` it starts."""
+        saved = json.dumps({"CLAUDE_CONFIG_DIR": None, "CCDECK_PREVIEW": None, "CCDECK_NOTIFY": "1", "CCDECK_AUTOSTART": None})
+        env = cc.user_env({"CLAUDE_CONFIG_DIR": "/p/claude", "CCDECK_PREVIEW": "#35", "CCDECK_NOTIFY": "0",
+                           "CCDECK_AUTOSTART": "0", "CCDECK_PREVIEW_SAVED_ENV": saved, "PATH": "/bin"})
+        self.assertEqual(env, {"CCDECK_NOTIFY": "1", "PATH": "/bin"})
+        env = cc.user_env({"CLAUDE_CONFIG_DIR": "/p/claude", "CCDECK_PREVIEW_SAVED_ENV": json.dumps({"CLAUDE_CONFIG_DIR": "/me/.claude"})})
+        self.assertEqual(env, {"CLAUDE_CONFIG_DIR": "/me/.claude"})
+        self.assertEqual(cc.user_env({"CLAUDE_CONFIG_DIR": "/mine"}), {"CLAUDE_CONFIG_DIR": "/mine"})  # not a preview: as is
+
+    def test_preview_refuses_a_port_another_program_has(self):
+        import socket
+        other = socket.socket()
+        other.bind(("127.0.0.1", 0))
+        other.listen()
+        self.addCleanup(other.close)
+        args = mock.Mock(target="34", repo="o/r", trust=False, port=other.getsockname()[1], no_open=True)
+        started = []
+        with mock.patch.object(cc, "resolve_preview", lambda *a: (TMP, "#34 x")), \
+                mock.patch.object(cc, "stop_preview", lambda quiet=False: True), \
+                mock.patch.object(cc.subprocess, "Popen", lambda *a, **k: started.append(a)), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit) as e:
+                cc.cmd_preview(args)
+        self.assertIn("in use", str(e.exception.code))
+        self.assertEqual(started, [])
+
+    def test_config_dir_links_resolve_with_a_relative_config_dir(self):
+        """CLAUDE_CONFIG_DIR=.claude: the links must lead to the real folders, not to paths inside the preview."""
+        cwd = os.getcwd()
+        os.chdir(TMP)
+        self.addCleanup(os.chdir, cwd)
+        rel = Path("rel-claude") / "projects"
+        with mock.patch.object(cc, "PROJECTS_DIR", rel):
+            cfg = cc.preview_config_dir()
+        self.assertEqual((cfg / "projects").resolve(), (TMP / rel).resolve())
+
+    def test_stop_counts_an_unreaped_preview_as_stopped(self):
+        """A preview whose parent never reaps it stays a zombie: its start time is still there, but it has
+        stopped, and stop must say so rather than time out (and block every later start)."""
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])  # never waited for: a zombie
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        cc._ps_cache["t"] = 0
+        cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": proc.pid, "pid_start": cc.proc_start_time(proc.pid), "label": "x"})
+        t = time.monotonic()
+        with mock.patch("builtins.print"):
+            self.assertTrue(cc.stop_preview())
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertTrue(cc.proc_zombie(proc.pid))  # still unreaped: it was the state that counted
+
+    def test_stop_never_signals_a_pid_it_cant_identify(self):
+        cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": os.getpid(), "pid_start": None, "label": "x"})
+        with mock.patch.object(cc.os, "kill") as kill, mock.patch("builtins.print"):
+            self.assertFalse(cc.stop_preview())
+        kill.assert_not_called()
+
+    def test_preview_commands_run_one_at_a_time(self):
+        active, overlap = [], []
+        def start(args):
+            active.append(1)
+            if len(active) > 1:
+                overlap.append(1)
+            time.sleep(0.2)
+            active.pop()
+        with mock.patch.object(cc, "start_preview", start):
+            threads = [threading.Thread(target=cc.cmd_preview, args=(mock.Mock(target="34"),)) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(overlap, [])
+
+    def test_config_dir_drops_a_stale_copy(self):
+        """No config.json of yours: the preview starts without one, not with the last preview's changes."""
+        cc.CONFIG_FILE.unlink(missing_ok=True)
+        stale = cc.PREVIEW_DIR / "claude" / "ccdeck" / "config.json"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text('{"review_requests": "off"}')
+        cc.preview_config_dir()
+        self.assertFalse(stale.exists())
+
+    def test_stop_waits_until_the_preview_is_gone(self):
+        import subprocess
+        # detached like a real preview (its parent exits), so the system reaps it rather than leaving a zombie
+        pid = int(subprocess.run(["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout)
+        self.addCleanup(lambda: os.kill(pid, 9) if cc.pid_alive(pid, None) else None)
+        cc.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        cc._ps_cache["t"] = 0
+        cc.save_json(cc.PREVIEW_DIR / "preview.json", {"pid": pid, "pid_start": cc.proc_start_time(pid), "label": "x"})
+        t = time.monotonic()
+        with mock.patch("builtins.print"):
+            self.assertTrue(cc.stop_preview())
+        cc._ps_cache["t"] = 0
+        # gone by the time it returns (a zombie has exited too: only its parent hasn't collected it)
+        self.assertTrue(not cc.pid_alive(pid, None) or cc.proc_zombie(pid))
+        self.assertLess(time.monotonic() - t, 5)  # SIGTERM was enough
+        self.assertFalse((cc.PREVIEW_DIR / "preview.json").exists())
+
+    def test_version_target_finds_main_or_the_open_pr(self):
+        def gh(path):
+            if path.startswith("repos/o/r/commits/"):
+                raise RuntimeError("no such tag")
+            if path.startswith("repos/o/r/pulls?"):
+                return [{"number": 7, "head": {"sha": "aaa", "repo": {"full_name": "o/r"}}},
+                        {"number": 8, "head": {"sha": "bbb", "repo": {"full_name": "fork/r"}}}]
+            import base64
+            ver = {"main": "0.8.1", "aaa": "0.8.5", "bbb": "0.8.6"}[path.rsplit("ref=", 1)[1]]
+            return {"content": base64.b64encode(json.dumps({"version": ver}).encode()).decode()}
+        with mock.patch.object(cc, "github_json", gh):
+            self.assertEqual(cc.find_version("0.8.1", "o/r"), "main")
+            self.assertEqual(cc.find_version("0.8.5", "o/r"), "#7")
+            self.assertIsNone(cc.find_version("0.8.6", "o/r"))  # only in a fork's PR: not looked at
+            self.assertIsNone(cc.find_version("9.9.9", "o/r"))
+
+    def test_config_dir_shares_sessions_and_copies_marks_and_settings(self):
+        cc.save_json(cc.CONFIG_FILE, {"review_requests": "mine"})
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        cfg = cc.preview_config_dir()
+        self.assertEqual((cfg / "projects").resolve(), cc.PROJECTS_DIR.resolve())
+        self.assertEqual((cfg / "ccdeck" / "state").resolve(), cc.STATE_DIR.resolve())
+        self.assertEqual((cfg / "sessions").resolve(), (cc.CLAUDE_DIR / "sessions").resolve())  # which sessions are open
+        copied = cfg / "ccdeck" / "config.json"
+        self.assertFalse(copied.is_symlink())
+        self.assertEqual(cc.load_json(copied, {}), {"review_requests": "mine"})
+        cc.save_json(copied, {"review_requests": "off"})  # changed in the preview
+        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}), {"review_requests": "mine"})
+
+    def test_unpack_refuses_escaping_paths(self):
+        import io
+        import tarfile
+
+        def tarball(names):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for n in names:
+                    info = tarfile.TarInfo(n)
+                    info.size = 2
+                    tar.addfile(info, io.BytesIO(b"ok"))
+            return buf.getvalue()
+
+        dest = TMP / "unpack-ok"
+        cc.unpack_tarball(tarball(["repo-abc/ccdeck", "repo-abc/web/index.html"]), dest)
+        self.assertEqual((dest / "web" / "index.html").read_text(), "ok")
+        with self.assertRaises(RuntimeError):
+            cc.unpack_tarball(tarball(["repo-abc/../../evil"]), TMP / "unpack-bad")
+        self.assertFalse((TMP / "evil").exists())
+
+    def test_fork_pr_needs_trust(self):
+        saved = cc.github_json
+        cc.github_json = lambda path: {"number": 9, "title": "x", "head": {"sha": "f" * 40, "repo": {"full_name": "someone/fork"}},
+                                       "base": {"repo": {"full_name": "slonik923/ccdeck"}}}
+        try:
+            with self.assertRaises(SystemExit) as e:
+                cc.resolve_preview("9", "slonik923/ccdeck", trust=False)
+            self.assertIn("--trust", str(e.exception))
+        finally:
+            cc.github_json = saved
+
+    def test_preview_of_local_checkout(self):
+        import socket
+        import subprocess
+        build_fixtures()
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        env = dict(os.environ, CCDECK_AUTOSTART="0")
+        r = subprocess.run([sys.executable, str(ROOT / "ccdeck"), "preview", str(ROOT), "--port", str(port), "--no-open"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        log = lambda: (cc.PREVIEW_DIR / "serve.log").read_text() if (cc.PREVIEW_DIR / "serve.log").exists() else ""  # noqa: E731
+        try:
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout + log())
+            self.assertIn(f"http://localhost:{port}", r.stdout)
+            cfg = cc.PREVIEW_DIR / "claude"
+            for _ in range(100):  # "(still starting)" is allowed; wait for it here
+                if (cfg / "ccdeck" / "token").exists():
+                    try:
+                        urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1).close()
+                        break
+                    except OSError:
+                        pass
+                time.sleep(0.3)
+            token = (cfg / "ccdeck" / "token").read_text().strip()
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/sessions", headers={"X-CC-Token": token, "Host": f"localhost:{port}"})
+            snap = json.load(urllib.request.urlopen(req, timeout=5))
+            self.assertTrue(snap["preview"].startswith("local "))
+            self.assertIn("s-decision", {s["id"] for s in snap["sessions"]})  # your real transcripts
+            self.assertNotEqual(token, cc.TOKEN_FILE.read_text().strip() if cc.TOKEN_FILE.exists() else "")
+            self.assertFalse((cc.DATA_DIR / "daemon.json").exists() and
+                             json.loads((cc.DATA_DIR / "daemon.json").read_text()).get("port") == port)
+        finally:
+            subprocess.run([sys.executable, str(ROOT / "ccdeck"), "preview", "stop"], capture_output=True, env=env, timeout=30)
+        self.assertFalse((cc.PREVIEW_DIR / "preview.json").exists())
+
+    def test_pr_preview_downloads_once(self):
+        import subprocess
+        tar = subprocess.run(["git", "-C", str(ROOT), "archive", "--format=tar.gz", "--prefix=ccdeck-abc/", "HEAD"],
+                             capture_output=True).stdout
+        if not tar:
+            self.skipTest("not a git checkout")
+        saved = (cc.github_json, cc.download_source)
+        calls = []
+        cc.github_json = lambda path: {"number": 16, "title": "Group sessions", "head": {"sha": "a" * 40, "repo": {"full_name": "slonik923/ccdeck"}},
+                                       "base": {"repo": {"full_name": "slonik923/ccdeck"}}}
+        cc.download_source = lambda repo, sha, dest: (calls.append(sha), cc.unpack_tarball(tar, dest))
+        try:
+            src, label = cc.resolve_preview("16", "slonik923/cc-dashboard", trust=False)  # old name: same repo
+            self.assertTrue((src / "ccdeck").is_file())
+            self.assertEqual(label, "#16 Group sessions (aaaaaaa)")
+            cc.resolve_preview("#16", "slonik923/ccdeck", trust=False)
+            self.assertEqual(len(calls), 1)  # cached by commit
+        finally:
+            cc.github_json, cc.download_source = saved

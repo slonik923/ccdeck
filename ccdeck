@@ -30,6 +30,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -39,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.8.1"
+VERSION = "0.8.5"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -59,13 +60,15 @@ SCRIPT = Path(__file__).resolve()
 WEB_DIR = SCRIPT.parent / "web"
 IS_MAC = sys.platform == "darwin"
 UNIT_FILE = HOME / ".config" / "systemd" / "user" / "ccdeck.service"
+PREVIEW = os.environ.get("CCDECK_PREVIEW")  # set by `ccdeck preview`: a label such as "#16 Group sessions…"
+PREVIEW_DIR = CLAUDE_DIR / "ccdeck-preview"
 STABLE_DIR = HOME / ".local" / "share" / "ccdeck"  # a copy that survives plugin updates
 LAUNCHD_LABEL = "io.github.slonik923.ccdeck"
 GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -288,9 +291,34 @@ def find_claude_ancestor():
     return None
 
 
-def pid_alive(pid, start):
+_DAYS, _MONTHS = "Mon Tue Wed Thu Fri Sat Sun".split(), "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+
+def lstart_local(utc_lstart):
+    """A UTC lstart ("Thu Nov 12 08:23:03 2026", the form Claude Code's registry (procStart) uses on macOS) as
+    the same moment in local time, the form `ps` prints ("Thu Nov 12 09:23:03 2026"). None if it doesn't parse.
+    UTC to local, not local to UTC: in the hour repeated when clocks go back, one local time is two moments."""
+    import calendar
+    try:
+        _, mon, day, hms, year = utc_lstart.split()
+        h, mi, s = (int(x) for x in hms.split(":"))
+        t = time.localtime(calendar.timegm((int(year), _MONTHS.index(mon) + 1, int(day), h, mi, s, 0, 0, 0)))
+    except (ValueError, OverflowError, AttributeError):
+        return None
+    return f"{_DAYS[t.tm_wday]} {_MONTHS[t.tm_mon - 1]} {t.tm_mday} {t.tm_hour:02}:{t.tm_min:02}:{t.tm_sec:02} {t.tm_year}"
+
+
+def pid_alive(pid, start, utc=False):
+    """pid runs and is the process that started at start (None: any). Without /proc, start is a `ps` lstart
+    in local time, as ccdeck saves it; utc: in UTC, as Claude Code's registry (procStart) saves it. Only that
+    one is converted: read as UTC, a local time would also match a process started one UTC offset later."""
     st = proc_start_time(pid) if pid else None
-    return st is not None and (start is None or st == start)
+    if st is None or start is None:
+        return st is not None
+    if USE_PROC or not isinstance(start, str):
+        return st == start  # /proc start ticks: the same on both sides, no time zone
+    want = lstart_local(start) if utc else start  # a UTC string equal to the local one is another moment
+    return bool(want) and " ".join(st.split()) == " ".join(want.split())
 
 
 def running_claude_processes():
@@ -515,7 +543,7 @@ def parse_transcript(path):
         "refs": [], "linear": {}, "issue_keys": [], "usage": empty_usage(), "context": 0, "model": None,
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
-    refs, linear, keys, tool_titles = {}, {}, {}, {}
+    refs, linear, keys, tool_titles, not_created = {}, {}, {}, {}, {}
     seen_msgs = set()
 
     def note_ref(url, kind, title, source):
@@ -609,6 +637,8 @@ def parse_transcript(path):
                             pending.pop(tid, None)
                             name = tool_names.get(tid, "")
                             body = block_text(b.get("content"))
+                            for u in not_created.pop(tid, ()):  # the type an artifact was made from isn't ours
+                                body = body.replace(u, "")
                             creating = any(h in name for h in CREATING_TOOL_HINTS)
                             if creating or "linear" in name.lower():
                                 src = "created" if creating else "tool"
@@ -657,6 +687,14 @@ def parse_transcript(path):
                         for v in inp.values():
                             if isinstance(v, str) and ISSUE_KEY_RE.fullmatch(v.upper()):
                                 note_issue(v, None, None, "tool")
+                    if name == "Artifact" and inp.get("action", "publish") != "publish":
+                        # quickstart, list, read, open...: their results name other accounts'
+                        # artifacts (Artifact types, shared pages), never one this session made
+                        tool_names[b.get("id")] = "artifact-lookup"
+                    elif name == "Artifact":
+                        theirs = [inp[k] for k in ("type_url", "from_url") if isinstance(inp.get(k), str)]
+                        if theirs:
+                            not_created[b.get("id")] = theirs
                     if name == "Artifact" or name.endswith("__create"):
                         t = inp.get("title") or inp.get("name")
                         if isinstance(t, str) and t.strip():
@@ -804,13 +842,30 @@ def fetch_pr(url):
     }
 
 
-def fetch_review_requests():
+REVIEW_SCOPES = {  # config.json's review_requests: which requests the dashboard lists
+    "all": "--review-requested=@me",  # asked of you, or of a team you're in
+    "mine": "user-review-requested:@me",  # asked of you by name; team requests are left out
+    "off": None,
+}
+
+
+def review_scope():
+    """config.json's review_requests (default all); CCDECK_REVIEW_REQUESTS=0 turns it off whatever it says."""
+    if os.environ.get("CCDECK_REVIEW_REQUESTS") == "0":
+        return "off"
+    cfg = load_json(CONFIG_FILE, {})
+    v = cfg.get("review_requests") if isinstance(cfg, dict) else None
+    return v if isinstance(v, str) and v in REVIEW_SCOPES else "all"  # a list or dict there isn't hashable
+
+
+def fetch_review_requests(scope=None):
     """Open PRs where your review is requested. They aren't tied to a session, so the dashboard
-    lists them on their own. Off with CCDECK_REVIEW_REQUESTS=0."""
-    if os.environ.get("CCDECK_REVIEW_REQUESTS") == "0" or not shutil.which("gh"):
+    lists them on their own. None when off, or when gh is missing or fails."""
+    query = REVIEW_SCOPES[scope or review_scope()]
+    if not query or not shutil.which("gh"):
         return None
     try:
-        r = subprocess.run(["gh", "search", "prs", "--review-requested=@me", "--state=open", "--limit", "30",
+        r = subprocess.run(["gh", "search", "prs", query, "--state=open", "--limit", "30",
                             "--json", "number,title,url,repository,author,isDraft,updatedAt"],
                            capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
@@ -835,9 +890,13 @@ def fetch_review_requests():
 
 
 def review_requests(sessions):
-    """Cached review requests, less PRs that one of your sessions made."""
+    """Cached review requests, less PRs that one of your sessions made. Nothing while the cache
+    was fetched for another setting (the PR loop fetches again within seconds)."""
     own = {p["url"] for s in sessions for p in s.get("pr_details") or [] if p.get("own")}
-    items = (load_json(REVIEWS_FILE, {}) or {}).get("items") or []
+    cache = load_json(REVIEWS_FILE, {}) or {}
+    if cache.get("scope", "all") != review_scope():
+        return []
+    items = cache.get("items") or []
     return [r for r in items if r.get("url") not in own]
 
 
@@ -1003,7 +1062,7 @@ def peer_sessions():
         sid, pid, start, name = d.get("sessionId"), d.get("pid"), d.get("procStart"), d.get("name")
         # the format is Claude Code's and undocumented: skip records that don't look as expected.
         # procStart is required: without it pid_alive accepts any process that reused the pid
-        if isinstance(sid, str) and sid and isinstance(pid, int) and start and pid_alive(pid, start):
+        if isinstance(sid, str) and sid and isinstance(pid, int) and start and pid_alive(pid, start, utc=True):
             e = out.setdefault(sid, {"name": None, "pid": pid, "pids": []})
             e["pids"].append(pid)
             e["name"] = e["name"] or (name if isinstance(name, str) else None)
@@ -1178,6 +1237,26 @@ GRAPHICAL_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_
                   "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP")
 
 
+PREVIEW_ENV = ("CLAUDE_CONFIG_DIR", "CCDECK_PREVIEW", "CCDECK_NOTIFY", "CCDECK_AUTOSTART")  # what a preview overrides
+
+
+def user_env(env):
+    """env as you had it before `ccdeck preview` overrode it, for what a preview starts on your behalf (claude
+    --resume): its config folder has no settings or hooks, and CCDECK_NOTIFY=0 would silence that session."""
+    saved = env.pop("CCDECK_PREVIEW_SAVED_ENV", None)
+    try:
+        orig = json.loads(saved) if saved else {}
+    except ValueError:
+        orig = {}
+    for k, v in (orig.items() if isinstance(orig, dict) else ()):
+        if k in PREVIEW_ENV:
+            if isinstance(v, str):
+                env[k] = v
+            else:
+                env.pop(k, None)
+    return env
+
+
 def desktop_env():
     """Environment with the graphical session's variables (a systemd service may start before them)."""
     env = dict(os.environ)
@@ -1218,6 +1297,22 @@ def notify_enabled(channel):
 def notify(title, body, urgent=False, sid=None):
     if not notify_enabled("desktop"):
         return
+    if IS_MAC and (tn := shutil.which("terminal-notifier")):
+        # clickable: on click, terminal-notifier runs `ccdeck focus <sid>`, which goes to the session's tab.
+        # osascript's notifications belong to Script Editor, so clicking one only opens Script Editor
+        cmd = [tn, "-title", title[:120], "-message", body[:200] or " ", "-group", "ccdeck-" + (sid or "ccdeck")]
+        if urgent:
+            cmd += ["-sound", "Glass"]
+        if sid:
+            cmd += ["-execute", shlex.join([sys.executable, str(Path(__file__).resolve()), "focus", sid])]
+        try:
+            # it exits once the notification is delivered (a click relaunches it); not 0 means it wasn't,
+            # e.g. 3 when notifications aren't allowed for it: send it the old way rather than lose it.
+            # A timeout kills it, so that falls back too
+            if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0:  # hooks have ~5 s
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
     if IS_MAC:
         script = f"display notification {applescript_str(body[:200])} with title {applescript_str(title[:120])}"
         if urgent:
@@ -1239,6 +1334,103 @@ def notify(title, body, urgent=False, sid=None):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+NOTIFY_SETTINGS_URL = "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+
+
+def terminal_notifier_app():
+    """terminal-notifier's .app bundle (Homebrew's command is a script that runs the binary inside it), or None."""
+    tn = shutil.which("terminal-notifier")
+    if not tn:
+        return None
+    real = Path(os.path.realpath(tn))
+    for p in (real, *real.parents):
+        if p.suffix == ".app":
+            return p
+    if (app := real.parent.parent / "terminal-notifier.app").is_dir():
+        return app
+    try:
+        m = re.search(r'"([^"]+\.app)/Contents/MacOS/', real.read_text(errors="replace")[:4000])
+    except OSError:
+        return None
+    return Path(m.group(1)) if m and Path(m.group(1)).is_dir() else None
+
+
+def terminal_notifier_version():
+    """(major, minor) of the installed terminal-notifier ("terminal-notifier (3.1.0) is a …"), or None."""
+    try:
+        out = subprocess.run(["terminal-notifier", "-help"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"terminal-notifier \((\d+)\.(\d+)", out.stdout + out.stderr)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def terminal_notifier_authorization():
+    """What macOS allows terminal-notifier: "authorized", "denied", "not requested yet", …; None if unknown."""
+    try:
+        out = subprocess.run(["terminal-notifier", "-diagnose"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"^\s*authorization\s+(.+?)\s*$", out, re.M)
+    return m.group(1) if m else None
+
+
+def setup_notifications(interactive):
+    """Make notifications clickable: on macOS, install terminal-notifier and get macOS to allow it."""
+    if not IS_MAC:
+        if importlib.util.find_spec("gi"):
+            print("Notifications are clickable: a click goes to the session's terminal tab.")
+        else:
+            print("To make notifications clickable, install PyGObject (sudo apt install python3-gi).")
+        return
+    if not shutil.which("terminal-notifier"):
+        hint = "brew install terminal-notifier, then ccdeck notifications setup"
+        if not (interactive and shutil.which("brew")):
+            print(f"  Tip: to make notifications clickable (a click goes to the session's tab): {hint}.")
+            return
+        if input("Install terminal-notifier with Homebrew, so clicking a notification goes to its session's tab? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print(f"Skipped. Later: {hint}.")
+            return
+        if subprocess.run(["brew", "install", "terminal-notifier"]).returncode != 0 or not shutil.which("terminal-notifier"):
+            print(f"Homebrew couldn't install it. Try: {hint}.")
+            return
+    ver = terminal_notifier_version()
+    if ver and ver < (3, 0):  # 2.x can't say whether macOS allows it (-diagnose) or be opened to ask
+        upgrade = "brew upgrade terminal-notifier, then ccdeck notifications setup"
+        if not (interactive and shutil.which("brew")) or input(
+                f"terminal-notifier {ver[0]}.{ver[1]} is too old; upgrade it to 3.x with Homebrew? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print(f"Clickable notifications need terminal-notifier 3.x (this is {ver[0]}.{ver[1]}): {upgrade}.")
+            return
+        if subprocess.run(["brew", "upgrade", "terminal-notifier"]).returncode != 0 or (terminal_notifier_version() or (0,)) < (3, 0):
+            print(f"Homebrew couldn't upgrade it. Try: {upgrade}.")
+            return
+    auth = terminal_notifier_authorization()
+    if auth == "not requested yet" and (app := terminal_notifier_app()):
+        # started from a shell it can't ask for permission (it exits with 3); opened as an app, macOS asks
+        print("macOS will ask whether terminal-notifier may send notifications: choose Allow.")
+        try:
+            subprocess.run(["open", "-W", "-a", str(app), "--args", "-title", "ccdeck",
+                            "-message", "Notifications from ccdeck are on. Clicking one goes to its session's tab."],
+                           timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for _ in range(30 if interactive else 0):  # give the prompt a moment to be answered
+            if (auth := terminal_notifier_authorization()) == "authorized":
+                break
+            time.sleep(1)
+        else:
+            auth = terminal_notifier_authorization()
+    if auth == "authorized":
+        print("Notifications are clickable: a click goes to the session's Terminal or iTerm tab.")
+        print("  The first click may ask whether terminal-notifier can control Terminal: choose OK.")
+        return
+    print("macOS doesn't allow terminal-notifier's notifications yet. In System Settings > Notifications >")
+    print("terminal-notifier, turn on Allow notifications (style: Banners). Until then they come from osascript,")
+    print("and clicking one opens Script Editor. Check with: ccdeck notifications setup")
+    if interactive:
+        open_path(NOTIFY_SETTINGS_URL)
 
 
 TERMINALS = [  # (binary, args before the command)
@@ -1286,7 +1478,7 @@ def open_terminal(cwd, argv):
     cmd = terminal_command(cwd, argv)
     if not cmd:
         raise RuntimeError("No terminal emulator found; set CCDECK_TERMINAL")
-    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=desktop_env(),
+    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=user_env(desktop_env()),
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     if cmd[0] == "osascript":
         return "iTerm" if 'tell application "iTerm"' in cmd else "Terminal"
@@ -1452,6 +1644,17 @@ def cmd_notify_click(args):
         focus_terminal(peer["pid"], token)
 
 
+def cmd_focus(args):
+    """Go to the terminal tab of an open session (what a clicked macOS notification runs)."""
+    peer = peer_sessions().get(args.sid)
+    if not peer:
+        sys.exit("That session isn't open in a terminal.")
+    label = focus_terminal(peer["pid"])
+    if not label:
+        sys.exit("Couldn't switch to its tab (supported: Terminal, iTerm, gnome-terminal, tmux).")
+    print(f"Switched to its {label} tab.")
+
+
 def open_path(target):
     opener = "open" if IS_MAC else "xdg-open"
     if shutil.which(opener):
@@ -1518,8 +1721,8 @@ class Dashboard:
             "groups": [{"key": g, "label": l} for g, l in GROUPS],
             "states": {k: {"group": g, "label": l} for k, (g, l) in STATES.items()},
             "gh": bool(shutil.which("gh")), "hooks": hooks_active(),
-            "default_days": DEFAULT_DAYS, "port": self.port, "gh_install": GH_INSTALL,
-            "reviews": review_requests(sessions),
+            "default_days": DEFAULT_DAYS, "port": self.port, "gh_install": GH_INSTALL, "preview": PREVIEW,
+            "reviews": review_requests(sessions), "settings": settings_view(),
         }
         etag = hashlib.sha1(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:16]
         snap["generated"] = time.time()
@@ -1531,7 +1734,7 @@ class Dashboard:
     def _notify_changes(self, rows):
         cur = {r["id"]: r["state"] for r in rows}
         prev, self.prev_states = self.prev_states, cur
-        if prev is None:
+        if prev is None or PREVIEW:
             return  # first scan after start: don't replay everything
         for r in rows:
             st, before = r["state"], prev.get(r["id"])
@@ -1561,7 +1764,7 @@ class Dashboard:
 
     def maybe_upgrade(self):
         """Restart into a newer ccdeck that the session hooks report (a plugin update), in place."""
-        if time.time() - getattr(self, "_upgrade_checked", 0) < 10:
+        if PREVIEW or time.time() - getattr(self, "_upgrade_checked", 0) < 10:
             return
         self._upgrade_checked = time.time()
         target = newer_install()
@@ -1577,14 +1780,15 @@ class Dashboard:
     def pr_loop(self):
         last_reviews = 0
         while True:
-            if time.time() - last_reviews > 300:
+            scope = review_scope()
+            cached = load_json(REVIEWS_FILE, {}) or {}
+            if time.time() - last_reviews > 300 or cached.get("scope", "all") != scope:
                 last_reviews = time.time()
                 try:
-                    items = fetch_review_requests()
-                    if items is not None:
-                        old = (load_json(REVIEWS_FILE, {}) or {}).get("items")
-                        save_json(REVIEWS_FILE, {"fetched": time.time(), "items": items})
-                        if items != old:
+                    items = fetch_review_requests(scope)
+                    if items is not None or scope == "off":
+                        save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or []})
+                        if items != cached.get("items") or scope != cached.get("scope", "all"):
                             self.wake.set()
                 except Exception as e:
                     print(f"review requests error: {e!r}", file=sys.stderr)
@@ -1610,6 +1814,14 @@ class Dashboard:
 
     def handle_action(self, body):
         sid, action = body.get("id"), body.get("action")
+        if action == "set_setting":  # the settings panel: not about a session
+            key = body.get("key")
+            try:
+                set_setting(key if isinstance(key, str) else "", body.get("value"))
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            self.refresh()
+            return 200, {"ok": True, "settings": settings_view()}
         s = self.find(sid) if isinstance(sid, str) else None
         if not s:
             return 404, {"error": "unknown session"}
@@ -1719,7 +1931,8 @@ class Dashboard:
         return Handler
 
     def serve(self):
-        adopt_stable_copy()
+        if not PREVIEW:
+            adopt_stable_copy()
         self.refresh()
         self.heartbeat()
         threading.Thread(target=self.scan_loop, daemon=True).start()
@@ -1993,6 +2206,281 @@ def cmd_open(args):
     open_path(url)
 
 
+# --------------------------------------------------------------------- preview
+# `ccdeck preview 16` runs PR #16's ccdeck next to your own, on your real sessions, so you can try a
+# change before it's merged or released. It gets its own config folder: transcripts, hook states and
+# marks are shared (marks as a copy), while caches, token and daemon file are its own. Hooks keep
+# running from your installed ccdeck.
+
+PREVIEW_REPO = os.environ.get("CCDECK_REPO", "slonik923/ccdeck")
+PREVIEW_PORT = 7798
+
+
+def github_json(path):
+    """GET api.github.com/<path>, through `gh` when it's installed (auth, private repos)."""
+    if shutil.which("gh"):
+        r = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+    import urllib.request
+    req = urllib.request.Request("https://api.github.com/" + path, headers={"Accept": "application/vnd.github+json",
+                                                                          "User-Agent": "ccdeck"})
+    with urllib.request.urlopen(req, timeout=30) as f:
+        return json.load(f)
+
+
+def download_source(repo, sha, dest):
+    """Download the repo at `sha` and unpack it into dest."""
+    import urllib.request
+    data = None
+    if shutil.which("gh"):
+        r = subprocess.run(["gh", "api", f"repos/{repo}/tarball/{sha}"], capture_output=True, timeout=120)
+        data = r.stdout if r.returncode == 0 else None
+    if data is None:
+        req = urllib.request.Request(f"https://codeload.github.com/{repo}/tar.gz/{sha}", headers={"User-Agent": "ccdeck"})
+        with urllib.request.urlopen(req, timeout=120) as f:
+            data = f.read()
+    unpack_tarball(data, dest)
+
+
+def unpack_tarball(data, dest):
+    """Unpack a GitHub tarball (one top folder) into dest. Only plain files and folders, inside dest."""
+    import io
+    import tarfile
+    tmp = dest.with_name(dest.name + ".part")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    root = tmp.resolve()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            parts = m.name.split("/", 1)
+            if len(parts) < 2 or not parts[1] or not (m.isfile() or m.isdir()):
+                continue  # the top folder, links and devices
+            target = (root / parts[1]).resolve()
+            if root not in target.parents:
+                raise RuntimeError(f"unsafe path in archive: {m.name}")
+            if m.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(m) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                if m.mode & 0o100:
+                    target.chmod(0o755)
+    shutil.rmtree(dest, ignore_errors=True)
+    tmp.rename(dest)
+
+
+VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
+
+
+def version_at(repo, ref):
+    """The ccdeck version (.claude-plugin/plugin.json) at a ref of repo, or None."""
+    try:
+        d = github_json(f"repos/{repo}/contents/.claude-plugin/plugin.json?ref={ref}")
+        import base64
+        return json.loads(base64.b64decode(d.get("content") or "")).get("version")
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        return None
+
+
+def find_version(version, repo):
+    """What has ccdeck `version`: a tag, main, or an open PR (they don't share one: version-bumping PRs are
+    stacked). Returns a target resolve_preview takes (a tag, "main", or "#N"), or None."""
+    for tag in ("v" + version, version):
+        try:
+            if github_json(f"repos/{repo}/commits/{tag}").get("sha"):
+                return tag
+        except (OSError, ValueError, RuntimeError):
+            pass
+    if version_at(repo, "main") == version:
+        return "main"
+    try:
+        prs = github_json(f"repos/{repo}/pulls?state=open&per_page=50")
+    except (OSError, ValueError, RuntimeError):
+        prs = []
+    for pr in prs if isinstance(prs, list) else []:
+        head = pr.get("head") or {}
+        if ((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower() \
+                and version_at(repo, head.get("sha")) == version:
+            return f"#{pr['number']}"
+    return None
+
+
+def resolve_preview(target, repo, trust):
+    """(source folder, label) for a PR number, ccdeck version (0.8.5), branch, tag, commit, or local checkout."""
+    if (m := VERSION_RE.fullmatch(target)) and not os.path.isdir(target):
+        found = find_version(m.group(1), repo)
+        if not found:
+            sys.exit(f"No ccdeck {m.group(1)} in {repo}: not a tag, not on main, not in an open PR.")
+        print(f"ccdeck {m.group(1)} is {'PR ' + found if found.startswith('#') else found}.")
+        target = found
+    if os.path.isdir(target):
+        src = Path(target).resolve()
+        if not (src / "ccdeck").is_file():
+            sys.exit(f"{target} has no ccdeck script.")
+        return src, f"local {src.name}"
+    if target.lstrip("#").isdigit():
+        pr = github_json(f"repos/{repo}/pulls/{target.lstrip('#')}")
+        head, base = pr.get("head") or {}, pr.get("base") or {}
+        head_repo = (head.get("repo") or {}).get("full_name") or "?"
+        if head_repo.lower() != ((base.get("repo") or {}).get("full_name") or repo).lower() and not trust:
+            sys.exit(f"PR #{pr.get('number')} comes from another repository ({head_repo}). "
+                     "Its code would run on your machine: read it first, then pass --trust.")
+        sha, label = head.get("sha"), f"#{pr.get('number')} {one_line(pr.get('title') or '', 60)}"
+    else:
+        sha = github_json(f"repos/{repo}/commits/{target}").get("sha")
+        label = target
+    if not sha:
+        sys.exit(f"Couldn't find {target} in {repo}.")
+    dest = PREVIEW_DIR / "src" / sha[:12]
+    if not (dest / "ccdeck").is_file():
+        print(f"Downloading {repo} at {sha[:12]}…")
+        download_source(repo, sha, dest)
+        olds = sorted((PREVIEW_DIR / "src").iterdir(), key=lambda p: p.stat().st_mtime)
+        for old in olds[:-5]:  # keep the last few
+            shutil.rmtree(old, ignore_errors=True)
+    return dest, f"{label} ({sha[:7]})"
+
+
+def preview_config_dir():
+    """A Claude config folder that sees your transcripts and hook states but keeps its own caches."""
+    cfg = PREVIEW_DIR / "claude"
+    (cfg / "ccdeck").mkdir(parents=True, exist_ok=True)
+    # sessions: Claude Code's registry of open sessions, which "Go to tab" and resume need
+    for link, real in ((cfg / "projects", PROJECTS_DIR), (cfg / "ccdeck" / "state", STATE_DIR),
+                       (cfg / "sessions", CLAUDE_DIR / "sessions")):
+        real.mkdir(parents=True, exist_ok=True)
+        real = real.resolve()  # a relative CLAUDE_CONFIG_DIR would make the link relative to the preview folder
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and os.readlink(link) == str(real):
+                continue
+            link.unlink() if link.is_symlink() or link.is_file() else shutil.rmtree(link)
+        link.symlink_to(real)
+    for real in (MARKS_FILE, CONFIG_FILE):  # copies: marks and settings changed in the preview don't change yours
+        if real.exists():
+            shutil.copy(real, cfg / "ccdeck" / real.name)
+        else:  # none of yours: start without one, not with what the last preview changed
+            (cfg / "ccdeck" / real.name).unlink(missing_ok=True)
+    return cfg
+
+
+def proc_zombie(pid):
+    """pid has exited but its parent hasn't reaped it yet: its start time stays readable, but it's gone."""
+    if USE_PROC:
+        try:
+            return _stat_fields(pid)[0] == "Z"
+        except (OSError, IndexError, ValueError, TypeError):
+            return False
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+    return out.strip().startswith("Z")
+
+
+def stop_preview(quiet=False):
+    """Stop the running preview and wait until it has (so its port is free). False if it wouldn't stop."""
+    info = load_json(PREVIEW_DIR / "preview.json", {})
+    pid, start = info.get("pid"), info.get("pid_start")
+    if pid and not start:  # pid_alive(pid, None) accepts any process that has the pid now: don't signal it
+        print(f"Can't tell whether pid {pid} is still the preview; if it is, stop it yourself.", file=sys.stderr)
+        (PREVIEW_DIR / "preview.json").unlink(missing_ok=True)
+        return False
+    if not (pid and pid_alive(pid, start)):
+        if not quiet:
+            print("No preview is running.")
+        (PREVIEW_DIR / "preview.json").unlink(missing_ok=True)
+        return True
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+        running = lambda: pid_alive(pid, start) and not proc_zombie(pid)  # noqa: E731  a zombie has stopped
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and running():
+            time.sleep(0.1)
+        if not running():
+            break
+    else:
+        print(f"The preview (pid {pid}) didn't stop; stop it yourself, then try again.", file=sys.stderr)
+        return False
+    if not quiet:
+        print(f"Stopped the preview of {info.get('label')}.")
+    (PREVIEW_DIR / "preview.json").unlink(missing_ok=True)
+    return True
+
+
+def cmd_preview(args):
+    """Stop and start go one at a time: two at once could both find the port free, and preview.json end up
+    naming the one that failed, so `stop` couldn't stop the one running."""
+    import fcntl
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PREVIEW_DIR / "preview.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes
+        if args.target == "stop":
+            return stop_preview()
+        return start_preview(args)
+
+
+def start_preview(args):
+    try:
+        src, label = resolve_preview(args.target, args.repo, args.trust)
+    except (OSError, ValueError, RuntimeError) as e:  # network, GitHub or archive problems
+        sys.exit(f"Couldn't get {args.target} from {args.repo}: {e}. "
+                 "Install and log in to the GitHub CLI (gh auth login), or pass a local checkout.")
+    if not stop_preview(quiet=True):
+        sys.exit(1)
+    try:
+        knows_preview = "CCDECK_PREVIEW" in (src / "ccdeck").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        knows_preview = False
+    if not knows_preview:  # it runs its own code, so it ignores what this version does for previews
+        print(f"Note: {label} predates `ccdeck preview`. Its page has no preview tag, and if the ccdeck your\n"
+              "hooks run is newer, it may switch itself to that version. Check the version in the page's header.")
+    import socket
+    with socket.socket() as sock:  # bound like the server binds it: free, or another program's
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", args.port))
+        except OSError:
+            sys.exit(f"Port {args.port} is in use by another program; pick another with --port.")
+    cfg = preview_config_dir()
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CCDECK_PREVIEW=label, CCDECK_NOTIFY="0", CCDECK_AUTOSTART="0",
+               CCDECK_PREVIEW_SAVED_ENV=json.dumps({k: os.environ.get(k) for k in PREVIEW_ENV}))
+    log = open(PREVIEW_DIR / "serve.log", "w")
+    proc = subprocess.Popen([sys.executable, str(src / "ccdeck"), "serve", "--port", str(args.port)], env=env,
+                            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    start = None
+    for _ in range(20):  # without /proc, ps is cached for a second and may predate the child: read it afresh
+        _ps_cache["t"] = 0
+        if (start := proc_start_time(proc.pid)) or proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    if not start:
+        proc.terminate()
+        sys.exit(f"The preview didn't start; see {short_path(PREVIEW_DIR / 'serve.log')}.")
+    save_json(PREVIEW_DIR / "preview.json", {"pid": proc.pid, "pid_start": start, "port": args.port,
+                                             "label": label, "source": str(src), "started": time.time()})
+    import urllib.request
+    url = f"http://localhost:{args.port}"
+    deadline, up = time.monotonic() + 20, False  # the first scan can take a while (macOS: ps and lsof)
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            sys.exit(f"The preview stopped right away; see {short_path(PREVIEW_DIR / 'serve.log')}.")
+        try:
+            urllib.request.urlopen(url, timeout=0.5).close()
+            up = True
+            break
+        except OSError:
+            time.sleep(0.2)
+    print(f"Preview of {label}: {url}" + ("" if up else "  (still starting)"))
+    print("It reads your real sessions; notes, marks and settings you change there aren't kept. Stop it with: ccdeck preview stop")
+    if not args.no_open:
+        open_path(url)
+
+
 # ------------------------------------------------------------------------ hook
 
 def cmd_hook(_args):
@@ -2222,11 +2710,46 @@ def wait_for_approval(sid, data, state):
         cleanup_request(req["id"])
 
 
+def settings_view():
+    """The settings the dashboard's settings panel shows: each one's value, and the environment
+    variable that overrides it in the server's environment, if one does."""
+    env = os.environ.get
+    return {
+        "review_requests": {"value": review_scope(),
+                            "locked": "CCDECK_REVIEW_REQUESTS=0" if env("CCDECK_REVIEW_REQUESTS") == "0" else None},
+        "approvals": {"value": approvals_enabled(),
+                      "locked": f"CCDECK_APPROVALS={env('CCDECK_APPROVALS')}" if env("CCDECK_APPROVALS") is not None else None},
+        "notifications": {c: {"value": notify_enabled(c),
+                              "locked": "CCDECK_NOTIFY=0" if env("CCDECK_NOTIFY") == "0" else None}
+                          for c in NOTIFY_CHANNELS},
+    }
+
+
+def set_setting(key, value):
+    """Save one setting to config.json. key is review_requests, approvals or notifications.<channel>.
+    Raises ValueError for an unknown key or a value it can't take.
+    The dashboard (a thread per request) and the ccdeck commands (other processes) all write config.json,
+    each reading the whole file and saving it back, so a file lock keeps one from undoing another's change."""
+    import fcntl
+    if not (key == "review_requests" and isinstance(value, str) and value in REVIEW_SCOPES
+            or key == "approvals" and isinstance(value, bool)
+            or key.startswith("notifications.") and key.split(".", 1)[1] in NOTIFY_CHANNELS and isinstance(value, bool)):
+        raise ValueError(f"can't set {key} to {value!r}")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DATA_DIR / "config.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes
+        cfg = load_json(CONFIG_FILE, {})
+        cfg = cfg if isinstance(cfg, dict) else {}
+        if key.startswith("notifications."):
+            cfg["notifications"] = {**notify_settings(cfg), key.split(".", 1)[1]: value}
+        else:
+            cfg[key] = value
+        save_json(CONFIG_FILE, cfg)
+
+
 def cmd_approvals(args):
     if args.mode in ("on", "off"):
-        cfg = load_json(CONFIG_FILE, {})
-        cfg["approvals"] = args.mode == "on"
-        save_json(CONFIG_FILE, cfg)
+        set_setting("approvals", args.mode == "on")
     on = approvals_enabled()
     print(f"Approvals from the dashboard: {'on' if on else 'off'}"
           + (" (CCDECK_APPROVALS overrides the setting)" if "CCDECK_APPROVALS" in os.environ else ""))
@@ -2234,18 +2757,29 @@ def cmd_approvals(args):
         print("Permission prompts can now be allowed or denied in the dashboard; the terminal still works too.")
 
 
+def cmd_review_requests(args):
+    if args.mode != "status":
+        set_setting("review_requests", args.mode)
+    scope = review_scope()
+    print("Review requests: " + {"all": "all (asked of you or of a team you're in)",
+                                 "mine": "mine (asked of you by name; team requests left out)",
+                                 "off": "off"}[scope])
+    if os.environ.get("CCDECK_REVIEW_REQUESTS") == "0":
+        print("(CCDECK_REVIEW_REQUESTS=0 turns them off, whatever the setting)")
+
+
 def cmd_notifications(args):
     words = args.words
+    if words == ["setup"]:
+        return setup_notifications(sys.stdin.isatty())
     if words and words[-1] not in ("on", "off"):
-        sys.exit("usage: ccdeck notifications [CHANNEL] [on|off]")
+        sys.exit("usage: ccdeck notifications [CHANNEL] [on|off] | setup")
     if words:
         channels = words[:-1] or list(NOTIFY_CHANNELS)
         if any(c not in NOTIFY_CHANNELS for c in channels):
             sys.exit(f"Unknown channel; channels: {', '.join(NOTIFY_CHANNELS)}")
-        cfg = load_json(CONFIG_FILE, {})
-        cfg = cfg if isinstance(cfg, dict) else {}
-        cfg["notifications"] = {**notify_settings(cfg), **{c: words[-1] == "on" for c in channels}}
-        save_json(CONFIG_FILE, cfg)
+        for c in channels:
+            set_setting("notifications." + c, words[-1] == "on")
     for c in NOTIFY_CHANNELS:
         print(f"{c} notifications: {'on' if notify_enabled(c) else 'off'}")
     if os.environ.get("CCDECK_NOTIFY") == "0":
@@ -2527,6 +3061,8 @@ def cmd_install(args):
         install_service(args.port)
     if not shutil.which("gh"):
         print(f"  Tip: install the GitHub CLI (`{GH_INSTALL}`, then `gh auth login`) for PR states.")
+    if notify_enabled("desktop"):
+        setup_notifications(sys.stdin.isatty())
 
 
 def cmd_uninstall(_args):
@@ -2589,10 +3125,21 @@ def main():
     sub.add_parser("uninstall", help="remove hooks, service and launcher")
     s = sub.add_parser("approvals", help="allow/deny permission prompts from the dashboard (opt-in)")
     s.add_argument("mode", nargs="?", choices=["on", "off", "status"], default="status")
-    s = sub.add_parser("notifications", help="turn notifications on or off, all or one channel ("
+    s = sub.add_parser("review-requests", help="which PR review requests to list: all (yours and your teams'), "
+                       "mine (asked of you by name) or off")
+    s.add_argument("mode", nargs="?", choices=["all", "mine", "off", "status"], default="status")
+    s = sub.add_parser("notifications", help="turn notifications on or off, all or one channel; setup makes them clickable ("
                        + ", ".join(NOTIFY_CHANNELS) + ")")
-    s.add_argument("words", nargs="*", metavar="[CHANNEL] [on|off]")
+    s.add_argument("words", nargs="*", metavar="[CHANNEL] [on|off] | setup")
+    s = sub.add_parser("preview", help="try a PR or branch of ccdeck on your sessions, next to your own dashboard")
+    s.add_argument("target", help="PR number, ccdeck version (0.8.5), branch, tag or commit, a local checkout, or 'stop'")
+    s.add_argument("--port", type=int, default=PREVIEW_PORT)
+    s.add_argument("--repo", default=PREVIEW_REPO, help="GitHub repository (default %(default)s)")
+    s.add_argument("--trust", action="store_true", help="allow a PR from a fork (its code runs on your machine)")
+    s.add_argument("--no-open", action="store_true", help="don't open the browser")
     sub.add_parser("hook", help=argparse.SUPPRESS)
+    s = sub.add_parser("focus", help=argparse.SUPPRESS)  # run by a clicked macOS notification
+    s.add_argument("sid")
     s = sub.add_parser("notify-click", help=argparse.SUPPRESS)
     s.add_argument("sid")
     s.add_argument("title")
@@ -2604,8 +3151,8 @@ def main():
         None: cmd_list, "list": cmd_list, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
-        "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,
-        "notify-click": cmd_notify_click,
+        "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,
+        "notify-click": cmd_notify_click, "focus": cmd_focus, "preview": cmd_preview,
     }
     handlers[args.cmd](args)
 

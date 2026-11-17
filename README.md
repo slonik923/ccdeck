@@ -35,6 +35,8 @@ Open it at `http://localhost:7799`, or with `/ccdeck:dashboard`.
 
 For PR states, also install the GitHub CLI (`sudo apt install gh` on Ubuntu, `brew install gh` on macOS) and run `gh auth login`.
 
+On macOS, make notifications clickable, so that a click goes to its session's tab (see [Clickable notifications on macOS](#clickable-notifications-on-macos)): run `/ccdeck:install` first, which adds the `ccdeck` terminal command, then run `ccdeck notifications setup` once in a terminal. It asks before installing anything, so run it in a terminal rather than through Claude.
+
 The plugin adds these commands to Claude Code:
 
 | Command | What it does |
@@ -43,6 +45,7 @@ The plugin adds these commands to Claude Code:
 | `/ccdeck:install` | Adds the background service (the dashboard starts at login) and the `ccdeck` terminal command |
 | `/ccdeck:done [note]` | Marks the current session done, with an optional note |
 | `/ccdeck:park [note]` | Sets the current session aside for later |
+| `/ccdeck:preview <PR or version>` | Tries an unreleased ccdeck PR, version (`0.8.5`) or branch on your sessions, next to your dashboard (see below) |
 
 `/ccdeck:install` copies ccdeck to `~/.local/share/ccdeck`, and the service and command run from that copy. Nothing points at the plugin's versioned cache folder.
 
@@ -57,16 +60,34 @@ git clone https://github.com/slonik923/ccdeck.git ~/ccdeck
 ~/ccdeck/ccdeck install            # add --no-hooks if you also use the plugin
 ```
 
-`install` does four things:
+`install` does five things:
 
 1. **Command.** It links `~/.local/bin/ccdeck` to the script in the clone, so `git pull` updates it.
 2. **Hooks.** It adds the same hooks to `~/.claude/settings.json`, after saving a backup as `settings.json.bak-ccdeck`. Skip this with `--no-hooks` when you use the plugin. Having both is harmless: a duplicate event is ignored.
 3. **Background service.** On Linux it adds a systemd user service, `ccdeck.service`. On macOS it adds a launchd agent, `~/Library/LaunchAgents/io.github.slonik923.ccdeck.plist`. The service starts at login, restarts if it crashes, keeps PR states up to date and sends the notifications.
 4. **App launcher** (Linux only). It adds a **ccdeck** entry that opens the dashboard. On macOS, run `ccdeck open` or bookmark the page.
+5. **Clickable notifications** (macOS). It offers to install `terminal-notifier` and asks macOS to allow its notifications, as `ccdeck notifications setup` does (see below). It asks before installing anything.
 
 On macOS, `~/.local/bin` may not be on your `PATH`. `install` tells you if it isn't.
 
 Options: `--port 8123`, `--no-hooks`, `--no-service`. To remove everything: `ccdeck uninstall`. Your marks and notes stay in `~/.claude/ccdeck/`.
+
+### Clickable notifications on macOS
+
+Clicking a ccdeck notification should take you to that session's tab in Terminal or iTerm. On macOS that needs [`terminal-notifier`](https://github.com/julienXX/terminal-notifier); without it, notifications are sent with `osascript`, and macOS opens Script Editor when you click one.
+
+```bash
+ccdeck notifications setup
+```
+
+It goes through these steps, and you can run it again any time to check:
+
+1. **Install.** If `terminal-notifier` is missing, it offers to run `brew install terminal-notifier`. It needs version 3 or later; if you have 2.x, it offers `brew upgrade terminal-notifier`.
+2. **Allow notifications.** It opens `terminal-notifier` once as an app, so macOS asks whether it may send notifications: choose **Allow**. Started from a script, it can't ask, and its notifications are dropped.
+3. **If macOS says no,** or the prompt didn't appear, it opens **System Settings > Notifications**. Find **terminal-notifier**, turn on **Allow notifications**, and set the style to **Banners**.
+4. **First click.** macOS may ask whether `terminal-notifier` can control Terminal (or iTerm): choose **OK**. That's how it switches to the tab.
+
+If notifications still open Script Editor, `terminal-notifier -diagnose` shows what macOS allows it. Until it's allowed, ccdeck sends notifications the old way (through `osascript`, which macOS lists as Script Editor), so you still get them, as long as notifications from Script Editor are allowed too.
 
 ## The dashboard
 
@@ -106,7 +127,9 @@ The groups say what you have to do, most urgent first:
 
 "In progress" means someone else is on it: Claude, CI or your reviewers. A PR waiting for review counts as in progress, because you can't approve your own (or your agent's) PR.
 
-**Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs --review-requested=@me`. Your own sessions' PRs are left out. To turn it off, set `CCDECK_REVIEW_REQUESTS=0`.
+**Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs`. Your own sessions' PRs are left out. By default the list includes requests made to a team you're in. If your teams get many of those, `ccdeck review-requests mine` lists only the PRs where you were asked by name; `ccdeck review-requests all` goes back. `ccdeck review-requests off` (or `CCDECK_REVIEW_REQUESTS=0`) turns the list off.
+
+**Settings.** The gear button in the dashboard's header opens a settings panel for review requests, desktop notifications and approvals from the dashboard. It saves to `~/.claude/ccdeck/config.json`, the same file the `ccdeck review-requests`, `ccdeck notifications` and `ccdeck approvals` commands change.
 
 Each card shows:
 - the title, folder, branch and number of prompts
@@ -134,6 +157,25 @@ The terminal used for **Resume ▸**:
 
 Any other terminal works through `CCDECK_TERMINAL`, for example `CCDECK_TERMINAL="wezterm start --"`. macOS asks once whether ccdeck may control Terminal or iTerm.
 
+## Trying a change before it's released
+
+```bash
+ccdeck preview 16          # PR #16 of slonik923/ccdeck
+ccdeck preview 0.8.5       # the version 0.8.5: a tag, main, or the open PR that bumps to it
+ccdeck preview my-branch   # a branch, tag or commit
+ccdeck preview ~/ccdeck    # a local checkout
+ccdeck preview stop
+```
+
+`preview` downloads that version and runs its dashboard on `http://localhost:7798`, next to your normal one. The header shows which version it is.
+- **Shared with your dashboard:** your real transcripts, the live states your hooks report, and which sessions are open in a terminal.
+- **Its own:** caches, token and notifications, so it doesn't disturb your normal dashboard.
+- **Marks, notes and settings:** it gets a copy of yours, and changes made in the preview aren't kept.
+
+Hooks keep running from your installed ccdeck, so a PR that changes the hooks only takes full effect after it's released.
+
+**Security.** A preview runs downloaded code on your machine. For PRs from forks, it refuses unless you pass `--trust`; read the PR first. Downloads use the GitHub CLI when it's installed, and are kept in `~/.claude/ccdeck-preview/` (the last five).
+
 ## Terminal
 
 ```text
@@ -146,6 +188,8 @@ ccdeck park 3          set aside               ccdeck unpark 3
 ccdeck note 3 text     attach a note
 ccdeck open            open the dashboard
 ccdeck serve           run the dashboard in the foreground (instead of the service)
+ccdeck review-requests mine   list only PRs where you were asked to review by name (all | mine | off)
+ccdeck preview 16      try PR #16 next to your dashboard (ccdeck preview stop)
 ```
 
 `3` is the row number from the last list. A prefix of the session id also works.
@@ -158,7 +202,11 @@ ccdeck serve           run the dashboard in the foreground (instead of the servi
 - **The server** listens only on `127.0.0.1`. The API needs a random token, stored in `~/.claude/ccdeck/token`, which only the dashboard page receives. Requests whose `Host` header isn't localhost are rejected. Together, these stop other websites from reading your sessions or opening terminals.
 - **Token usage** comes from the `usage` that Claude Code saves with each response. Each response is counted once, even though it's saved on several entries. The context bar uses the size of the latest request against the model's window: 1M for current models, 200K for Claude Haiku 4.5 and older models. To use a different limit, set `CCDECK_CONTEXT_LIMIT`. Tokens are shown rather than dollars, because many people use Claude Code on a subscription and prices differ by model.
 - **Dashboard autostart.** With the plugin, the `SessionStart` hook starts `ccdeck serve` in the background when nothing answers on the port; it logs to `~/.claude/ccdeck/serve.log`. It doesn't do this when the systemd service or launchd agent is installed. To turn it off, set `CCDECK_AUTOSTART=0`.
-- **Notifications** appear when a session moves into *Needs you*, *PRs to fix* or *Your turn*. They use `notify-send` on Linux and Notification Center (through `osascript`) on macOS. On Linux, clicking one goes to that session's terminal tab and raises its window, in gnome-terminal (or selects its tmux pane). That needs PyGObject (`python3-gi`, preinstalled on GNOME); without it, and on macOS, notifications still appear but clicking them does nothing. Turn them off or on with `ccdeck notifications off|on`, or one channel at a time with `ccdeck notifications desktop off` (desktop is the only channel so far). The setting lives in ccdeck's `config.json`; `CCDECK_NOTIFY=0` turns them all off whatever it says.
+- **Notifications** appear when a session moves into *Needs you*, *PRs to fix* or *Your turn*. Clicking one goes to that session's terminal tab:
+  - **Linux:** it raises the window in gnome-terminal (or selects the tmux pane). That needs PyGObject (`python3-gi`, preinstalled on GNOME); without it, notifications come from `notify-send` and clicking them does nothing.
+  - **macOS:** it switches to the tab in Terminal or iTerm. That needs `terminal-notifier` 3 or later, which `ccdeck notifications setup` installs (or upgrades) and gets allowed (see [Clickable notifications on macOS](#clickable-notifications-on-macos)). Without it, notifications come from `osascript`, and clicking one only opens Script Editor.
+
+  Turn them off or on with `ccdeck notifications off|on`, or one channel at a time with `ccdeck notifications desktop off` (desktop is the only channel so far). The setting lives in ccdeck's `config.json`; `CCDECK_NOTIFY=0` turns them all off whatever it says.
 - **Running or closed.** A session counts as running in one of two ways:
   - **Reported by hooks:** its hooks recorded the Claude process, and that process is still alive with the same start time.
   - **Guessed:** for sessions no hook has reported on (for example, ones started before you installed the plugin), N `claude` processes in a folder mark that folder's N most recent sessions as open. A `claude --resume <id>` process marks exactly that session.

@@ -50,6 +50,7 @@
 <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path><path d="M19 17v4M17 19h4"></path></symbol>
 <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"></path></symbol>
 <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5"></path><path d="M12 8h.01"></path></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path></symbol>
 <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></symbol>
 <symbol id="i-contrast" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"></path></symbol>
 <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6"></path><path d="M6 8h12v4a6 6 0 0 1-12 0z"></path><path d="M12 18v4"></path></symbol>
@@ -63,6 +64,7 @@
 <span class="brand-mark"><svg class="i" aria-hidden="true"><use href="#i-peak"></use></svg><span class="brand-badge" id="needBadge" hidden></span></span>
 <span>ccdeck</span>
 <span class="host" id="host">localhost</span>
+<span class="previewtag" id="previewTag" hidden></span>
 </div>
 <span class="live" id="live" data-on="on" role="status"><span class="live-dot"></span><span id="liveText">Connecting</span><span class="live-text-long muted" id="liveSub"></span></span>
 <div class="menu-wrap" id="hintWrap" hidden></div>
@@ -71,6 +73,7 @@
 <button class="toggle" id="tDone" aria-pressed="false"><span class="switch"></span><span class="toggle-label">Show done</span><span class="toggle-count" id="cDone">0</span></button>
 <button class="toggle" id="tOld" aria-pressed="false"><span class="switch"></span><span class="toggle-label">Older closed</span><span class="toggle-count" id="cOld">0</span></button>
 <div class="menu-wrap"><button class="ibtn" id="legendBtn" aria-label="Legend: what the states mean" aria-expanded="false"><svg class="i" aria-hidden="true"><use href="#i-info"></use></svg></button><div id="legendHost"></div></div>
+<button class="ibtn" id="settingsBtn" aria-label="Settings" aria-expanded="false"><svg class="i" aria-hidden="true"><use href="#i-gear"></use></svg></button>
 </div>
 </div>
 </header>
@@ -78,6 +81,7 @@
 
 <main class="wrap" id="main"></main>
 <div id="drawerHost"></div>
+<div id="settingsHost"></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </div>
 
@@ -189,7 +193,7 @@ async function copy(text, what) {
 let data = null, etag = "", lastOk = 0, failures = 0;
 const ui = {
   filter: "all", showDone: ls.get("showDone", false), showOld: ls.get("showOld", false), q: "",
-  menu: "", drawer: "", focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false),
+  menu: "", drawer: "", settings: false, focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false),
 };
 const offline = () => !!data && failures > 0 && Date.now() - lastOk > 6000;
 
@@ -619,7 +623,10 @@ function render() {
   const isOld = (s) => s.g === "closed" && s.k !== "parked" && now - s.ts > OLD_AFTER;
   const oldClosed = all.filter(isOld).length;
 
-  document.title = (needN ? `(${needN}) ` : "") + "ccdeck";
+  document.title = (needN ? `(${needN}) ` : "") + (data.preview ? "ccdeck preview" : "ccdeck");
+  $("previewTag").hidden = !data.preview;
+  $("previewTag").textContent = data.preview ? "Preview · " + data.preview : "";
+  $("previewTag").title = data.preview ? data.preview + "\n\nA preview started with `ccdeck preview`. Notes and marks changed here aren't kept. Stop it with `ccdeck preview stop`." : "";
   setFavicon(needN, needN ? "#E9887D" : prN ? "#C393C2" : count("turn") ? "#10b981" : count("work") ? "#F0B44C" : "#10b981");
   $("needBadge").hidden = !needN || isOff; $("needBadge").textContent = needN;
   $("host").textContent = "localhost:" + data.port + " · v" + data.version;
@@ -698,6 +705,7 @@ function render() {
     h("span", {}, h("span", { class: "kbd" }, "."), " actions")));
   $("main").replaceChildren(...out);
   renderDrawer(all);
+  renderSettings();
   if (keep) focusKey(keep);
 }
 // PRs that ask for your review. They belong to colleagues, not to a session, so they get their own list.
@@ -742,7 +750,12 @@ function capped(s, key, items, n, render, inList) {
   const shown = open ? items : items.slice(0, n);
   const more = items.length - n;
   const btn = more > 0 ? h("button", { class: "linkbtn showall", "data-key": "more:" + key,
-    onclick: () => { expanded[s.id + ":" + key] = !open; drawerSig = ""; renderDrawer(lastAll); focusKey("more:" + key); } },
+    onclick: () => {
+      expanded[s.id + ":" + key] = !open; drawerSig = ""; renderDrawer(lastAll); focusKey("more:" + key);
+      // collapsing moves the button up, maybe above the kept scroll position: keep it (and the focus) in view.
+      // Expanding doesn't scroll: the list grows below and you stay where you were
+      const b = open && document.querySelector('[data-key="more:' + CSS.escape(key) + '"]'); if (b) b.scrollIntoView({ block: "nearest" });
+    } },
     open ? "Show fewer" : "Show all " + items.length) : null;
   return [shown.map(render), btn && inList ? h("li", { class: "showall-li" }, btn) : btn];
 }
@@ -758,7 +771,7 @@ function renderDrawer(all) {
   const active = document.activeElement;
   if (active && active.id === "dr-note" && host.contains(active)) return; // don't clobber typing
   drawerSig = sig;
-  const scroll = host.querySelector(".drawer") ? host.querySelector(".drawer").scrollTop : 0;
+  const body = host.querySelector(".dr-body"), scroll = body ? body.scrollTop : 0; // .dr-body is what scrolls
   const msgHead = s.g === "need" ? s.stateLabel : "Claude’s last message";
   const hint = s.k === "perm" ? "Approve or deny in the terminal. " + resumeHint(s)
     : s.k === "question" || s.k === "decision" ? "Answer in the terminal. " + resumeHint(s)
@@ -818,7 +831,95 @@ function renderDrawer(all) {
           h("dt", {}, "Running"), h("dd", {}, (s.run ? "Yes" : "No") + " · " + (s.raw.live_source === "hook"
             ? "reported by the session's hooks" : "guessed: no hook has reported for this session")),
           h("dt", {}, "Last activity"), h("dd", {}, new Date(s.ts * 1000).toLocaleString()))))));
-  const d = host.querySelector(".drawer"); if (d) d.scrollTop = scroll;
+  const d = host.querySelector(".dr-body"); if (d) d.scrollTop = scroll;
+}
+
+// ---- settings panel: what's in ~/.claude/ccdeck/config.json, also set with ccdeck review-requests / approvals / notifications ----
+const SETTINGS = [
+  { key: "review_requests", title: "Review requests", choices: [
+    ["all", "All", "PRs where you or a team you're in was asked to review"],
+    ["mine", "Only mine", "PRs where you were asked by name; requests to your teams are left out"],
+    ["off", "Off", "No review-request list"]] },
+  { key: "notifications.desktop", title: "Desktop notifications", d: "A notification when a session needs you, or its PR needs fixing" },
+  { key: "approvals", title: "Approve from the dashboard", d: "Allow or deny permission prompts here as well as in the terminal" },
+];
+let settingsSig = "";
+// a click shows at once and saves in order: a setting clicked again while one saves waits with its latest value,
+// so the last click wins. Clicked values wait in settingsPending until saved, laid over the snapshots load()
+// brings every 2 s: one taken before the save would otherwise undo the click (and make the next look like a no-op)
+const settingsPending = new Map();
+const settingOf = (key) => {
+  const st = key.split(".").reduce((o, k) => o && o[k], data && data.settings);
+  return st && settingsPending.has(key) ? Object.assign({}, st, { value: settingsPending.get(key) }) : st;
+};
+let settingsSaving = false;
+const settingsQueue = new Map();
+async function setSetting(key, value) {
+  if (offline()) {
+    // a queued click that can't be saved now: show what the server has, not a value that was never saved
+    if (settingsPending.delete(key)) { settingsSig = ""; renderSettings(); }
+    toast("Settings are paused until the server is back"); return;
+  }
+  settingsPending.set(key, value); settingsSig = ""; renderSettings(); focusKey("set:" + key + (typeof value === "boolean" ? "" : ":" + value));
+  if (settingsSaving) { settingsQueue.delete(key); settingsQueue.set(key, value); return; }
+  settingsSaving = true;
+  try {
+    const r = await fetch("/api/action", {
+      method: "POST", headers: { "X-CC-Token": TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "set_setting", key, value }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+    if (settingsPending.get(key) === value && !settingsQueue.has(key)) settingsPending.delete(key); // saved, nothing newer
+    data.settings = j.settings; settingsSig = ""; renderSettings();
+    if (!settingsQueue.size) toast("Saved");
+  } catch (e) {
+    settingsQueue.clear(); settingsPending.clear(); toast("Failed: " + e.message);
+  } finally {
+    settingsSaving = false;
+    const next = settingsQueue.entries().next().value;
+    if (next) { settingsQueue.delete(next[0]); setSetting(next[0], next[1]); }
+    else { etag = ""; load(); } // the server's view of every setting, also after a failure
+  }
+}
+function openSettings() { ui.settings = true; if (ui.drawer) closeDrawer(); settingsSig = ""; renderSettings(); setTimeout(() => focusKey("set-close"), 0); }
+function closeSettings() { ui.settings = false; settingsSig = ""; renderSettings(); focusKey("settings"); }
+function renderSettings() {
+  $("settingsBtn").setAttribute("aria-expanded", ui.settings ? "true" : "false");
+  const host = $("settingsHost");
+  if (!ui.settings || !data || !data.settings) { host.replaceChildren(); return; }
+  const sig = JSON.stringify(data.settings) + JSON.stringify([...settingsPending]) + "|" + offline();
+  if (sig === settingsSig) return;
+  settingsSig = sig;
+  const body = host.querySelector(".dr-body"), scroll = body ? body.scrollTop : 0;
+  const a = document.activeElement, keep = a && host.contains(a) && a.dataset ? a.dataset.key : ""; // redrawn: focus it again
+  const locked = (st) => st && st.locked ? h("p", { class: "cutnote" }, "Set by " + st.locked + " in the dashboard's environment; that wins over this setting.") : null;
+  host.replaceChildren(
+    h("div", { class: "scrim", onclick: closeSettings }),
+    h("aside", { class: "drawer settings", role: "dialog", "aria-modal": "true", "aria-labelledby": "set-title" },
+      h("div", { class: "dr-head" },
+        h("div", { class: "card-top" }, h("h2", { class: "dr-title", id: "set-title" }, "Settings"), h("span", { class: "grow" }),
+          h("button", { class: "ibtn ibtn-sm", "aria-label": "Close settings", "data-key": "set-close", onclick: closeSettings }, ic("close"))),
+        h("p", { class: "cutnote", style: "margin: 0" }, "Saved in ~/.claude/ccdeck/config.json, the same file the ccdeck commands change.")),
+      h("div", { class: "dr-body" }, SETTINGS.map((def) => {
+        const st = settingOf(def.key);
+        if (!st) return null;
+        if (def.choices) {
+          const cur = def.choices.find((c) => c[0] === st.value);
+          return h("section", { class: "dsec" }, h("h3", { id: "set-h-" + def.key }, def.title),
+            h("div", { class: "seg", role: "group", "aria-labelledby": "set-h-" + def.key }, def.choices.map(([v, l]) =>
+              h("button", { class: "fchip", "aria-pressed": st.value === v ? "true" : "false", "data-key": "set:" + def.key + ":" + v,
+                disabled: !!st.locked, onclick: () => st.value !== v && setSetting(def.key, v) }, l))),
+            h("p", { class: "set-d" }, cur ? cur[2] : ""), locked(st));
+        }
+        return h("section", { class: "dsec" },
+          h("button", { class: "toggle set-toggle", "aria-pressed": st.value ? "true" : "false", "data-key": "set:" + def.key,
+            disabled: !!st.locked, onclick: () => setSetting(def.key, !st.value) },
+            h("span", { class: "set-text" }, h("b", {}, def.title), h("span", { class: "set-d" }, def.d)), h("span", { class: "switch" })),
+          locked(st));
+      }))));
+  const d = host.querySelector(".dr-body"); if (d) d.scrollTop = scroll;
+  if (keep) focusKey(keep);
 }
 
 // ---- interactions ----
@@ -834,6 +935,8 @@ function toggleDone() { ui.showDone = !ui.showDone; ls.set("showDone", ui.showDo
 function toggleOld() { ui.showOld = !ui.showOld; ls.set("showOld", ui.showOld); render(); }
 $("tDone").addEventListener("click", toggleDone);
 $("tOld").addEventListener("click", toggleOld);
+$("settingsBtn").setAttribute("data-key", "settings");
+$("settingsBtn").addEventListener("click", (e) => { e.stopPropagation(); ui.settings ? closeSettings() : openSettings(); });
 $("legendBtn").addEventListener("click", (e) => { e.stopPropagation(); ui.legend = !ui.legend; renderLegend(); });
 $("q").addEventListener("input", (e) => { ui.q = e.target.value; render(); });
 document.addEventListener("click", () => {
@@ -848,9 +951,21 @@ document.addEventListener("keydown", (e) => {
   const t = e.target, typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
   if (e.key === "Escape") {
     if (ui.menu) { const id = ui.menu; ui.menu = ""; render(); focusKey("m:" + id); }
+    else if (ui.settings) closeSettings();
     else if (ui.drawer) closeDrawer();
     else if (ui.hint || ui.legend) { ui.hint = ui.legend = false; renderHint(); renderLegend(); }
     else if (t === $("q") && ui.q) { $("q").value = ""; ui.q = ""; render(); }
+    return;
+  }
+  // the settings panel and the session drawer are modal: the page's shortcuts (/, j/k, r, .) would act on
+  // sessions behind them, and Tab would leave them, so Tab cycles inside the open one and nothing else runs
+  const dialog = ui.settings ? document.querySelector("#settingsHost .drawer") : ui.drawer ? document.querySelector("#drawerHost .drawer") : null;
+  if (dialog) {
+    if (e.key === "Tab") {
+      const f = [...dialog.querySelectorAll("button:not([disabled]), a[href], textarea, input, [tabindex]:not([tabindex='-1'])")];
+      const i = f.indexOf(document.activeElement);
+      if (f.length && (i < 0 || (e.shiftKey ? i === 0 : i === f.length - 1))) { e.preventDefault(); f[e.shiftKey ? f.length - 1 : 0].focus(); }
+    }
     return;
   }
   if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
