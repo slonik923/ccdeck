@@ -1396,6 +1396,13 @@ class PsProcessTest(unittest.TestCase):
                 self.assertEqual(procs, [(1, "/w", args)])
                 self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set()), expected)
 
+    def test_unreadable_arguments_dont_hide_an_open_session(self):
+        with mock.patch.object(cc, "ps_table", return_value={1: (0, "", "claude --resume s")}), \
+                mock.patch.object(cc, "_process_argv", return_value=[]), \
+                mock.patch.object(cc.shutil, "which", return_value="/usr/bin/lsof"), \
+                mock.patch.object(cc.subprocess, "run", return_value=mock.Mock(stdout="p1\nn/w\n")):
+            self.assertEqual(cc._running_claude_ps(), [(1, "/w", ["claude", "--resume", "s"])])
+
     def test_mac_argv_reads_nul_delimited_arguments(self):
         import ctypes
         import struct

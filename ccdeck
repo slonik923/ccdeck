@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.4"
+VERSION = "0.9.1"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -377,8 +377,10 @@ def _process_argv(pid):
 def _running_claude_ps():
     procs = []
     for pid, row in ps_table().items():
-        if is_claude_cmd(row[2].split()):
-            argv = _process_argv(pid)
+        words = row[2].split()
+        if is_claude_cmd(words):
+            # ps loses where one argument ends; when the real ones can't be read, its words still say it's open
+            argv = _process_argv(pid) or words
             if is_claude_cmd(argv):
                 procs.append((pid, argv))
     cwds = {}
