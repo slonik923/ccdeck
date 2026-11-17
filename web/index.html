@@ -194,7 +194,7 @@ async function copy(text, what) {
 let data = null, etag = "", lastOk = 0, failures = 0;
 const ui = {
   filter: "all", showDone: ls.get("showDone", false), showOld: ls.get("showOld", false), q: "",
-  menu: "", drawer: "", settings: false, focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false),
+  menu: "", drawer: "", settings: false, focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false), notifOpen: "",
 };
 const offline = () => !!data && failures > 0 && Date.now() - lastOk > 6000;
 
@@ -793,6 +793,21 @@ function capped(s, key, items, n, render, inList) {
     open ? "Show fewer" : "Show all " + items.length) : null;
   return [shown.map(render), btn && inList ? h("li", { class: "showall-li" }, btn) : btn];
 }
+// A notification's text is folded: it's often the same as Claude's last message, shown right below it, and can be
+// long. Unfolding is per notification, so a new one arrives folded.
+const sameText = (a, b) => { const n = (x) => (x || "").replace(/\s+/g, " ").trim(); return !!n(a) && (n(a) === n(b) || n(a).endsWith(n(b)) && n(b).length > 40); };
+function notifText(s) {
+  const body = (s.notif.body || "").trim();
+  if (!body) return null;
+  const open = ui.notifOpen === s.notif.id, same = sameText(body, s.msg);
+  return h("div", { class: "dnotif-text" },
+    h("div", { class: "dnotif-fold" },
+      h("button", { class: "btn btn-ghost btn-sm", "aria-expanded": String(open), "aria-controls": "dr-notif-text", "data-key": "dr-notif-fold",
+        onclick: () => { ui.notifOpen = open ? "" : s.notif.id; drawerSig = ""; renderDrawer(lastAll); focusKey("dr-notif-fold"); } },
+        ic("chevron", "i-sm"), open ? "Hide text" : "Show text"),
+      same ? h("span", { class: "dnotif-same" }, "Same as the last message below") : null),
+    open ? h("div", { class: "msg md", id: "dr-notif-text" }, md(body)) : null);
+}
 function openDrawer(id) { ui.drawer = id; ui.menu = ""; drawerSig = ""; render(); setTimeout(() => focusKey("dr-close"), 0); }
 function closeDrawer() { const id = ui.drawer; ui.drawer = ""; drawerSig = ""; renderDrawer([]); if (id) focusKey("t:" + id); }
 function renderDrawer(all) {
@@ -836,7 +851,7 @@ function renderDrawer(all) {
           h("div", { class: "dnotif-head" }, h("h3", { id: "dr-notif" }, ic("bell", "i-xs"), "Notification · " + agoShort(s.notif.ts)), h("span", { class: "grow" }),
             h("button", { class: "btn btn-ghost btn-sm", onclick: () => act("", "dismiss", { nid: s.notif.id }) }, ic("close", "i-sm"), "Dismiss")),
           h("p", { class: "dnotif-title" }, s.notif.title || ""),
-          s.notif.body ? h("div", { class: "msg md" }, md(s.notif.body.trim())) : null) : null,
+          notifText(s)) : null,
         h("section", { class: "dsec" }, h("h3", {}, msgHead),
           s.cut ? h("p", { class: "cutnote" }, "This message is long. Its start is cut here; resume the session to read all of it.") : null,
           h("div", { class: "msg md" }, md((s.msg || s.reason || "No messages yet.").trim())),
