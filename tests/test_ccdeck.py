@@ -576,6 +576,14 @@ class HookTest(unittest.TestCase):
         finally:
             cc.running_claude_processes = saved
 
+    def test_print_resume_does_not_mark_session_alive(self):
+        build_fixtures()
+        for flag in ("-p", "--print"):
+            with mock.patch.object(cc, "peer_sessions", return_value={}), \
+                    mock.patch.object(cc, "running_claude_processes", return_value=[
+                        (1, str(WORK), ["claude", flag, "--resume", "s-closed"]) ]):
+                self.assertFalse(by_id(cc.collect(True, 10 ** 6))["s-closed"]["alive"])
+
     def test_resumed_session_isnt_held_back_by_the_ended_hook(self):
         build_fixtures()
         sid = "s-midtask"  # its transcript ends on a tool entry, so an open session isn't idle
@@ -1374,6 +1382,37 @@ class PsProcessTest(unittest.TestCase):
         self.assertTrue(cc.proc_cmdline(os.getpid()))
         self.assertIsInstance(cc.running_claude_processes(), list)
 
+    def test_ps_preserves_prompt_argument_boundaries(self):
+        sessions = {"s": {"id": "s", "cwd": "/w", "last_ts": 1}}
+        for args, expected in [(["claude", "explain -p usage"], {"s"}),
+                               (["claude", "explain --print usage"], {"s"}),
+                               (["claude", "-p", "query"], set()),
+                               (["claude", "--print", "query"], set())]:
+            with self.subTest(args=args), mock.patch.object(cc, "ps_table", return_value={1: (0, "", " ".join(args))}), \
+                    mock.patch.object(cc, "_process_argv", return_value=args), \
+                    mock.patch.object(cc.shutil, "which", return_value="/usr/bin/lsof"), \
+                    mock.patch.object(cc.subprocess, "run", return_value=mock.Mock(stdout="p1\nn/w\n")):
+                procs = cc._running_claude_ps()
+                self.assertEqual(procs, [(1, "/w", args)])
+                self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set()), expected)
+
+    def test_mac_argv_reads_nul_delimited_arguments(self):
+        import ctypes
+        import struct
+        args = [b"claude", b"", b"explain -p usage"]
+        data = struct.pack("i", len(args)) + b"/bin/claude\0\0" + b"\0".join(args) + b"\0ENV=value\0"
+        def sysctl(mib, count, buf, size, new, newlen):
+            self.assertEqual(list(mib), [1, 49, 123])
+            ctypes.memmove(buf, data, len(data))
+            size._obj.value = len(data)
+            return 0
+        with mock.patch.object(cc.sys, "platform", "darwin"), \
+                mock.patch("ctypes.CDLL", return_value=mock.Mock(sysctl=sysctl)):
+            self.assertEqual(cc._process_argv(123), [a.decode() for a in args])
+        with mock.patch.object(cc.sys, "platform", "darwin"), \
+                mock.patch("ctypes.CDLL", return_value=mock.Mock(sysctl=lambda *a: -1)):
+            self.assertEqual(cc._process_argv(123), [])
+
     def test_claude_detection(self):
         self.assertTrue(cc.is_claude_cmd(["/Users/me/.local/share/claude/versions/2.1.321", "--resume"]))
         self.assertTrue(cc.is_claude_cmd(["claude"]))
@@ -1384,7 +1423,9 @@ class ResumedIdsTest(unittest.TestCase):
     def test_only_the_resume_argument_counts(self):
         procs = [(1, "/w", ["claude", "--resume", "a"]), (2, "/w", ["claude", "-r", "b"]),
                  (3, "/w", ["claude", "--resume=c"]), (4, "/w", ["claude", "-p", "look at session d and --resume"]),
-                 (5, "/w", ["claude", "summarize", "e"]), (6, "/w", ["claude", "--resume"])]
+                 (5, "/w", ["claude", "summarize", "e"]), (6, "/w", ["claude", "--resume"]),
+                 (7, "/w", ["claude", "-p", "--resume", "d"]),
+                 (8, "/w", ["claude", "--print", "--resume=e"])]
         self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c"})
 
 
@@ -1401,12 +1442,26 @@ class GuessLiveTest(unittest.TestCase):
                 self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set(), {3}, {"registered"}),
                                  {"new"})
 
+    def test_only_eligible_processes_use_slots(self):
+        sessions = {k: {"id": k, "cwd": "/w", "last_ts": ts}
+                    for k, ts in [("old", 1), ("new", 2)]}
+        me = os.getpid()
+        for flag in ("-p", "--print"):
+            procs = [(me, "/w", ["claude", flag, "--resume", "old"]), (2, "/w", ["claude"])]
+            self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, cc.resumed_ids(procs)), {"new"})
+            hooks = {"old": {"pid": me, "pid_start": cc.proc_start_time(me)}}
+            self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, set()), {"new"})
+        procs = [(me, "/w", ["claude"])]
+        hooks = {"old": {"pid": me, "pid_start": cc.proc_start_time(me), "status": "ended"}}
+        self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, set()), {"new"})
+
     def test_n_processes_mark_n_newest_sessions_open(self):
         mk = lambda sid, ts: {"id": sid, "cwd": "/w/app", "last_ts": ts}
         sessions = {k: mk(k, ts) for k, ts in [("old", 1), ("mid", 2), ("new", 3), ("resumed", 0)]}
         procs = [(1, "/w/app", ["claude"]), (2, "/w/app", ["claude"]), (3, "/w/app", ["claude", "--resume", "resumed"])]
         live = cc.guess_live_sessions(sessions, {}, procs, {"resumed"})
         self.assertEqual(live, {"new", "mid"})  # 3 processes, one of them is the resumed session
+        procs[0] = (os.getpid(), "/w/app", ["claude"])
         hooks = {"new": {"pid": os.getpid(), "pid_start": cc.proc_start_time(os.getpid())}}
         self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, {"resumed"}), {"mid"})
 

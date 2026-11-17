@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -346,8 +346,41 @@ def running_claude_processes():
     return out
 
 
+def _process_argv(pid):
+    """Read argument boundaries; ps command text cannot distinguish flags from prompt words."""
+    if sys.platform != "darwin":  # also supports CCDECK_NO_PROC on Linux
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").decode(errors="replace").split("\0")
+        except OSError:
+            return []
+    import ctypes
+    import struct
+    try:
+        libc = ctypes.CDLL(None)
+        # CTL_KERN, KERN_PROCARGS2: argc, executable path, padding, then NUL-delimited argv.
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))
+        size = ctypes.c_size_t(1024 * 1024)
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return []
+        data = buf.raw[:size.value]
+        argc = struct.unpack_from("i", data)[0]
+        start = data.index(b"\0", struct.calcsize("i"))
+        while start < len(data) and data[start] == 0:
+            start += 1
+        args = data[start:].split(b"\0")
+        return [a.decode(errors="replace") for a in args[:argc]] if 0 < argc <= len(args) else []
+    except (OSError, ValueError, struct.error):
+        return []
+
+
 def _running_claude_ps():
-    procs = [(pid, row[2].split()) for pid, row in ps_table().items() if is_claude_cmd(row[2].split())]
+    procs = []
+    for pid, row in ps_table().items():
+        if is_claude_cmd(row[2].split()):
+            argv = _process_argv(pid)
+            if is_claude_cmd(argv):
+                procs.append((pid, argv))
     cwds = {}
     if procs and shutil.which("lsof"):
         try:
@@ -1054,11 +1087,15 @@ def classify(s, hook, alive):
     return "closed_midtask" if s.get("last_role") in ("user", "tool") else "closed"
 
 
+def interactive_processes(procs):
+    return [p for p in procs if not any(a in ("-p", "--print") for a in p[2][1:])]
+
+
 def resumed_ids(procs):
     """Session ids that running claude processes were started on (`--resume <id>`, `-r <id>`, `--resume=<id>`).
     Only the resume argument counts: an id mentioned in a prompt doesn't make that session open."""
     out = set()
-    for _, _, argv in procs:
+    for _, _, argv in interactive_processes(procs):
         for i, a in enumerate(argv):
             if a in ("--resume", "-r") and i + 1 < len(argv):
                 out.add(argv[i + 1])
@@ -1093,8 +1130,10 @@ def guess_live_sessions(sessions, hooks, procs, resumed, reg_pids=frozenset(), r
     however many share a session. Each other process counts once: after /resume, the old session's hook
     and the registry can name the same pid."""
     per_cwd = {}
-    for pid, cwd, argv in procs:
-        if cwd and pid not in reg_pids and not any(a in ("-p", "--print") for a in argv[1:]):
+    eligible = [p for p in interactive_processes(procs) if p[0] not in reg_pids]
+    eligible_pids = {p[0] for p in eligible}
+    for pid, cwd, argv in eligible:
+        if cwd:
             per_cwd[cwd] = per_cwd.get(cwd, 0) + 1
     by_cwd = {}
     for s in sessions.values():
@@ -1108,7 +1147,7 @@ def guess_live_sessions(sessions, hooks, procs, resumed, reg_pids=frozenset(), r
             pid = h.get("pid")
             if s["id"] in resumed:
                 n -= 1
-            elif pid and pid not in reg_pids and pid not in counted and pid_alive(pid, h.get("pid_start")):
+            elif pid in eligible_pids and pid not in counted and h.get("status") != "ended" and pid_alive(pid, h.get("pid_start")):
                 counted.add(pid)
                 n -= 1
         rest = sorted((s for s in ss if not (hooks.get(s["id"]) or {}).get("pid") and s["id"] not in resumed
