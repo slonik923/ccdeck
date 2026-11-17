@@ -467,6 +467,29 @@ class HookTest(unittest.TestCase):
         write_session("s-oddq", [user("plan it", 200), asst([tool("t1", "AskUserQuestion", {"questions": 1})], 199)])
         self.assertIsNone(cc.parse_transcript(PROJ / "s-oddq.jsonl")["pending_question"])  # no TypeError
 
+    def test_each_question_is_its_own_notification(self):
+        """A question is its tool call: an answer's epoch alone doesn't repeat it, and the next question with
+        the same epoch (both read between two hook events) still gets its own."""
+        dash = cc.Dashboard(0)
+        row = lambda tid, epoch: {"id": "s-q", "state": "question", "group": "needs", "alive": True,
+                                  "pending_id": tid, "notification_epoch": epoch, "pending_question": tid}
+        sent = []
+        with mock.patch.object(cc, "notify", lambda *a, **k: sent.append(k["text"])):
+            dash.prev_states = {"s-q": ("working", None)}
+            for r in (row("A", 1), row("A", 2), row("B", 2)):
+                dash._notify_changes([r])
+        self.assertEqual(sent, ["A", "B"])
+
+    def test_a_held_inbox_lock_doesnt_hold_up_the_hook(self):
+        import fcntl
+        cc.INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cc.INBOX_DIR / ".lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)  # another hook, stuck while holding it
+            t = time.monotonic()
+            with self.assertRaises(OSError):  # notify() catches it: the popup goes out without a bell entry
+                cc.inbox_add("s-lock", "idle", "Your turn", "")
+            self.assertLess(time.monotonic() - t, 3)
+
     def test_closed_pending_question_withdraws_the_desktop_notification(self):
         build_fixtures()
         sid = "s-question"
@@ -1086,6 +1109,18 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(opened, [])
         finally:
             cc.peer_sessions, cc.focus_terminal, cc.open_terminal = saved
+
+    def test_notification_click_goes_to_the_tab_even_if_the_inbox_cant_be_written(self):
+        focused = []
+        def fail(nid):
+            raise PermissionError("inbox")
+        with mock.patch.object(cc, "peer_sessions", lambda: {"s-closed": {"name": "w", "pid": 42, "pids": [42]}}), \
+                mock.patch.object(cc, "focus_terminal", lambda pid, token: focused.append(pid)), \
+                mock.patch.object(cc, "notification_click", lambda *a: (True, "tok")), \
+                mock.patch.object(cc, "inbox_clear", fail), \
+                mock.patch.object(sys, "argv", ["ccdeck", "notify-click", "s-closed", "--id", "n1", "--", "t", "b"]):
+            cc.main()
+        self.assertEqual(focused, [42])
 
     def test_notification_click_goes_to_the_sessions_tab(self):
         saved = cc.peer_sessions, cc.focus_terminal, cc.notification_click, sys.argv
