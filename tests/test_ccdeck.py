@@ -454,6 +454,8 @@ class HookTest(unittest.TestCase):
             cc.inbox_clear(second["id"])  # dismissal must survive another scan of the same prompt
             scan()
             self.assertFalse(any(d["sid"] == sid for d in cc.inbox_items()))
+        # pid 123 is made up, but it can be a real, live process: don't leave it for later tests
+        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
 
     def test_closing_doesnt_bring_back_a_dismissed_pr_notification(self):
         dash = cc.Dashboard(0)
@@ -578,6 +580,7 @@ class HookTest(unittest.TestCase):
 
     def test_print_resume_does_not_mark_session_alive(self):
         build_fixtures()
+        (cc.STATE_DIR / "s-closed.json").unlink(missing_ok=True)  # only the -p process may speak for it
         for flag in ("-p", "--print"):
             with mock.patch.object(cc, "peer_sessions", return_value={}), \
                     mock.patch.object(cc, "running_claude_processes", return_value=[
