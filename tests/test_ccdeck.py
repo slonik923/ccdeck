@@ -410,10 +410,11 @@ class HookTest(unittest.TestCase):
 
     def test_question_notification_uses_pending_question_text(self):
         build_fixtures()
-        question = "Which database should we use?"
+        long_q = "Which database should we use? " + "Context. " * 120  # past the 600-character summary
+        question = long_q + "\n\nAnd which region?"
         write_session("s-question", [user("plan it", 200),
                       asst([text("Let me ask you."), tool("t1", "AskUserQuestion",
-                            {"questions": [{"question": question}]})], 199)])
+                            {"questions": [{"question": long_q}, {"question": "And which region?"}]})], 199)])
         row = by_id(cc.collect(True, 10 ** 6))["s-question"]
         row["alive"] = True
         row["hook_message"] = "Generic hook message"
@@ -421,8 +422,9 @@ class HookTest(unittest.TestCase):
         dash.prev_states = {}
         with mock.patch.object(cc, "notify") as notify:
             dash._notify_changes([row])
-        self.assertEqual(notify.call_args.args[1], question)
-        self.assertEqual(notify.call_args.kwargs["text"], question)
+        self.assertEqual(notify.call_args.kwargs["text"], question)  # the bell: every question, whole
+        self.assertEqual(notify.call_args.args[1], cc.one_line(question, 160))  # the popup: one short line
+        self.assertLessEqual(len(row["pending_input"]), 600)  # the waiting-state summary is unchanged
 
     def test_new_permission_between_scans_gets_a_fresh_notification(self):
         build_fixtures()

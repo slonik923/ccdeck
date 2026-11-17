@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.2"
+VERSION = "0.9.0"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -70,7 +70,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 9
+CACHE_VERSION = 10
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -542,11 +542,11 @@ def parse_transcript(path):
         "id": path.stem, "cwd": None, "branch": None, "title": None, "ai_title": None,
         "summary": None, "first_prompt": None, "last_prompt": None, "prompts": 0,
         "first_ts": 0.0, "last_ts": 0.0, "last_role": None, "last_text": "",
-        "api_error": False, "pending_tool": None, "pending_input": None, "prs": [], "links": {}, "files": [],
+        "api_error": False, "pending_tool": None, "pending_input": None, "pending_question": None, "prs": [], "links": {}, "files": [],
         "refs": [], "linear": {}, "issue_keys": [], "usage": empty_usage(), "context": 0, "model": None,
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
-    refs, linear, keys, tool_titles, not_created = {}, {}, {}, {}, {}
+    refs, linear, keys, tool_titles, not_created, questions = {}, {}, {}, {}, {}, {}
     seen_msgs = set()
 
     def note_ref(url, kind, title, source):
@@ -685,6 +685,9 @@ def parse_transcript(path):
                     tool_names[b.get("id")] = name
                     pending[b.get("id")] = name
                     pending_inputs[b.get("id")] = summarize_tool_input(name, inp)
+                    if name == "AskUserQuestion":  # every question, whole: the bell keeps the full text
+                        qs = [q.get("question") for q in inp.get("questions") or [] if isinstance(q, dict)]
+                        questions[b.get("id")] = "\n\n".join(str(q) for q in qs if q) or None
                     info["last_role"] = "tool"
                     if "linear" in name.lower():
                         for v in inp.values():
@@ -712,6 +715,7 @@ def parse_transcript(path):
                             tool_names[b.get("id")] = "Bash:create"
     info["pending_tool"] = list(pending.values())[-1] if pending else None
     info["pending_input"] = pending_inputs.get(list(pending)[-1]) if pending else None
+    info["pending_question"] = questions.get(list(pending)[-1]) if pending else None
     info["prs"] = list(prs)
     info["pr_sources"] = dict(prs)
     for r in refs.values():
@@ -1819,7 +1823,7 @@ class Dashboard:
                 continue
             if st == "idle" and (before is None or before[0] != "working"):
                 continue
-            text = ((r.get("pending_input") if st == "question" else None)
+            text = ((r.get("pending_question") if st == "question" else None)
                     or r.get("hook_message") or r.get("last_text") or "")
             notify(f"{STATES[st][1]} · {title_of(r)[:60]}", one_line(text, 160), urgent=r["group"] == "needs",
                    sid=r["id"], state=st, text=text)
