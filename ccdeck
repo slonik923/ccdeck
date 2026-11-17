@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -70,7 +70,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 11
+CACHE_VERSION = 12
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -537,12 +537,18 @@ def summarize_tool_input(name, inp):
         return None
 
 
+def is_headless(info):
+    """`claude -p` and Agent SDK runs ("sdk-cli", "sdk-ts", "sdk-py"): scripts and tools, never waiting for
+    you, so not sessions for the dashboard. One resumed in a terminal is interactive again ("cli")."""
+    return str(info.get("entrypoint") or "").startswith("sdk")
+
+
 def parse_transcript(path):
     info = {
         "id": path.stem, "cwd": None, "branch": None, "title": None, "ai_title": None,
         "summary": None, "first_prompt": None, "last_prompt": None, "prompts": 0,
         "first_ts": 0.0, "last_ts": 0.0, "last_role": None, "last_text": "",
-        "api_error": False, "pending_tool": None, "pending_input": None, "pending_question": None, "pending_id": None, "prs": [], "links": {}, "files": [],
+        "api_error": False, "entrypoint": None, "pending_tool": None, "pending_input": None, "pending_question": None, "pending_id": None, "prs": [], "links": {}, "files": [],
         "refs": [], "linear": {}, "issue_keys": [], "usage": empty_usage(), "context": 0, "model": None,
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
@@ -630,6 +636,7 @@ def parse_transcript(path):
                 info["last_ts"] = max(info["last_ts"], ts)
             info["cwd"] = e.get("cwd") or info["cwd"]
             info["branch"] = e.get("gitBranch") or info["branch"]
+            info["entrypoint"] = e.get("entrypoint") or info["entrypoint"]  # the latest: a resume can change it
             content = message_content(e)
 
             if t == "user":
@@ -762,7 +769,7 @@ def scan_transcripts():
                     info = parse_transcript(path)
                     entries[key] = {"sig": sig, "info": info}
                     dirty = True
-                if info["prompts"] == 0:
+                if info["prompts"] == 0 or is_headless(info):
                     continue
                 prev = sessions.get(info["id"])
                 if not prev or info["last_ts"] > prev["last_ts"]:
@@ -1531,11 +1538,38 @@ TERMINALS = [  # (binary, args before the command)
 ]
 
 
+def mac_terminal_app_of(pid):
+    """"terminal" or "iterm": the macOS terminal app a process runs in (its nearest such ancestor), or None."""
+    for _ in range(12):
+        if not pid or pid <= 1:
+            return None
+        cmd = " ".join(proc_cmdline(pid))
+        if "/Terminal.app/" in cmd:
+            return "terminal"
+        if "/iTerm.app/" in cmd or "/iTerm2.app/" in cmd:
+            return "iterm"
+        pid = proc_ppid(pid)
+    return None
+
+
+def mac_terminal_used():
+    """The terminal you use, when both are installed: the one most of your open sessions run in, else the
+    one the dashboard was started from (a session's hook starts it), else None."""
+    try:
+        apps = [a for peer in peer_sessions().values() if (a := mac_terminal_app_of(peer.get("pid")))]
+    except Exception:  # finding out is a nicety: never fail opening a terminal over it
+        apps = []
+    if apps:
+        return max(("terminal", "iterm"), key=apps.count)  # a tie goes to Terminal
+    return {"Apple_Terminal": "terminal", "iTerm.app": "iterm"}.get(os.environ.get("TERM_PROGRAM", ""))
+
+
 def mac_terminal_command(cwd, argv, app=None):
-    """osascript that opens iTerm (if installed) or Terminal and runs the command in a new window."""
+    """osascript that opens Terminal or iTerm and runs the command in a new window."""
     line = applescript_str(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}")
     if app is None:
-        app = "iterm" if (Path("/Applications/iTerm.app").exists() or (HOME / "Applications" / "iTerm.app").exists()) else "terminal"
+        has_iterm = Path("/Applications/iTerm.app").exists() or (HOME / "Applications" / "iTerm.app").exists()
+        app = (mac_terminal_used() or "iterm") if has_iterm else "terminal"
     if app == "iterm":
         return ["osascript", "-e", 'tell application "iTerm"', "-e", "activate",
                 "-e", "set w to (create window with default profile)",

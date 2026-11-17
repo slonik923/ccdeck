@@ -1407,6 +1407,19 @@ class GuessLiveTest(unittest.TestCase):
         procs = [(me, "/w/app", ["claude"]), (2, "/w/app", ["claude"])]
         self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, set(), {me}, {"B"}), {"C"})
 
+    def test_headless_runs_arent_sessions(self):
+        """`claude -p` and SDK runs stay off the dashboard; one resumed in a terminal comes back."""
+        build_fixtures()
+        hl = lambda e, ep: dict(e, entrypoint=ep)
+        write_session("s-headless", [hl(user("/qta", 30), "sdk-cli"), hl(asst([text("Do you want me to run it?")], 29), "sdk-cli")])
+        write_session("s-sdk", [hl(user("summarize", 30), "sdk-ts"), hl(asst([text("Done.")], 29), "sdk-ts")])
+        write_session("s-resumed", [hl(user("try it", 30), "sdk-cli"), hl(asst([text("Ok.")], 29), "sdk-cli"),
+                                    hl(user("now interactively", 10), "cli"), hl(asst([text("Sure.")], 9), "cli")])
+        write_session("s-desktop", [hl(user("hi", 30), "claude-desktop"), hl(asst([text("Hello.")], 29), "claude-desktop")])
+        ids = set(by_id(cc.collect(True, 10 ** 6)))
+        self.assertFalse({"s-headless", "s-sdk"} & ids)
+        self.assertTrue({"s-resumed", "s-desktop", "s-closed"} <= ids)
+
     def test_registry_sessions_use_up_their_process(self):
         # registry session A is open in /w/app; B is newer and closed: one process, so only A
         sessions = {"A": {"id": "A", "cwd": "/w/app", "last_ts": 1}, "B": {"id": "B", "cwd": "/w/app", "last_ts": 2}}
@@ -1421,6 +1434,30 @@ class MacDesktopTest(unittest.TestCase):
         i = cc.mac_terminal_command("/tmp", ["claude"], "iterm")
         self.assertIn('tell application "iTerm"', i)
         self.assertTrue(any("write text" in x for x in i))
+
+    def test_resume_opens_the_terminal_you_use(self):
+        """Both installed: the app most open sessions run in, else the one the dashboard started from."""
+        procs = {  # pid: (ppid, command)
+            10: (9, "claude"), 9: (8, "-zsh"), 8: (7, "login -pfl me"), 7: (1, "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
+            20: (19, "claude"), 19: (18, "-zsh"), 18: (1, "/Applications/iTerm.app/Contents/MacOS/iTerm2 --server login"),
+            30: (1, "claude"),  # no terminal above it (an IDE, ssh, …)
+        }
+        def app_for(peers, term_program=""):
+            with mock.patch.object(cc, "peer_sessions", lambda: {f"s{i}": {"pid": p} for i, p in enumerate(peers)}), \
+                    mock.patch.object(cc, "proc_ppid", lambda p: procs.get(p, (None,))[0]), \
+                    mock.patch.object(cc, "proc_cmdline", lambda p: procs[p][1].split() if p in procs else []), \
+                    mock.patch.object(cc.Path, "exists", lambda self: "iTerm.app" in str(self)), \
+                    mock.patch.dict(os.environ, {"TERM_PROGRAM": term_program}):
+                cmd = cc.mac_terminal_command("/tmp", ["claude"])
+            return "iterm" if 'tell application "iTerm"' in cmd else "terminal"
+        self.assertEqual(app_for([10]), "terminal")             # iTerm installed, but you work in Terminal
+        self.assertEqual(app_for([20, 10, 20]), "iterm")        # most sessions
+        self.assertEqual(app_for([10, 20]), "terminal")         # a tie: Terminal
+        self.assertEqual(app_for([30], "Apple_Terminal"), "terminal")  # no session says: where the dashboard started
+        self.assertEqual(app_for([], "iTerm.app"), "iterm")
+        self.assertEqual(app_for([]), "iterm")                  # nothing says: iTerm when it's installed, as before
+        with mock.patch.object(cc.Path, "exists", lambda self: False):
+            self.assertIn('tell application "Terminal" to activate', cc.mac_terminal_command("/tmp", ["claude"]))
 
     def test_focus_commands(self):
         gnome = {"GNOME_TERMINAL_SCREEN": "/org/gnome/Terminal/screen/ecdaf156_8be8_4402_9d37_193ec38ead77"}
