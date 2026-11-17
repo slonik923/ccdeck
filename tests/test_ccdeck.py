@@ -1389,6 +1389,18 @@ class ResumedIdsTest(unittest.TestCase):
 
 
 class GuessLiveTest(unittest.TestCase):
+    def test_headless_processes_do_not_keep_older_sessions_alive(self):
+        sessions = {k: {"id": k, "cwd": "/w/app", "last_ts": ts}
+                    for k, ts in [("old", 1), ("new", 2), ("registered", 3)]}
+        for flag in ("-p", "--print"):
+            with self.subTest(flag=flag):
+                headless = [(1, "/w/app", ["claude", flag, "summarize"])]
+                self.assertEqual(cc.guess_live_sessions(sessions, {}, headless, set()), set())
+                procs = headless + [(2, "/w/app", ["claude"]), (3, "/w/app", ["claude"]),
+                                    (4, "/w/other", ["claude"]), (5, None, ["claude"])]
+                self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set(), {3}, {"registered"}),
+                                 {"new"})
+
     def test_n_processes_mark_n_newest_sessions_open(self):
         mk = lambda sid, ts: {"id": sid, "cwd": "/w/app", "last_ts": ts}
         sessions = {k: mk(k, ts) for k, ts in [("old", 1), ("mid", 2), ("new", 3), ("resumed", 0)]}

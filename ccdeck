@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1087,14 +1087,14 @@ def peer_sessions():
 
 
 def guess_live_sessions(sessions, hooks, procs, resumed, reg_pids=frozenset(), registered=frozenset()):
-    """Sessions no hook reports on: N claude processes in a folder => its N most recent sessions
+    """Sessions no hook reports on: N interactive claude processes in a folder => its N most recent sessions
     are taken as open, less the processes hooks or `--resume <id>` already account for.
     Registered processes (reg_pids) are left out entirely: the registry says what they run (registered),
     however many share a session. Each other process counts once: after /resume, the old session's hook
     and the registry can name the same pid."""
     per_cwd = {}
     for pid, cwd, argv in procs:
-        if cwd and pid not in reg_pids:
+        if cwd and pid not in reg_pids and not any(a in ("-p", "--print") for a in argv[1:]):
             per_cwd[cwd] = per_cwd.get(cwd, 0) + 1
     by_cwd = {}
     for s in sessions.values():
