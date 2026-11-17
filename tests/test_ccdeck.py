@@ -455,6 +455,18 @@ class HookTest(unittest.TestCase):
             scan()
             self.assertFalse(any(d["sid"] == sid for d in cc.inbox_items()))
 
+    def test_closing_doesnt_bring_back_a_dismissed_pr_notification(self):
+        dash = cc.Dashboard(0)
+        dash.prev_states = {"s-pr": ("ci_failing", None)}  # notified, then dismissed
+        row = {"id": "s-pr", "state": "ci_failing", "group": "fix", "alive": False, "notification_epoch": 123.0}
+        with mock.patch.object(cc, "notify") as notify:
+            dash._notify_changes([row])  # SessionEnd moved the epoch; the PR's state didn't change
+        notify.assert_not_called()
+
+    def test_odd_question_input_doesnt_break_the_scan(self):
+        write_session("s-oddq", [user("plan it", 200), asst([tool("t1", "AskUserQuestion", {"questions": 1})], 199)])
+        self.assertIsNone(cc.parse_transcript(PROJ / "s-oddq.jsonl")["pending_question"])  # no TypeError
+
     def test_closed_pending_question_withdraws_the_desktop_notification(self):
         build_fixtures()
         sid = "s-question"

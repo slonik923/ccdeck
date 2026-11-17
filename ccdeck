@@ -112,6 +112,7 @@ STATES = {
     "done": ("done", "Done"),
 }
 GROUP_ORDER = {g: i for i, (g, _) in enumerate(GROUPS)}
+PROMPT_STATES = {"permission", "question", "plan"}
 PR_STATES = {"ci_failing", "changes_requested", "pr_conflict", "pr_approved", "pr_draft"}
 NOTIFY_STATES = {"permission", "question", "plan", "decision", "error",
                  "ci_failing", "changes_requested", "pr_conflict", "pr_approved", "pr_draft", "idle"}
@@ -686,7 +687,8 @@ def parse_transcript(path):
                     pending[b.get("id")] = name
                     pending_inputs[b.get("id")] = summarize_tool_input(name, inp)
                     if name == "AskUserQuestion":  # every question, whole: the bell keeps the full text
-                        qs = [q.get("question") for q in inp.get("questions") or [] if isinstance(q, dict)]
+                        raw = inp.get("questions")
+                        qs = [q.get("question") for q in (raw if isinstance(raw, list) else []) if isinstance(q, dict)]
                         questions[b.get("id")] = "\n\n".join(str(q) for q in qs if q) or None
                     info["last_role"] = "tool"
                     if "linear" in name.lower():
@@ -1812,7 +1814,9 @@ class Dashboard:
 
     def _notify_changes(self, rows):
         inbox_sweep(rows)
-        cur = {r["id"]: (r["state"], r.get("notification_epoch")) for r in rows}
+        # the epoch tells two prompts in a row apart; other states (a PR's) change only with the state, or
+        # closing the session (SessionEnd moves the epoch too) would bring back a PR notification you dismissed
+        cur = {r["id"]: (r["state"], r.get("notification_epoch") if r["state"] in PROMPT_STATES else None) for r in rows}
         prev, self.prev_states = self.prev_states, cur
         if prev is None or PREVIEW:
             return  # first scan after start: don't replay everything
