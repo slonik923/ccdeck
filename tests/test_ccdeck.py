@@ -395,6 +395,35 @@ class HookTest(unittest.TestCase):
             self.run_hook({"session_id": "s-closed", "hook_event_name": "PostToolUse", "tool_name": "Bash"})
         self.assertEqual([d["id"] for d in cc.inbox_items()], [keep])
 
+    def test_session_end_preserves_pr_notifications_and_clears_prompts(self):
+        build_fixtures()
+        shutil.rmtree(cc.INBOX_DIR, ignore_errors=True)
+        states = cc.PR_STATES | {"question", "permission", "plan", "decision"}
+        kept = set()
+        for state in states:
+            sid = "s-end-" + state
+            nid = cc.inbox_add(sid, state, "Needs you", state)
+            if state in cc.PR_STATES:
+                kept.add(nid)
+            self.run_hook({"session_id": sid, "hook_event_name": "SessionEnd", "reason": "exit"})
+        self.assertEqual({d["id"] for d in cc.inbox_items()}, kept)
+
+    def test_question_notification_uses_pending_question_text(self):
+        build_fixtures()
+        question = "Which database should we use?"
+        write_session("s-question", [user("plan it", 200),
+                      asst([text("Let me ask you."), tool("t1", "AskUserQuestion",
+                            {"questions": [{"question": question}]})], 199)])
+        row = by_id(cc.collect(True, 10 ** 6))["s-question"]
+        row["alive"] = True
+        row["hook_message"] = "Generic hook message"
+        dash = cc.Dashboard(0)
+        dash.prev_states = {}
+        with mock.patch.object(cc, "notify") as notify:
+            dash._notify_changes([row])
+        self.assertEqual(notify.call_args.args[1], question)
+        self.assertEqual(notify.call_args.kwargs["text"], question)
+
     def test_new_permission_between_scans_gets_a_fresh_notification(self):
         build_fixtures()
         sid = "s-closed"
