@@ -1585,10 +1585,10 @@ def mac_terminal_app_of(pid):
     for _ in range(12):
         if not pid or pid <= 1:
             return None
-        cmd = " ".join(proc_cmdline(pid))
-        if "/Terminal.app/" in cmd:
+        exe = (proc_cmdline(pid) or [""])[0]  # the program, not its arguments: a prompt can name iTerm.app
+        if "/Terminal.app/" in exe:
             return "terminal"
-        if "/iTerm.app/" in cmd or "/iTerm2.app/" in cmd:
+        if "/iTerm.app/" in exe or "/iTerm2.app/" in exe:
             return "iterm"
         pid = proc_ppid(pid)
     return None

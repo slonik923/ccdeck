@@ -1547,6 +1547,7 @@ class MacDesktopTest(unittest.TestCase):
             10: (9, "claude"), 9: (8, "-zsh"), 8: (7, "login -pfl me"), 7: (1, "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
             20: (19, "claude"), 19: (18, "-zsh"), 18: (1, "/Applications/iTerm.app/Contents/MacOS/iTerm2 --server login"),
             30: (1, "claude"),  # no terminal above it (an IDE, ssh, …)
+            40: (8, "claude look at /Applications/iTerm.app/Contents/Info.plist"),  # in Terminal; its prompt names iTerm
         }
         def app_for(peers, term_program=""):
             with mock.patch.object(cc, "peer_sessions", lambda: {f"s{i}": {"pid": p} for i, p in enumerate(peers)}), \
@@ -1559,6 +1560,7 @@ class MacDesktopTest(unittest.TestCase):
         self.assertEqual(app_for([10]), "terminal")             # iTerm installed, but you work in Terminal
         self.assertEqual(app_for([20, 10, 20]), "iterm")        # most sessions
         self.assertEqual(app_for([10, 20]), "terminal")         # a tie: Terminal
+        self.assertEqual(app_for([40]), "terminal")             # only the program counts, not a path in a prompt
         self.assertEqual(app_for([30], "Apple_Terminal"), "terminal")  # no session says: where the dashboard started
         self.assertEqual(app_for([], "iTerm.app"), "iterm")
         self.assertEqual(app_for([]), "iterm")                  # nothing says: iTerm when it's installed, as before
