@@ -1230,8 +1230,6 @@ def collect(include_all=False, days=DEFAULT_DAYS):
     rows, cutoff = [], time.time() - days * 86400
     for sid, s in sessions.items():
         hook = hooks.get(sid)
-        if hook and hook.get("headless"):
-            hook = None  # written by a `claude -p` run on this session: says nothing about it being open
         # a hook whose process the registry says now runs another session (/resume) is stale
         hook_live = bool(hook and hook.get("pid")) and pid_alive(hook["pid"], hook.get("pid_start")) \
             and hook.get("status") != "ended" and owner.get(hook["pid"], sid) == sid
@@ -2709,6 +2707,9 @@ def cmd_hook(_args):
     sid = str(data["session_id"])
     if not re.fullmatch(r"[\w-]+", sid):
         return
+    sender = find_claude_ancestor()
+    if pid_is_headless(sender):
+        return  # a `claude -p` run (even `-p --resume <id>`): it never waits for you, and mustn't speak for the session
     event = data.get("hook_event_name", "")
     path = STATE_DIR / f"{sid}.json"
     state = load_json(path, {})
@@ -2721,10 +2722,8 @@ def cmd_hook(_args):
                  cwd=data.get("cwd") or state.get("cwd"),
                  ccdeck={"version": VERSION, "script": str(SCRIPT)})  # lets a running dashboard upgrade itself
     if not pid_alive(state.get("pid"), state.get("pid_start")):
-        pid = find_claude_ancestor()
-        if pid:
-            state["pid"], state["pid_start"] = pid, proc_start_time(pid)
-            state["headless"] = pid_is_headless(pid)  # claude -p --resume <id>: runs, but doesn't open the session
+        if sender:
+            state["pid"], state["pid_start"] = sender, proc_start_time(sender)
 
     if event == "SessionStart":
         state["status"] = "idle"

@@ -587,19 +587,31 @@ class HookTest(unittest.TestCase):
                         (1, str(WORK), ["claude", flag, "--resume", "s-closed"]) ]):
                 self.assertFalse(by_id(cc.collect(True, 10 ** 6))["s-closed"]["alive"])
 
-    def test_a_headless_resume_hook_doesnt_open_the_session(self):
+    def test_a_headless_run_doesnt_speak_for_the_session(self):
+        """claude -p --resume <id> fires the same hooks: they mustn't open the session, mark it working, end it,
+        or take over the record of the interactive process that has it open."""
         build_fixtures()
         sid, me = "s-closed", os.getpid()
-        self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
-        for headless, alive in ((True, False), (False, True)):
-            (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        path = cc.STATE_DIR / f"{sid}.json"
+        path.unlink(missing_ok=True)
+        self.addCleanup(path.unlink, missing_ok=True)
+        def hook(event, headless, **kw):
             with mock.patch.object(cc, "find_claude_ancestor", return_value=me), \
-                    mock.patch.object(cc, "pid_is_headless", return_value=headless), \
-                    mock.patch.object(cc, "peer_sessions", return_value={}), \
+                    mock.patch.object(cc, "pid_is_headless", return_value=headless):
+                self.run_hook(dict({"session_id": sid, "hook_event_name": event, "cwd": str(WORK)}, **kw))
+        def row():
+            with mock.patch.object(cc, "peer_sessions", return_value={}), \
                     mock.patch.object(cc, "running_claude_processes", return_value=[]):
-                self.run_hook({"session_id": sid, "hook_event_name": "UserPromptSubmit", "cwd": str(WORK)})
-                row = by_id(cc.collect(True, 10 ** 6))[sid]
-            self.assertEqual((row["alive"], row["state"] == "working"), (alive, alive), headless)
+                return by_id(cc.collect(True, 10 ** 6))[sid]
+        hook("UserPromptSubmit", True)
+        self.assertFalse(path.exists())                       # headless first: nothing recorded
+        self.assertFalse(row()["alive"])
+        hook("UserPromptSubmit", False)
+        hook("Stop", False)
+        self.assertEqual((row()["alive"], row()["state"]), (True, "idle"))
+        hook("UserPromptSubmit", True)                        # a -p run on the open session
+        hook("SessionEnd", True, reason="other")
+        self.assertEqual((row()["alive"], row()["state"]), (True, "idle"))
 
     def test_resumed_session_isnt_held_back_by_the_ended_hook(self):
         build_fixtures()
@@ -1601,7 +1613,7 @@ class MacDesktopTest(unittest.TestCase):
         self.assertEqual(app_for([40]), "terminal")             # only the program counts, not a path in a prompt
         self.assertEqual(app_for([50], "Apple_Terminal"), "iterm")  # iTerm in a folder with a space
         self.assertEqual(app_for([[30, 20]], "Apple_Terminal"), "iterm")  # open in an IDE and in iTerm
-        self.assertEqual(app_for([[10, 20], 10, [20, 10]]), "terminal")  # one vote per session, not per process
+        self.assertEqual(app_for([[20, 50], 10]), "terminal")    # one vote per session (a tie), not per process
         self.assertEqual(app_for([30], "Apple_Terminal"), "terminal")  # no session says: where the dashboard started
         self.assertEqual(app_for([], "iTerm.app"), "iterm")
         self.assertEqual(app_for([]), "iterm")                  # nothing says: iTerm when it's installed, as before
