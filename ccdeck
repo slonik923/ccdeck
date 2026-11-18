@@ -1230,6 +1230,8 @@ def collect(include_all=False, days=DEFAULT_DAYS):
     rows, cutoff = [], time.time() - days * 86400
     for sid, s in sessions.items():
         hook = hooks.get(sid)
+        if hook and hook.get("headless"):
+            hook = None  # written by a `claude -p` run on this session: says nothing about it being open
         # a hook whose process the registry says now runs another session (/resume) is stale
         hook_live = bool(hook and hook.get("pid")) and pid_alive(hook["pid"], hook.get("pid_start")) \
             and hook.get("status") != "ended" and owner.get(hook["pid"], sid) == sid
@@ -1605,7 +1607,9 @@ def mac_terminal_used():
     """The terminal you use, when both are installed: the one most of your open sessions run in, else the
     one the dashboard was started from (a session's hook starts it), else None."""
     try:
-        apps = [a for peer in peer_sessions().values() if (a := mac_terminal_app_of(peer.get("pid")))]
+        # one vote per session: the first of its processes that runs in a terminal (it can also be open in an IDE)
+        apps = [a for peer in peer_sessions().values()
+                if (a := next(filter(None, map(mac_terminal_app_of, peer.get("pids") or [peer.get("pid")])), None))]
     except Exception:  # finding out is a nicety: never fail opening a terminal over it
         apps = []
     if apps:
@@ -2720,6 +2724,7 @@ def cmd_hook(_args):
         pid = find_claude_ancestor()
         if pid:
             state["pid"], state["pid_start"] = pid, proc_start_time(pid)
+            state["headless"] = pid_is_headless(pid)  # claude -p --resume <id>: runs, but doesn't open the session
 
     if event == "SessionStart":
         state["status"] = "idle"
@@ -2790,10 +2795,13 @@ def input_hash(tool_name, tool_input):
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def pid_is_headless(pid):
+    argv = (_process_argv(pid) or proc_cmdline(pid)) if pid else []
+    return any(is_print_flag(a) for a in argv[1:])
+
+
 def claude_is_headless():
-    pid = find_claude_ancestor()
-    argv = proc_cmdline(pid) if pid else []
-    return any(a in ("-p", "--print") for a in argv[1:])
+    return pid_is_headless(find_claude_ancestor())
 
 
 def ensure_req_dir():

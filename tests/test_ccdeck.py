@@ -587,6 +587,20 @@ class HookTest(unittest.TestCase):
                         (1, str(WORK), ["claude", flag, "--resume", "s-closed"]) ]):
                 self.assertFalse(by_id(cc.collect(True, 10 ** 6))["s-closed"]["alive"])
 
+    def test_a_headless_resume_hook_doesnt_open_the_session(self):
+        build_fixtures()
+        sid, me = "s-closed", os.getpid()
+        self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
+        for headless, alive in ((True, False), (False, True)):
+            (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+            with mock.patch.object(cc, "find_claude_ancestor", return_value=me), \
+                    mock.patch.object(cc, "pid_is_headless", return_value=headless), \
+                    mock.patch.object(cc, "peer_sessions", return_value={}), \
+                    mock.patch.object(cc, "running_claude_processes", return_value=[]):
+                self.run_hook({"session_id": sid, "hook_event_name": "UserPromptSubmit", "cwd": str(WORK)})
+                row = by_id(cc.collect(True, 10 ** 6))[sid]
+            self.assertEqual((row["alive"], row["state"] == "working"), (alive, alive), headless)
+
     def test_resumed_session_isnt_held_back_by_the_ended_hook(self):
         build_fixtures()
         sid = "s-midtask"  # its transcript ends on a tool entry, so an open session isn't idle
@@ -1444,6 +1458,10 @@ class ResumedIdsTest(unittest.TestCase):
                  (8, "/w", ["claude", "--print", "--resume=e"])]
         self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c"})
 
+    def test_headless_pid(self):
+        with mock.patch.object(cc, "_process_argv", lambda p: {1: ["claude", "-pc", "q"], 2: ["claude", "-c"]}.get(p, [])):
+            self.assertEqual([cc.pid_is_headless(p) for p in (1, 2, None)], [True, False, False])
+
     def test_print_flag_in_a_cluster(self):
         for a in ("-p", "--print", "-pc", "-cp"):
             self.assertTrue(cc.is_print_flag(a), a)
@@ -1566,7 +1584,10 @@ class MacDesktopTest(unittest.TestCase):
         }
         exact = {51: ["/Users/me/Local Apps/iTerm.app/Contents/MacOS/iTerm2"]}  # what the kernel says; ps splits it
         def app_for(peers, term_program=""):
-            with mock.patch.object(cc, "peer_sessions", lambda: {f"s{i}": {"pid": p} for i, p in enumerate(peers)}), \
+            def peer(p):  # a pid, or a list: one session in several processes
+                ps = p if isinstance(p, list) else [p]
+                return {"pid": ps[0], "pids": ps}
+            with mock.patch.object(cc, "peer_sessions", lambda: {f"s{i}": peer(p) for i, p in enumerate(peers)}), \
                     mock.patch.object(cc, "proc_ppid", lambda p: procs.get(p, (None,))[0]), \
                     mock.patch.object(cc, "proc_cmdline", lambda p: procs[p][1].split() if p in procs else []), \
                     mock.patch.object(cc, "_process_argv", lambda p: exact.get(p, [])), \
@@ -1579,6 +1600,8 @@ class MacDesktopTest(unittest.TestCase):
         self.assertEqual(app_for([10, 20]), "terminal")         # a tie: Terminal
         self.assertEqual(app_for([40]), "terminal")             # only the program counts, not a path in a prompt
         self.assertEqual(app_for([50], "Apple_Terminal"), "iterm")  # iTerm in a folder with a space
+        self.assertEqual(app_for([[30, 20]], "Apple_Terminal"), "iterm")  # open in an IDE and in iTerm
+        self.assertEqual(app_for([[10, 20], 10, [20, 10]]), "terminal")  # one vote per session, not per process
         self.assertEqual(app_for([30], "Apple_Terminal"), "terminal")  # no session says: where the dashboard started
         self.assertEqual(app_for([], "iTerm.app"), "iterm")
         self.assertEqual(app_for([]), "iterm")                  # nothing says: iTerm when it's installed, as before
