@@ -1579,6 +1579,24 @@ class GuessLiveTest(unittest.TestCase):
         self.assertFalse({"s-headless", "s-sdk"} & ids)
         self.assertTrue({"s-resumed", "s-desktop", "s-closed"} <= ids)
 
+    def test_a_print_run_doesnt_hide_a_session_open_in_a_terminal(self):
+        """`claude -p --resume` writes "sdk" entries to a session still open in a terminal: it stays."""
+        build_fixtures()
+        hl = lambda e, ep: dict(e, entrypoint=ep)
+        for sid in ("s-term", "s-printing"):
+            write_session(sid, [hl(user("hi", 30), "cli"), hl(user("run it", 5), "sdk-cli"), hl(asst([text("Done.")], 4), "sdk-cli")])
+        peers = {"s-term": {"name": None, "pid": 1, "pids": [1]}, "s-printing": {"name": None, "pid": 2, "pids": [2]}}
+        with mock.patch.object(cc, "peer_sessions", lambda: peers), \
+             mock.patch.object(cc, "pid_is_headless", lambda p: p == 2):
+            ids = set(by_id(cc.collect(True, 10 ** 6)))
+        self.assertIn("s-term", ids)  # an interactive process runs it
+        self.assertNotIn("s-printing", ids)  # only the print run itself has it open
+        me = os.getpid()
+        hooks = {"s-h": {"pid": me, "pid_start": cc.proc_start_time(me)}, "s-ended": {"pid": me, "status": "ended"}}
+        self.assertTrue(cc.has_live_owner("s-h", hooks, {}))
+        self.assertFalse(cc.has_live_owner("s-ended", hooks, {}))
+        self.assertFalse(cc.has_live_owner("s-none", hooks, {}))
+
     def test_duplicate_sessions_filter_headless_after_selecting_latest(self):
         for older_ep, newer_ep, has_prompt in (("cli", "sdk-cli", True),
                                                ("sdk-cli", "cli", True),
@@ -1600,13 +1618,10 @@ class GuessLiveTest(unittest.TestCase):
                          mock.patch.object(cc, "CACHE_FILE", Path(tmp) / "cache.json"), \
                          mock.patch.object(Path, "glob", lambda _, pattern: iter(paths) if pattern == "*/*.jsonl" else iter(())):
                         for _ in range(2):  # parse first, then reuse cached transcripts
-                            sessions = cc.scan_transcripts()
-                            if has_prompt and newer_ep == "sdk-cli":
-                                self.assertNotIn("duplicate", sessions)
-                            else:
-                                selected = sessions["duplicate"]
-                                self.assertEqual(selected["entrypoint"], newer_ep if has_prompt else older_ep)
-                                self.assertEqual(selected["last_ts"], cc.parse_transcript(projects / ("new" if has_prompt else "old") / "duplicate.jsonl")["last_ts"])
+                            sessions = cc.scan_transcripts()  # the latest copy wins; collect drops headless ones
+                            selected = sessions["duplicate"]
+                            self.assertEqual(selected["entrypoint"], newer_ep if has_prompt else older_ep)
+                            self.assertEqual(selected["last_ts"], cc.parse_transcript(projects / ("new" if has_prompt else "old") / "duplicate.jsonl")["last_ts"])
 
     def test_registry_sessions_use_up_their_process(self):
         # registry session A is open in /w/app; B is newer and closed: one process, so only A
