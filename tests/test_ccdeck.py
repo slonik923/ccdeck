@@ -500,6 +500,15 @@ class ClassifyTest(unittest.TestCase):
                                  result("g4", 79, "✓ Created PR #5 for feat/e\n✓ Created PR #6 for feat/f"), asst([text("Done.")], 78)])
         with mock.patch.object(cc.subprocess, "run", side_effect=git):
             self.assertEqual(cc.with_stack_prs(cc.parse_transcript(PROJ / "s-both.jsonl"))["prs"], [])
+        # cd -P resolves the link before `..`; plain cd collapses `..` as typed
+        with tempfile.TemporaryDirectory() as root:
+            root = os.path.realpath(root)
+            (Path(root) / "repos" / "app" / "subdir").mkdir(parents=True)
+            (Path(root) / "work").mkdir()
+            (Path(root) / "work" / "link").symlink_to(Path(root) / "repos" / "app" / "subdir")
+            self.assertEqual(cc.gh_stack_dirs(f"cd -P {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/repos/app"])
+            self.assertEqual(cc.gh_stack_dirs(f"cd {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/work"])
+            self.assertEqual(cc.gh_stack_dirs(f"cd -P -L {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/work"])
         # two spellings of one folder (a symlink) are one folder
         with tempfile.TemporaryDirectory() as root:
             real = Path(root) / "repo"
