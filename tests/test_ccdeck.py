@@ -458,6 +458,34 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(self.state("s-midtask"), "closed_midtask")
         self.assertEqual(self.state("s-garbage"), "closed")
 
+    def test_gh_stack_submit_prs(self):
+        """`gh stack submit` prints PR numbers without links: the repo comes from the folder's git remote."""
+        out = ("Pushing 3 branches...\n✓ Created PR #12 for feat/b\nPR #11 for feat/a is up to date\n"
+               "Linked the stack on GitHub\nSee PR #9 for feat/z earlier")  # a sentence isn't a submit line
+        write_session("s-stack", [user("submit the stack", 80), asst([tool("g1", "Bash", {"command": "gh stack submit --auto"})], 79),
+                                  result("g1", 79, out), asst([text("Submitted.")], 78)])
+        write_session("s-stack-view", [user("show it", 80), asst([tool("g2", "Bash", {"command": "gh pr list"})], 79),
+                                       result("g2", 79, "✓ Created PR #13 for feat/c"), asst([text("Listed.")], 78)])
+        cc.github_repo.cache_clear()
+        with mock.patch.object(cc.subprocess, "run", return_value=type("R", (), {"stdout": "git@github.com:acme/app.git\n"})):
+            info = cc.parse_transcript(PROJ / "s-stack.jsonl")
+            other = cc.parse_transcript(PROJ / "s-stack-view.jsonl")
+        cc.github_repo.cache_clear()
+        self.assertEqual(sorted(info["prs"]), ["https://github.com/acme/app/pull/11", "https://github.com/acme/app/pull/12"])
+        self.assertEqual(set(info["pr_sources"].values()), {"created"})
+        self.assertEqual(other["prs"], [])  # only gh stack's own output counts
+        # Claude Code's pr-link entries name the session's PRs with links
+        write_session("s-linked", [user("ship", 80), asst([text("Opened it.")], 79),
+                                   {"type": "pr-link", "prNumber": 5, "prUrl": PR.format(5), "prRepository": "me/app"},
+                                   {"type": "pr-link", "prUrl": "javascript:alert(1)"}, {"type": "pr-link", "prUrl": 7}])
+        linked = cc.parse_transcript(PROJ / "s-linked.jsonl")
+        self.assertEqual((linked["prs"], linked["pr_sources"]), ([PR.format(5)], {PR.format(5): "created"}))
+        for remote, repo in (("https://github.com/acme/app.git", "acme/app"), ("https://github.com/acme/my.app", "acme/my.app"),
+                             ("git@gitlab.com:acme/app.git", None), ("", None)):
+            with self.subTest(remote=remote):
+                m = cc.GITHUB_REMOTE_RE.search(remote)
+                self.assertEqual(m.group(1) if m else None, repo)
+
     def test_links_and_files(self):
         s = self.rows["s-links"]
         self.assertEqual(s["links"]["artifact"], ["https://claude.ai/code/artifact/abc-123"])

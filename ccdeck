@@ -23,6 +23,7 @@ ID is a row number from the last list or any unique prefix of a session id.
 
 import argparse
 import fcntl
+import functools
 import importlib.util
 import hashlib
 import json
@@ -42,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -72,7 +73,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 12
+CACHE_VERSION = 13  # 13: PRs from pr-link entries and gh stack output
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -420,6 +421,9 @@ def _running_claude_ps():
 # ----------------------------------------------------------------- transcripts
 
 PR_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# `gh stack submit` names a stack's PRs without links: "✓ Created PR #12 for feat/x", "PR #11 for feat/w is up to date"
+STACK_PR_RE = re.compile(r"^\s*(?:✓\s*)?(?:(?:Created|Updated) PR #(\d+) for \S+|PR #(\d+) for \S+ is up to date)\s*$", re.M)
+GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 REF_RES = [  # links shown on a session (Linear issues are handled on their own below)
     ("artifact", re.compile(r"https://claude\.ai/(?:code/)?artifacts?/[\w-]+")),
     ("notion", re.compile(r"https://(?:www\.|app\.)?notion\.(?:so|site|com)/[\w./?=&%#-]+")),
@@ -596,6 +600,19 @@ def is_headless(info):
     return str(info.get("entrypoint") or "").startswith("sdk")
 
 
+@functools.lru_cache(maxsize=256)
+def github_repo(cwd):
+    """owner/name of the GitHub repo a folder's origin remote points at, or None."""
+    if not cwd:
+        return None
+    try:
+        out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = GITHUB_REMOTE_RE.search(out.strip())
+    return m.group(1) if m else None
+
+
 def parse_transcript(path):
     info = {
         "id": path.stem, "cwd": None, "branch": None, "title": None, "ai_title": None,
@@ -606,6 +623,7 @@ def parse_transcript(path):
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
     refs, linear, keys, tool_titles, not_created, questions = {}, {}, {}, {}, {}, {}
+    stack_prs = set()  # PR numbers `gh stack submit` printed; their repo is the session folder's
     seen_msgs = set()
 
     def note_ref(url, kind, title, source):
@@ -681,6 +699,11 @@ def parse_transcript(path):
             if t == "summary":
                 info["summary"] = e.get("summary") or info["summary"]
                 continue
+            if t == "pr-link":  # Claude Code's own record of a PR it linked to this session
+                url = e.get("prUrl")
+                if isinstance(url, str) and PR_RE.fullmatch(url):
+                    prs[url] = "created"
+                continue
             if t not in ("user", "assistant") or e.get("isSidechain"):
                 continue
             ts = parse_ts(e.get("timestamp"))
@@ -706,6 +729,8 @@ def parse_transcript(path):
                             if creating or "linear" in name.lower():
                                 src = "created" if creating else "tool"
                                 add_refs(body, src, with_prs=creating)
+                                if name == "Bash:create":
+                                    stack_prs.update(int(x or y) for x, y in STACK_PR_RE.findall(body))
                                 add_json_titles(body, src)
                                 if tid in tool_titles:  # an Artifact publish: title from its own input
                                     for r in refs.values():
@@ -772,12 +797,15 @@ def parse_transcript(path):
                             files[fp] = None
                     elif name == "Bash":
                         cmd = str(inp.get("command", ""))
-                        if "gh pr create" in cmd or "git push" in cmd:
+                        if "gh pr create" in cmd or "git push" in cmd or "gh stack" in cmd:
                             tool_names[b.get("id")] = "Bash:create"
     info["pending_tool"] = list(pending.values())[-1] if pending else None
     info["pending_input"] = pending_inputs.get(list(pending)[-1]) if pending else None
     info["pending_question"] = questions.get(list(pending)[-1]) if pending else None
     info["pending_id"] = list(pending)[-1] if pending else None
+    repo = github_repo(info["cwd"]) if stack_prs else None
+    for n in sorted(stack_prs) if repo else ():
+        prs[f"https://github.com/{repo}/pull/{n}"] = "created"
     info["prs"] = list(prs)
     info["pr_sources"] = dict(prs)
     for r in refs.values():
