@@ -794,6 +794,12 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .dnotif-head { display: flex; align-items: center; gap: var(--s-3); }
 .ccd .dnotif-head h3 { display: flex; align-items: center; gap: 6px; margin: 0; }
 .ccd .dnotif-title { margin: var(--s-2) 0 0; font-weight: 650; color: var(--text); }
+.ccd .dnotif-fold { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-3); margin: var(--s-2) 0 0 -10px; }
+.ccd .dnotif-fold .btn .i { transition: transform .15s; }
+.ccd .dnotif-fold .btn[aria-expanded="true"] .i { transform: rotate(180deg); }
+.ccd .dnotif-same { font-size: var(--t-12); color: var(--text-3); }
+.ccd .dnotif-text .msg { margin-top: var(--s-2); }
+@media (prefers-reduced-motion: reduce) { .ccd .dnotif-fold .btn .i { transition: none; } }
 .ccd .ib-open { all: unset; cursor: pointer; min-width: 0; display: grid; gap: 2px; border-radius: var(--r-xs); }
 .ccd .ib-open:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .ccd .ib-open:hover .rr-title { text-decoration: underline; }

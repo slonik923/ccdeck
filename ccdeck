@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.0"
+VERSION = "0.9.2"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -70,7 +70,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 11
+CACHE_VERSION = 12
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -200,7 +200,7 @@ def one_line(s, n):
 # ------------------------------------------------------------------ processes
 
 USE_PROC = os.path.exists("/proc/self/stat") and os.environ.get("CCDECK_NO_PROC") != "1"  # set to test the macOS path
-_ps_cache = {"t": 0.0, "rows": {}}
+_ps_cache = {"t": 0.0, "rows": {}, "timeout": 10}  # a hook lowers the timeout: it must exit fast
 
 
 def parse_ps(text):
@@ -223,10 +223,10 @@ def ps_table():
         return _ps_cache["rows"]
     try:
         out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,lstart=,command="], capture_output=True,
-                             text=True, timeout=10, env=dict(os.environ, LC_ALL="C")).stdout
+                             text=True, timeout=_ps_cache["timeout"], env=dict(os.environ, LC_ALL="C")).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
-    _ps_cache.update(t=now, rows=parse_ps(out))
+    _ps_cache.update(t=time.time(), rows=parse_ps(out))  # stamped after: a timed-out call isn't repeated at once
     return _ps_cache["rows"]
 
 
@@ -346,8 +346,44 @@ def running_claude_processes():
     return out
 
 
+def _process_argv(pid):
+    """Read argument boundaries; ps command text cannot distinguish flags from prompt words."""
+    if sys.platform != "darwin":  # also supports CCDECK_NO_PROC on Linux
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0")
+        except OSError:
+            return []
+        return raw.decode(errors="replace").split("\0") if raw else []  # empty: a zombie, let ps say
+    import ctypes
+    import struct
+    try:
+        libc = ctypes.CDLL(None)
+        # CTL_KERN, KERN_PROCARGS2: argc, executable path, padding, then NUL-delimited argv.
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))
+        size = ctypes.c_size_t(1024 * 1024)
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return []
+        data = buf.raw[:size.value]
+        argc = struct.unpack_from("i", data)[0]
+        start = data.index(b"\0", struct.calcsize("i"))
+        while start < len(data) and data[start] == 0:
+            start += 1
+        args = data[start:].split(b"\0")
+        return [a.decode(errors="replace") for a in args[:argc]] if 0 < argc <= len(args) else []
+    except (OSError, ValueError, struct.error):
+        return []
+
+
 def _running_claude_ps():
-    procs = [(pid, row[2].split()) for pid, row in ps_table().items() if is_claude_cmd(row[2].split())]
+    procs = []
+    for pid, row in ps_table().items():
+        words = row[2].split()
+        if is_claude_cmd(words):
+            # ps loses where one argument ends; when the real ones can't be read, its words still say it's open
+            argv = _process_argv(pid) or words
+            if is_claude_cmd(argv):
+                procs.append((pid, argv))
     cwds = {}
     if procs and shutil.which("lsof"):
         try:
@@ -537,12 +573,18 @@ def summarize_tool_input(name, inp):
         return None
 
 
+def is_headless(info):
+    """`claude -p` and Agent SDK runs ("sdk-cli", "sdk-ts", "sdk-py"): scripts and tools, never waiting for
+    you, so not sessions for the dashboard. One resumed in a terminal is interactive again ("cli")."""
+    return str(info.get("entrypoint") or "").startswith("sdk")
+
+
 def parse_transcript(path):
     info = {
         "id": path.stem, "cwd": None, "branch": None, "title": None, "ai_title": None,
         "summary": None, "first_prompt": None, "last_prompt": None, "prompts": 0,
         "first_ts": 0.0, "last_ts": 0.0, "last_role": None, "last_text": "",
-        "api_error": False, "pending_tool": None, "pending_input": None, "pending_question": None, "pending_id": None, "prs": [], "links": {}, "files": [],
+        "api_error": False, "entrypoint": None, "pending_tool": None, "pending_input": None, "pending_question": None, "pending_id": None, "prs": [], "links": {}, "files": [],
         "refs": [], "linear": {}, "issue_keys": [], "usage": empty_usage(), "context": 0, "model": None,
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
@@ -630,6 +672,7 @@ def parse_transcript(path):
                 info["last_ts"] = max(info["last_ts"], ts)
             info["cwd"] = e.get("cwd") or info["cwd"]
             info["branch"] = e.get("gitBranch") or info["branch"]
+            info["entrypoint"] = e.get("entrypoint") or info["entrypoint"]  # the latest: a resume can change it
             content = message_content(e)
 
             if t == "user":
@@ -1046,11 +1089,30 @@ def classify(s, hook, alive):
     return "closed_midtask" if s.get("last_role") in ("user", "tool") else "closed"
 
 
+def is_print_flag(a):
+    """-p, --print, or a cluster of short flags with p in it (-pc): claude -p never waits for you."""
+    return a == "--print" or bool(re.fullmatch(r"-[A-Za-z]*p[A-Za-z]*", a))
+
+
+def is_print_argv(argv):
+    """Whether a claude command line runs headless. After `--` come prompt words, not options (`claude -- -p`)."""
+    for a in argv[1:]:
+        if a == "--":
+            return False
+        if is_print_flag(a):
+            return True
+    return False
+
+
+def interactive_processes(procs):
+    return [p for p in procs if not is_print_argv(p[2])]
+
+
 def resumed_ids(procs):
     """Session ids that running claude processes were started on (`--resume <id>`, `-r <id>`, `--resume=<id>`).
     Only the resume argument counts: an id mentioned in a prompt doesn't make that session open."""
     out = set()
-    for _, _, argv in procs:
+    for _, _, argv in interactive_processes(procs):
         for i, a in enumerate(argv):
             if a in ("--resume", "-r") and i + 1 < len(argv):
                 out.add(argv[i + 1])
@@ -1079,14 +1141,16 @@ def peer_sessions():
 
 
 def guess_live_sessions(sessions, hooks, procs, resumed, reg_pids=frozenset(), registered=frozenset()):
-    """Sessions no hook reports on: N claude processes in a folder => its N most recent sessions
+    """Sessions no hook reports on: N interactive claude processes in a folder => its N most recent sessions
     are taken as open, less the processes hooks or `--resume <id>` already account for.
     Registered processes (reg_pids) are left out entirely: the registry says what they run (registered),
     however many share a session. Each other process counts once: after /resume, the old session's hook
     and the registry can name the same pid."""
     per_cwd = {}
-    for pid, cwd, argv in procs:
-        if cwd and pid not in reg_pids:
+    eligible = [p for p in interactive_processes(procs) if p[0] not in reg_pids]
+    eligible_pids = {p[0] for p in eligible}
+    for pid, cwd, argv in eligible:
+        if cwd:
             per_cwd[cwd] = per_cwd.get(cwd, 0) + 1
     by_cwd = {}
     for s in sessions.values():
@@ -1100,7 +1164,7 @@ def guess_live_sessions(sessions, hooks, procs, resumed, reg_pids=frozenset(), r
             pid = h.get("pid")
             if s["id"] in resumed:
                 n -= 1
-            elif pid and pid not in reg_pids and pid not in counted and pid_alive(pid, h.get("pid_start")):
+            elif pid in eligible_pids and pid not in counted and h.get("status") != "ended" and pid_alive(pid, h.get("pid_start")):
                 counted.add(pid)
                 n -= 1
         rest = sorted((s for s in ss if not (hooks.get(s["id"]) or {}).get("pid") and s["id"] not in resumed
@@ -1156,6 +1220,21 @@ def title_of(s):
             or one_line(s.get("first_prompt"), 90) or "(untitled)")
 
 
+def has_live_owner(sid, hooks, peers, owner, resumed):
+    """A session open in a terminal stays on the dashboard while `claude -p --resume` writes to it: its
+    latest entries then say "sdk", but an interactive process still runs it. Evidence: its live hook (unless
+    the registry says that process now runs another session), an interactive registry process, or an
+    unregistered interactive `--resume <id>`. Print-run processes never count."""
+    if sid in resumed:
+        return True
+    hook = hooks.get(sid) or {}
+    pid = hook.get("pid")
+    if pid and hook.get("status") != "ended" and owner.get(pid, sid) == sid \
+            and pid_alive(pid, hook.get("pid_start")) and not pid_is_headless(pid):
+        return True
+    return any(not pid_is_headless(p) for p in (peers.get(sid) or {}).get("pids", []))
+
+
 def collect(include_all=False, days=DEFAULT_DAYS):
     sessions = scan_transcripts()
     hooks = load_states()
@@ -1169,6 +1248,8 @@ def collect(include_all=False, days=DEFAULT_DAYS):
     owner = {pid: sid for sid, p in peers.items() for pid in p["pids"]}  # what each registered process runs now
     reg_pids = set(owner)
     resumed = resumed_ids([p for p in procs if p[0] not in reg_pids])
+    sessions = {sid: s for sid, s in sessions.items()
+                if not is_headless(s) or has_live_owner(sid, hooks, peers, owner, resumed)}
     guessed_live = guess_live_sessions(sessions, hooks, procs, resumed, reg_pids, set(peers))
 
     resolve_linear(sessions)
@@ -1531,11 +1612,41 @@ TERMINALS = [  # (binary, args before the command)
 ]
 
 
+def mac_terminal_app_of(pid):
+    """"terminal" or "iterm": the macOS terminal app a process runs in (its nearest such ancestor), or None."""
+    for _ in range(12):
+        if not pid or pid <= 1:
+            return None
+        # the program, not its arguments (a prompt can name iTerm.app); exact, as a path can have a space in it
+        exe = (_process_argv(pid) or proc_cmdline(pid) or [""])[0]
+        if "/Terminal.app/" in exe:
+            return "terminal"
+        if "/iTerm.app/" in exe or "/iTerm2.app/" in exe:
+            return "iterm"
+        pid = proc_ppid(pid)
+    return None
+
+
+def mac_terminal_used():
+    """The terminal you use, when both are installed: the one most of your open sessions run in, else the
+    one the dashboard was started from (a session's hook starts it), else None."""
+    try:
+        # one vote per session: the first of its processes that runs in a terminal (it can also be open in an IDE)
+        apps = [a for peer in peer_sessions().values()
+                if (a := next(filter(None, map(mac_terminal_app_of, peer.get("pids") or [peer.get("pid")])), None))]
+    except Exception:  # finding out is a nicety: never fail opening a terminal over it
+        apps = []
+    if apps:
+        return max(("terminal", "iterm"), key=apps.count)  # a tie goes to Terminal
+    return {"Apple_Terminal": "terminal", "iTerm.app": "iterm"}.get(os.environ.get("TERM_PROGRAM", ""))
+
+
 def mac_terminal_command(cwd, argv, app=None):
-    """osascript that opens iTerm (if installed) or Terminal and runs the command in a new window."""
+    """osascript that opens Terminal or iTerm and runs the command in a new window."""
     line = applescript_str(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}")
     if app is None:
-        app = "iterm" if (Path("/Applications/iTerm.app").exists() or (HOME / "Applications" / "iTerm.app").exists()) else "terminal"
+        has_iterm = Path("/Applications/iTerm.app").exists() or (HOME / "Applications" / "iTerm.app").exists()
+        app = (mac_terminal_used() or "iterm") if has_iterm else "terminal"
     if app == "iterm":
         return ["osascript", "-e", 'tell application "iTerm"', "-e", "activate",
                 "-e", "set w to (create window with default profile)",
@@ -2630,13 +2741,17 @@ def cmd_hook(_args):
             and event not in ("PostToolUse", "PostToolUseFailure", "PermissionRequest")
             and time.time() - (state.get("ts") or 0) < 1.0):
         return  # same event twice (hooks installed both as a plugin and in settings.json)
+    # A hook must exit fast: give ps 2 s here. If it can't say, the sender counts as interactive, as before.
+    _ps_cache["timeout"] = 2
+    sender = find_claude_ancestor()
+    if pid_is_headless(sender):
+        return  # a `claude -p` run (even `-p --resume <id>`): it never waits for you, and mustn't speak for the session
     state.update(session_id=sid, event=event, ts=time.time(),
                  cwd=data.get("cwd") or state.get("cwd"),
                  ccdeck={"version": VERSION, "script": str(SCRIPT)})  # lets a running dashboard upgrade itself
     if not pid_alive(state.get("pid"), state.get("pid_start")):
-        pid = find_claude_ancestor()
-        if pid:
-            state["pid"], state["pid_start"] = pid, proc_start_time(pid)
+        if sender:
+            state["pid"], state["pid_start"] = sender, proc_start_time(sender)
 
     if event == "SessionStart":
         state["status"] = "idle"
@@ -2707,10 +2822,13 @@ def input_hash(tool_name, tool_input):
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def pid_is_headless(pid):
+    # exact arguments only: ps words split a quoted prompt, so its `--` could hide a real -p. Unreadable: interactive
+    return is_print_argv(_process_argv(pid) if pid else [])
+
+
 def claude_is_headless():
-    pid = find_claude_ancestor()
-    argv = proc_cmdline(pid) if pid else []
-    return any(a in ("-p", "--print") for a in argv[1:])
+    return pid_is_headless(find_claude_ancestor())
 
 
 def ensure_req_dir():

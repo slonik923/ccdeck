@@ -1,0 +1,13 @@
+{
+  "shots": [
+    { "name": "notif-folded", "width": 1440, "height": 1000, "scale": 1,
+      "steps": [ { "click": ".nf-q[data-nav='d-auth']" }, { "click": ".nf-actions button:has-text('Details')", "wait": 500 } ],
+      "clip": ".drawer",
+      "highlight": [ { "sel": ".drawer .dnotif-fold", "label": "New: text folded" } ] },
+    { "name": "notif-open", "width": 1440, "height": 1000, "scale": 1,
+      "steps": [ { "click": ".nf-q[data-nav='d-auth']" }, { "click": ".nf-actions button:has-text('Details')", "wait": 500 },
+                 { "click": ".dnotif-fold button", "wait": 300 } ],
+      "clip": ".drawer",
+      "highlight": [ { "sel": ".drawer .dnotif-text", "label": "Show text opens it" } ] }
+  ]
+}

@@ -430,6 +430,8 @@ class HookTest(unittest.TestCase):
         build_fixtures()
         sid = "s-closed"
         (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        # pid 123 is made up, but it can be a real, live process: don't leave it for later tests, pass or fail
+        self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
         dash = cc.Dashboard(0)
         def scan():
             rows = cc.collect(True, 10 ** 6)
@@ -575,6 +577,57 @@ class HookTest(unittest.TestCase):
             self.assertTrue(by_id(cc.collect(True, 10 ** 6))[sid]["alive"])
         finally:
             cc.running_claude_processes = saved
+
+    def test_print_resume_does_not_mark_session_alive(self):
+        build_fixtures()
+        (cc.STATE_DIR / "s-closed.json").unlink(missing_ok=True)  # only the -p process may speak for it
+        for flag in ("-p", "--print"):
+            with mock.patch.object(cc, "peer_sessions", return_value={}), \
+                    mock.patch.object(cc, "running_claude_processes", return_value=[
+                        (1, str(WORK), ["claude", flag, "--resume", "s-closed"]) ]):
+                self.assertFalse(by_id(cc.collect(True, 10 ** 6))["s-closed"]["alive"])
+
+    def test_a_headless_run_doesnt_speak_for_the_session(self):
+        """claude -p --resume <id> fires the same hooks: they mustn't open the session, mark it working, end it,
+        or take over the record of the interactive process that has it open."""
+        build_fixtures()
+        sid, me, headless_pid = "s-closed", os.getpid(), 999_999
+        path = cc.STATE_DIR / f"{sid}.json"
+        path.unlink(missing_ok=True)
+        self.addCleanup(path.unlink, missing_ok=True)
+        def hook(event, sender, **kw):
+            with mock.patch.object(cc, "find_claude_ancestor", return_value=sender), \
+                    mock.patch.object(cc, "pid_is_headless", lambda p: p == headless_pid):
+                self.run_hook(dict({"session_id": sid, "hook_event_name": event, "cwd": str(WORK)}, **kw))
+        def row():
+            with mock.patch.object(cc, "peer_sessions", return_value={}), \
+                    mock.patch.object(cc, "running_claude_processes", return_value=[]):
+                return by_id(cc.collect(True, 10 ** 6))[sid]
+        hook("UserPromptSubmit", headless_pid)
+        self.assertFalse(path.exists())                       # headless first: nothing recorded
+        self.assertFalse(row()["alive"])
+        hook("UserPromptSubmit", me)
+        hook("Stop", me)
+        self.assertEqual((row()["alive"], row()["state"]), (True, "idle"))
+        for event, kw in (("UserPromptSubmit", {}), ("SessionEnd", {"reason": "other"})):  # a -p run on the open session
+            before = path.read_text()
+            hook(event, headless_pid, **kw)
+            self.assertEqual(path.read_text(), before, event)  # not a field changed
+        self.assertEqual((row()["alive"], row()["state"]), (True, "idle"))
+        # the interactive process is gone: a -p run still doesn't take the record over
+        cc.save_json(path, dict(json.loads(path.read_text()), pid=999_998, pid_start=None))
+        before = path.read_text()
+        hook("UserPromptSubmit", headless_pid)
+        self.assertEqual(path.read_text(), before)
+
+    def test_a_duplicate_event_looks_up_no_process(self):
+        build_fixtures()
+        sid = "s-closed"
+        self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
+        cc.save_json(cc.STATE_DIR / f"{sid}.json", {"session_id": sid, "event": "Stop", "status": "stopped", "ts": 1000.0})
+        with mock.patch.object(cc.time, "time", return_value=1000.5), \
+                mock.patch.object(cc, "find_claude_ancestor", side_effect=AssertionError("looked up")):
+            self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
 
     def test_resumed_session_isnt_held_back_by_the_ended_hook(self):
         build_fixtures()
@@ -1374,6 +1427,50 @@ class PsProcessTest(unittest.TestCase):
         self.assertTrue(cc.proc_cmdline(os.getpid()))
         self.assertIsInstance(cc.running_claude_processes(), list)
 
+    def test_ps_preserves_prompt_argument_boundaries(self):
+        sessions = {"s": {"id": "s", "cwd": "/w", "last_ts": 1}}
+        for args, expected in [(["claude", "explain -p usage"], {"s"}),
+                               (["claude", "explain --print usage"], {"s"}),
+                               (["claude", "-p", "query"], set()),
+                               (["claude", "--print", "query"], set())]:
+            with self.subTest(args=args), mock.patch.object(cc, "ps_table", return_value={1: (0, "", " ".join(args))}), \
+                    mock.patch.object(cc, "_process_argv", return_value=args), \
+                    mock.patch.object(cc.shutil, "which", return_value="/usr/bin/lsof"), \
+                    mock.patch.object(cc.subprocess, "run", return_value=mock.Mock(stdout="p1\nn/w\n")):
+                procs = cc._running_claude_ps()
+                self.assertEqual(procs, [(1, "/w", args)])
+                self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set()), expected)
+
+    def test_an_empty_cmdline_reads_as_unreadable(self):
+        with mock.patch.object(cc.sys, "platform", "linux"), mock.patch.object(cc.Path, "read_bytes", return_value=b""):
+            self.assertEqual(cc._process_argv(123), [])
+        with mock.patch.object(cc.sys, "platform", "linux"), mock.patch.object(cc.Path, "read_bytes", return_value=b"claude\0-c\0"):
+            self.assertEqual(cc._process_argv(123), ["claude", "-c"])
+
+    def test_unreadable_arguments_dont_hide_an_open_session(self):
+        with mock.patch.object(cc, "ps_table", return_value={1: (0, "", "claude --resume s")}), \
+                mock.patch.object(cc, "_process_argv", return_value=[]), \
+                mock.patch.object(cc.shutil, "which", return_value="/usr/bin/lsof"), \
+                mock.patch.object(cc.subprocess, "run", return_value=mock.Mock(stdout="p1\nn/w\n")):
+            self.assertEqual(cc._running_claude_ps(), [(1, "/w", ["claude", "--resume", "s"])])
+
+    def test_mac_argv_reads_nul_delimited_arguments(self):
+        import ctypes
+        import struct
+        args = [b"claude", b"", b"explain -p usage"]
+        data = struct.pack("i", len(args)) + b"/bin/claude\0\0" + b"\0".join(args) + b"\0ENV=value\0"
+        def sysctl(mib, count, buf, size, new, newlen):
+            self.assertEqual(list(mib), [1, 49, 123])
+            ctypes.memmove(buf, data, len(data))
+            size._obj.value = len(data)
+            return 0
+        with mock.patch.object(cc.sys, "platform", "darwin"), \
+                mock.patch("ctypes.CDLL", return_value=mock.Mock(sysctl=sysctl)):
+            self.assertEqual(cc._process_argv(123), [a.decode() for a in args])
+        with mock.patch.object(cc.sys, "platform", "darwin"), \
+                mock.patch("ctypes.CDLL", return_value=mock.Mock(sysctl=lambda *a: -1)):
+            self.assertEqual(cc._process_argv(123), [])
+
     def test_claude_detection(self):
         self.assertTrue(cc.is_claude_cmd(["/Users/me/.local/share/claude/versions/2.1.321", "--resume"]))
         self.assertTrue(cc.is_claude_cmd(["claude"]))
@@ -1384,17 +1481,79 @@ class ResumedIdsTest(unittest.TestCase):
     def test_only_the_resume_argument_counts(self):
         procs = [(1, "/w", ["claude", "--resume", "a"]), (2, "/w", ["claude", "-r", "b"]),
                  (3, "/w", ["claude", "--resume=c"]), (4, "/w", ["claude", "-p", "look at session d and --resume"]),
-                 (5, "/w", ["claude", "summarize", "e"]), (6, "/w", ["claude", "--resume"])]
+                 (5, "/w", ["claude", "summarize", "e"]), (6, "/w", ["claude", "--resume"]),
+                 (7, "/w", ["claude", "-p", "--resume", "d"]),
+                 (8, "/w", ["claude", "--print", "--resume=e"])]
         self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c"})
+
+    def test_after_double_dash_comes_the_prompt(self):
+        self.assertTrue(cc.is_print_argv(["claude", "-c", "-p", "q"]))
+        self.assertFalse(cc.is_print_argv(["claude", "--", "-p"]))
+        self.assertTrue(cc.is_print_argv(["claude", "-p", "--", "-x"]))
+        self.assertEqual([p[0] for p in cc.interactive_processes([(1, "/w", ["claude", "--", "-p"])])], [1])
+
+    def test_ps_words_dont_say_headless(self):
+        with mock.patch.object(cc, "_process_argv", return_value=[]), \
+                mock.patch.object(cc, "proc_cmdline", return_value=["claude", "-p", "q"]):
+            self.assertFalse(cc.pid_is_headless(1))
+
+    def test_a_timed_out_ps_is_reused_for_a_second(self):
+        calls = []
+        def run(*a, **kw):
+            calls.append(1)
+            raise cc.subprocess.TimeoutExpired("ps", 2)
+        clock = iter([100.0, 102.0, 102.5])  # the call starts at 100 and times out at 102
+        with mock.patch.object(cc.subprocess, "run", run), mock.patch.object(cc.time, "time", lambda: next(clock)), \
+                mock.patch.dict(cc._ps_cache, {"t": 0.0, "rows": {}}):
+            cc.ps_table(); cc.ps_table()
+        self.assertEqual(len(calls), 1)
+
+    def test_headless_pid(self):
+        with mock.patch.object(cc, "_process_argv", lambda p: {1: ["claude", "-pc", "q"], 2: ["claude", "-c"]}.get(p, [])):
+            self.assertEqual([cc.pid_is_headless(p) for p in (1, 2, None)], [True, False, False])
+
+    def test_print_flag_in_a_cluster(self):
+        for a in ("-p", "--print", "-pc", "-cp"):
+            self.assertTrue(cc.is_print_flag(a), a)
+        for a in ("-c", "--permission-mode", "-p=x", "-1p", "explain -p usage", "p"):
+            self.assertFalse(cc.is_print_flag(a), a)
+        procs = [(1, "/w", ["claude", "-pc", "query"]), (2, "/w", ["claude", "-c"])]
+        self.assertEqual([p[0] for p in cc.interactive_processes(procs)], [2])
 
 
 class GuessLiveTest(unittest.TestCase):
+    def test_headless_processes_do_not_keep_older_sessions_alive(self):
+        sessions = {k: {"id": k, "cwd": "/w/app", "last_ts": ts}
+                    for k, ts in [("old", 1), ("new", 2), ("registered", 3)]}
+        for flag in ("-p", "--print"):
+            with self.subTest(flag=flag):
+                headless = [(1, "/w/app", ["claude", flag, "summarize"])]
+                self.assertEqual(cc.guess_live_sessions(sessions, {}, headless, set()), set())
+                procs = headless + [(2, "/w/app", ["claude"]), (3, "/w/app", ["claude"]),
+                                    (4, "/w/other", ["claude"]), (5, None, ["claude"])]
+                self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set(), {3}, {"registered"}),
+                                 {"new"})
+
+    def test_only_eligible_processes_use_slots(self):
+        sessions = {k: {"id": k, "cwd": "/w", "last_ts": ts}
+                    for k, ts in [("old", 1), ("new", 2)]}
+        me = os.getpid()
+        for flag in ("-p", "--print"):
+            procs = [(me, "/w", ["claude", flag, "--resume", "old"]), (2, "/w", ["claude"])]
+            self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, cc.resumed_ids(procs)), {"new"})
+            hooks = {"old": {"pid": me, "pid_start": cc.proc_start_time(me)}}
+            self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, set()), {"new"})
+        procs = [(me, "/w", ["claude"])]
+        hooks = {"old": {"pid": me, "pid_start": cc.proc_start_time(me), "status": "ended"}}
+        self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, set()), {"new"})
+
     def test_n_processes_mark_n_newest_sessions_open(self):
         mk = lambda sid, ts: {"id": sid, "cwd": "/w/app", "last_ts": ts}
         sessions = {k: mk(k, ts) for k, ts in [("old", 1), ("mid", 2), ("new", 3), ("resumed", 0)]}
         procs = [(1, "/w/app", ["claude"]), (2, "/w/app", ["claude"]), (3, "/w/app", ["claude", "--resume", "resumed"])]
         live = cc.guess_live_sessions(sessions, {}, procs, {"resumed"})
         self.assertEqual(live, {"new", "mid"})  # 3 processes, one of them is the resumed session
+        procs[0] = (os.getpid(), "/w/app", ["claude"])
         hooks = {"new": {"pid": os.getpid(), "pid_start": cc.proc_start_time(os.getpid())}}
         self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, {"resumed"}), {"mid"})
 
@@ -1406,6 +1565,69 @@ class GuessLiveTest(unittest.TestCase):
         hooks = {"A": {"pid": me, "pid_start": start}}
         procs = [(me, "/w/app", ["claude"]), (2, "/w/app", ["claude"])]
         self.assertEqual(cc.guess_live_sessions(sessions, hooks, procs, set(), {me}, {"B"}), {"C"})
+
+    def test_headless_runs_arent_sessions(self):
+        """`claude -p` and SDK runs stay off the dashboard; one resumed in a terminal comes back."""
+        build_fixtures()
+        hl = lambda e, ep: dict(e, entrypoint=ep)
+        write_session("s-headless", [hl(user("/qta", 30), "sdk-cli"), hl(asst([text("Do you want me to run it?")], 29), "sdk-cli")])
+        write_session("s-sdk", [hl(user("summarize", 30), "sdk-ts"), hl(asst([text("Done.")], 29), "sdk-ts")])
+        write_session("s-resumed", [hl(user("try it", 30), "sdk-cli"), hl(asst([text("Ok.")], 29), "sdk-cli"),
+                                    hl(user("now interactively", 10), "cli"), hl(asst([text("Sure.")], 9), "cli")])
+        write_session("s-desktop", [hl(user("hi", 30), "claude-desktop"), hl(asst([text("Hello.")], 29), "claude-desktop")])
+        ids = set(by_id(cc.collect(True, 10 ** 6)))
+        self.assertFalse({"s-headless", "s-sdk"} & ids)
+        self.assertTrue({"s-resumed", "s-desktop", "s-closed"} <= ids)
+
+    def test_a_print_run_doesnt_hide_a_session_open_in_a_terminal(self):
+        """`claude -p --resume` writes "sdk" entries to a session still open in a terminal: it stays."""
+        build_fixtures()
+        hl = lambda e, ep: dict(e, entrypoint=ep)
+        for sid in ("s-term", "s-printing"):
+            write_session(sid, [hl(user("hi", 30), "cli"), hl(user("run it", 5), "sdk-cli"), hl(asst([text("Done.")], 4), "sdk-cli")])
+        peers = {"s-term": {"name": None, "pid": 1, "pids": [1]}, "s-printing": {"name": None, "pid": 2, "pids": [2]}}
+        with mock.patch.object(cc, "peer_sessions", lambda: peers), \
+             mock.patch.object(cc, "pid_is_headless", lambda p: p == 2):
+            ids = set(by_id(cc.collect(True, 10 ** 6)))
+        self.assertIn("s-term", ids)  # an interactive process runs it
+        self.assertNotIn("s-printing", ids)  # only the print run itself has it open
+        me = os.getpid()
+        hooks = {"s-h": {"pid": me, "pid_start": cc.proc_start_time(me)}, "s-ended": {"pid": me, "status": "ended"}}
+        with mock.patch.object(cc, "pid_is_headless", lambda p: False):
+            self.assertTrue(cc.has_live_owner("s-h", hooks, {}, {}, set()))
+            self.assertTrue(cc.has_live_owner("s-h", hooks, {}, {me: "s-h"}, set()))
+            self.assertFalse(cc.has_live_owner("s-h", hooks, {}, {me: "s-b"}, set()))  # /resume moved it to s-b
+            self.assertFalse(cc.has_live_owner("s-ended", hooks, {}, {}, set()))
+            self.assertFalse(cc.has_live_owner("s-none", hooks, {}, {}, set()))
+            self.assertTrue(cc.has_live_owner("s-none", hooks, {}, {}, {"s-none"}))  # an interactive --resume
+        with mock.patch.object(cc, "pid_is_headless", lambda p: p == me):
+            self.assertFalse(cc.has_live_owner("s-h", hooks, {}, {}, set()))  # an older release's hook from a -p run
+
+    def test_duplicate_sessions_filter_headless_after_selecting_latest(self):
+        for older_ep, newer_ep, has_prompt in (("cli", "sdk-cli", True),
+                                               ("sdk-cli", "cli", True),
+                                               ("cli", "sdk-cli", False)):
+            for newest_first in (False, True):
+                with self.subTest(older=older_ep, newer=newer_ep, prompt=has_prompt,
+                                  newest_first=newest_first), tempfile.TemporaryDirectory() as tmp:
+                    projects = Path(tmp) / "projects"
+                    paths = []
+                    for folder, ep, minutes in (("old", older_ep, 30), ("new", newer_ep, 10)):
+                        path = projects / folder / "duplicate.jsonl"
+                        path.parent.mkdir(parents=True)
+                        entry = user("hello", minutes) if folder == "old" or has_prompt else asst([text("Done.")], minutes)
+                        path.write_text(json.dumps(dict(entry, entrypoint=ep)) + "\n")
+                        paths.append(path)
+                    if newest_first:
+                        paths.reverse()
+                    with mock.patch.object(cc, "PROJECTS_DIR", projects), \
+                         mock.patch.object(cc, "CACHE_FILE", Path(tmp) / "cache.json"), \
+                         mock.patch.object(Path, "glob", lambda _, pattern: iter(paths) if pattern == "*/*.jsonl" else iter(())):
+                        for _ in range(2):  # parse first, then reuse cached transcripts
+                            sessions = cc.scan_transcripts()  # the latest copy wins; collect drops headless ones
+                            selected = sessions["duplicate"]
+                            self.assertEqual(selected["entrypoint"], newer_ep if has_prompt else older_ep)
+                            self.assertEqual(selected["last_ts"], cc.parse_transcript(projects / ("new" if has_prompt else "old") / "duplicate.jsonl")["last_ts"])
 
     def test_registry_sessions_use_up_their_process(self):
         # registry session A is open in /w/app; B is newer and closed: one process, so only A
@@ -1421,6 +1643,41 @@ class MacDesktopTest(unittest.TestCase):
         i = cc.mac_terminal_command("/tmp", ["claude"], "iterm")
         self.assertIn('tell application "iTerm"', i)
         self.assertTrue(any("write text" in x for x in i))
+
+    def test_resume_opens_the_terminal_you_use(self):
+        """Both installed: the app most open sessions run in, else the one the dashboard started from."""
+        procs = {  # pid: (ppid, command)
+            10: (9, "claude"), 9: (8, "-zsh"), 8: (7, "login -pfl me"), 7: (1, "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
+            20: (19, "claude"), 19: (18, "-zsh"), 18: (1, "/Applications/iTerm.app/Contents/MacOS/iTerm2 --server login"),
+            30: (1, "claude"),  # no terminal above it (an IDE, ssh, …)
+            40: (8, "claude look at /Applications/iTerm.app/Contents/Info.plist"),  # in Terminal; its prompt names iTerm
+            50: (51, "claude"), 51: (1, "/Users/me/Local Apps/iTerm.app/Contents/MacOS/iTerm2"),  # a space in the path
+        }
+        exact = {51: ["/Users/me/Local Apps/iTerm.app/Contents/MacOS/iTerm2"]}  # what the kernel says; ps splits it
+        def app_for(peers, term_program=""):
+            def peer(p):  # a pid, or a list: one session in several processes
+                ps = p if isinstance(p, list) else [p]
+                return {"pid": ps[0], "pids": ps}
+            with mock.patch.object(cc, "peer_sessions", lambda: {f"s{i}": peer(p) for i, p in enumerate(peers)}), \
+                    mock.patch.object(cc, "proc_ppid", lambda p: procs.get(p, (None,))[0]), \
+                    mock.patch.object(cc, "proc_cmdline", lambda p: procs[p][1].split() if p in procs else []), \
+                    mock.patch.object(cc, "_process_argv", lambda p: exact.get(p, [])), \
+                    mock.patch.object(cc.Path, "exists", lambda self: "iTerm.app" in str(self)), \
+                    mock.patch.dict(os.environ, {"TERM_PROGRAM": term_program}):
+                cmd = cc.mac_terminal_command("/tmp", ["claude"])
+            return "iterm" if 'tell application "iTerm"' in cmd else "terminal"
+        self.assertEqual(app_for([10]), "terminal")             # iTerm installed, but you work in Terminal
+        self.assertEqual(app_for([20, 10, 20]), "iterm")        # most sessions
+        self.assertEqual(app_for([10, 20]), "terminal")         # a tie: Terminal
+        self.assertEqual(app_for([40]), "terminal")             # only the program counts, not a path in a prompt
+        self.assertEqual(app_for([50], "Apple_Terminal"), "iterm")  # iTerm in a folder with a space
+        self.assertEqual(app_for([[30, 20]], "Apple_Terminal"), "iterm")  # open in an IDE and in iTerm
+        self.assertEqual(app_for([[20, 50], 10]), "terminal")    # one vote per session (a tie), not per process
+        self.assertEqual(app_for([30], "Apple_Terminal"), "terminal")  # no session says: where the dashboard started
+        self.assertEqual(app_for([], "iTerm.app"), "iterm")
+        self.assertEqual(app_for([]), "iterm")                  # nothing says: iTerm when it's installed, as before
+        with mock.patch.object(cc.Path, "exists", lambda self: False):
+            self.assertIn('tell application "Terminal" to activate', cc.mac_terminal_command("/tmp", ["claude"]))
 
     def test_focus_commands(self):
         gnome = {"GNOME_TERMINAL_SCREEN": "/org/gnome/Terminal/screen/ecdaf156_8be8_4402_9d37_193ec38ead77"}
