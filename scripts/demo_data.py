@@ -80,6 +80,8 @@ class Session:
 FAKE_GH = r'''#!/usr/bin/env python3
 import json, sys
 PRS = __PRS__
+if sys.argv[1:3] == ["api", "graphql"]:  # the PR view's query: your open PRs
+    print(json.dumps({"data": {"viewer": {"login": "you"}, "mine": {"nodes": __PLAN__}}})); sys.exit(0)
 if sys.argv[1:3] == ["search", "prs"]:
     print(json.dumps(__REVIEWS__)); sys.exit(0)
 if sys.argv[1:3] == ["pr", "view"]:
@@ -99,6 +101,16 @@ def pr(n, title, state="OPEN", draft=False, review="", checks="SUCCESS", mergeab
                                        "conclusion": "" if checks == "PENDING" else checks}]
     return {"number": n, "title": title, "state": state, "isDraft": draft, "reviewDecision": review,
             "mergeable": mergeable, "statusCheckRollup": roll, "headRefName": head}
+
+
+def gql(repo, n, title, head, base="main", draft=False, merge="CLEAN", review=None, checks="SUCCESS", said=(), mins=60):
+    """One PR as the PR view's GraphQL query returns it. said: who wrote last on each open review thread."""
+    return {"url": REPO.format(repo, n), "number": n, "title": title, "isDraft": draft, "updatedAt": ts(mins),
+            "headRefName": head, "baseRefName": base, "mergeStateStatus": merge, "reviewDecision": review,
+            "repository": {"nameWithOwner": "acme/" + repo, "defaultBranchRef": {"name": "main"}}, "author": {"login": "you"},
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": checks} if checks else None}}]},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False},
+                              "nodes": [{"isResolved": False, "comments": {"nodes": [{"author": {"login": a}}]}} for a in said]}}
 
 
 def build(home, pid):
@@ -160,7 +172,18 @@ def build(home, pid):
                 "updatedAt": ts(90)}]
     gh = home / "bin" / "gh"
     gh.parent.mkdir(parents=True, exist_ok=True)
-    gh.write_text(FAKE_GH.replace("__PRS__", repr(prs)).replace("__REVIEWS__", repr(reviews)))
+    plan = [  # one or more PRs per step of the PR view
+        gql("dashboard", 212, "CSV export for reports", "feat/csv-export", checks="FAILURE", said=("reviewbot",), mins=19),
+        gql("billing-api", 88, "Rate-limit public API", "feat/rate-limit", review="CHANGES_REQUESTED", said=("dana", "reviewbot"), mins=34),
+        gql("web-app", 301, "Node 22 LTS", "chore/node-22", checks="PENDING", mins=3),
+        gql("web-app", 299, "Settings dark mode", "feat/settings-dark", draft=True, mins=7),
+        gql("billing-api", 90, "Cache exchange rates", "feat/fx-cache", merge="BLOCKED", review="REVIEW_REQUIRED", mins=49),
+        gql("billing-api", 93, "Refresh cached rates hourly", "feat/fx-refresh", base="feat/fx-cache", mins=45),
+        gql("tooling", 55, "Pin GitHub Actions to commit SHAs", "ci/pin-actions", said=("you", "you"), mins=300),
+        gql("storefront", 140, "Lazy-load product images", "perf/lazy-images", mins=150),
+        gql("web-app", 256, "Remove old feature flags", "chore/flags", merge="DIRTY", mins=30 * 1440),
+    ]
+    gh.write_text(FAKE_GH.replace("__PRS__", repr(prs)).replace("__REVIEWS__", repr(reviews)).replace("__PLAN__", repr(plan)))
     gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
 
     data = home / ".claude" / "ccdeck"

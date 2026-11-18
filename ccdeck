@@ -34,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -41,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -52,6 +53,7 @@ MARKS_FILE = DATA_DIR / "marks.json"
 CACHE_FILE = DATA_DIR / "index-cache.json"
 PR_CACHE_FILE = DATA_DIR / "prs.json"
 REVIEWS_FILE = DATA_DIR / "reviews.json"  # open PRs that ask you for a review
+PR_PLAN_FILE = DATA_DIR / "pr-plan.json"  # your open PRs with what the PR focus plan needs
 LAST_LIST_FILE = DATA_DIR / "last-list.json"
 TOKEN_FILE = DATA_DIR / "token"
 DAEMON_FILE = DATA_DIR / "daemon.json"
@@ -137,6 +139,9 @@ def dim(t):
 
 def load_json(path, default):
     try:
+        if path.parent == DATA_DIR and path.exists():
+            path.parent.chmod(0o700)
+            path.chmod(0o600)
         with open(path, encoding="utf-8") as f:
             val = json.load(f)
     except (OSError, ValueError):
@@ -147,11 +152,19 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=1)
-    os.replace(tmp, path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.parent == DATA_DIR:
+        path.parent.chmod(0o700)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def parse_ts(s):
@@ -941,15 +954,232 @@ def fetch_review_requests(scope=None):
     return out
 
 
-def review_requests(sessions):
+def review_requests(sessions, items=None):
     """Cached review requests, less PRs that one of your sessions made. Nothing while the cache
     was fetched for another setting (the PR loop fetches again within seconds)."""
     own = {p["url"] for s in sessions for p in s.get("pr_details") or [] if p.get("own")}
     cache = load_json(REVIEWS_FILE, {}) or {}
-    if cache.get("scope", "all") != review_scope():
+    if items is None and cache.get("scope", "all") != review_scope():
         return []
-    items = cache.get("items") or []
+    items = (cache.get("items") or []) if items is None else items
     return [r for r in items if r.get("url") not in own]
+
+
+# Authored search is capped; expose GitHub pagination state to both consumers.
+PR_PLAN_QUERY = """query {
+  viewer { login }
+  mine: search(type: ISSUE, query: "is:pr is:open author:@me archived:false", first: 100) { pageInfo { hasNextPage } nodes { ... on PullRequest {
+    url number title isDraft updatedAt headRefName baseRefName mergeStateStatus reviewDecision
+    headRepository { nameWithOwner }
+    repository { nameWithOwner defaultBranchRef { name } } author { login }
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    reviewThreads(first: 100) { pageInfo { hasNextPage endCursor } nodes { isResolved comments(last: 1) { nodes { author { login } } } } }
+  } } }
+}"""
+ROLLUP = {"SUCCESS": "passing", "FAILURE": "failing", "ERROR": "failing", "PENDING": "pending", "EXPECTED": "pending"}
+STALE_AFTER = 14 * 86400
+
+
+def fetch_pr_plan():
+    """Your open PRs with CI, merge state and who spoke last on each open review thread, in one
+    GraphQL call (about 50 points for 20 PRs). Off with CCDECK_PR_PLAN=0."""
+    global _plan_state
+    if os.environ.get("CCDECK_PR_PLAN") == "0" or not shutil.which("gh"):
+        return None
+    try:
+        r = subprocess.run(["gh", "api", "graphql", "-f", "query=" + PR_PLAN_QUERY],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        _plan_state = "auth_required" if any(word in r.stderr.lower() for word in ("auth login", "authentication", "401", "not logged")) else "failed"
+        return None
+    try:
+        data = json.loads(r.stdout)["data"]
+        for node in (data.get("mine") or {}).get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            threads = node.get("reviewThreads") or {}
+            seen = set()
+            while (threads.get("pageInfo") or {}).get("hasNextPage"):
+                cursor = (threads.get("pageInfo") or {}).get("endCursor")
+                if not cursor or cursor in seen:
+                    break
+                seen.add(cursor)
+                query = """query($url: URI!, $cursor: String!) {
+                  resource(url: $url) { ... on PullRequest {
+                    reviewThreads(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { isResolved comments(last: 1) { nodes { author { login } } } }
+                    }
+                  } }
+                }"""
+                try:
+                    page = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query,
+                                           "-f", "url=" + node["url"], "-f", "cursor=" + cursor],
+                                          capture_output=True, text=True, timeout=30)
+                except (OSError, subprocess.SubprocessError):
+                    break  # retain the authored rows with an explicitly unknown review status
+                try:
+                    more = json.loads(page.stdout)["data"]["resource"]["reviewThreads"] if page.returncode == 0 else None
+                    if not isinstance(more, dict) or not isinstance(more.get("nodes"), list) or not isinstance(more.get("pageInfo", {}).get("hasNextPage"), bool):
+                        break
+                    threads.setdefault("nodes", []).extend(more["nodes"])
+                    threads["pageInfo"] = more["pageInfo"]
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    break
+        return parse_pr_plan(data)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+_plan_state = "pending"
+
+
+def refresh_pr_plan():
+    """Serialize observations across daemon and CLI processes; cache writes are best effort."""
+    global _plan_state
+    if os.environ.get("CCDECK_PR_PLAN") == "0":
+        _plan_state = "disabled"
+        return None
+    lock = None
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        DATA_DIR.chmod(0o700)
+        fd = os.open(DATA_DIR / "pr-plan.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        lock = os.fdopen(fd, "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError as e:
+        if lock:
+            lock.close()
+            lock = None
+        print(f"Warning: PR cache lock unavailable: {e}", file=sys.stderr)
+    try:
+        _plan_state = "pending"
+        plan = fetch_pr_plan()
+        _plan_state = "ready" if plan is not None else ("auth_required" if _plan_state == "auth_required" else "failed")
+        if plan is not None:
+            plan = dict(plan, fetched=time.time())
+            if lock:
+                try:
+                    save_json(PR_PLAN_FILE, plan)
+                except OSError as e:
+                    print(f"Warning: could not save PR plan: {e}", file=sys.stderr)
+        return plan
+    finally:
+        if lock:
+            lock.close()
+
+
+def parse_pr_plan(d):
+    """GraphQL data -> {"viewer", "prs"}."""
+    viewer = (d.get("viewer") or {}).get("login") or ""
+    prs = []
+    for n in (d.get("mine") or {}).get("nodes") or []:
+        if not isinstance(n, dict) or not isinstance(n.get("url"), str):
+            continue
+        repo = n.get("repository") or {}
+        commit = (((n.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+        rollup = (commit.get("statusCheckRollup") or {}).get("state")
+        last = [((((t.get("comments") or {}).get("nodes") or [{}])[0] or {}).get("author") or {}).get("login")
+                for t in (n.get("reviewThreads") or {}).get("nodes") or [] if not t.get("isResolved")]
+        prs.append({
+            "url": n["url"], "number": n.get("number"), "title": n.get("title") or "",
+            "repo": repo.get("nameWithOwner") or "", "draft": bool(n.get("isDraft")),
+            "updated": parse_ts(n.get("updatedAt")) or 0,
+            "head_repo": (n.get("headRepository") or {}).get("nameWithOwner") or "",
+            "head": n.get("headRefName") or "", "base": n.get("baseRefName") or "",
+            "default_base": (repo.get("defaultBranchRef") or {}).get("name") or "",
+            "merge": (n.get("mergeStateStatus") or "unknown").lower(),  # clean | blocked | behind | dirty | unstable | unknown
+            "review": (n.get("reviewDecision") or "").lower(),
+            "checks": ROLLUP.get(rollup, "none") if rollup else "none",
+            # someone else spoke last: work for the author; you did: only you can resolve the thread
+            "threads": sum(1 for a in last if a != viewer), "threads_yours": sum(1 for a in last if a == viewer),
+            "threads_more": bool((((n.get("reviewThreads") or {}).get("pageInfo")) or {}).get("hasNextPage")),
+        })
+    return {"viewer": viewer, "prs": prs, "truncated": bool(((d.get("mine") or {}).get("pageInfo") or {}).get("hasNextPage"))}
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def pr_step(p, stacked_on=None, session=None, now=None):
+    """(step, texts, who) for one of your open PRs. Steps: 1 merge, 2 fix, 4 waiting, 5 clean up
+    (3, review, is for review requests). stacked_on: the open PR whose branch this one targets.
+    session: name of a running session that owns the PR; it gets the fixes. who None: nobody."""
+    if p["draft"]:
+        return (4, ["Draft: the session is still on it"], None) if session else (5, ["Draft: finish or close"], "you")
+    fix = []
+    if p["checks"] == "failing":
+        fix.append("CI failing")
+    if p["merge"] == "dirty":
+        fix.append(f"Conflicts with {p['base']}")
+    if p["review"] == "changes_requested":
+        fix.append("Changes requested")
+    if p["threads"] and not p.get("threads_more"):
+        fix.append(plural(p["threads"], "review comment") + " to answer")
+    days = int(((now or time.time()) - p["updated"]) // 86400)
+    stale = [f"No activity for {days} days: close or pick up"] if days * 86400 >= STALE_AFTER else None
+    if fix:
+        # untouched for weeks and no session on it: decide its fate before fixing it
+        return (5, stale + fix, "you") if stale and not session else (2, fix, session or "you")
+    if p.get("threads_more"):
+        return 4, ["Review status unknown: check GitHub"], None
+    if p["merge"] == "blocked" and p["threads_yours"]:
+        return 2, ["Resolve " + plural(p["threads_yours"], "thread"), "Waiting for a review or a required check"], "you"
+    if stacked_on:
+        wait = f"After #{stacked_on} merges"
+    elif p["checks"] == "pending":
+        wait = "CI running"
+    elif p["merge"] == "blocked":
+        wait = "Waiting for a review or a required check"
+    elif p["merge"] not in ("clean", "has_hooks", "unstable", "behind"):
+        wait = "GitHub is still checking whether it can merge"
+    else:
+        texts = ["Resolve " + plural(p["threads_yours"], "thread")] if p["threads_yours"] else []
+        if p["merge"] == "behind":
+            texts.append("Update the branch")
+        return 1, texts + ["Merge it"], "you"
+    return (5, stale, "you") if stale else (4, [wait], None)
+
+
+def pr_plan(sessions, saved=None, reviews=None):
+    """Your saved PRs with their step, who acts and the owning session (`own` in pr_details), plus
+    review requests as step 3."""
+    disabled = os.environ.get("CCDECK_PR_PLAN") == "0"
+    saved = {} if disabled else (load_json(PR_PLAN_FILE, {}) if saved is None else saved)
+    saved = saved or {}
+    required = {"url", "repo", "head", "base", "default_base", "number", "title", "draft", "checks", "merge", "review", "threads", "threads_yours", "updated"}
+    cached_prs = saved.get("prs")
+    prs = [p for p in (cached_prs if isinstance(cached_prs, list) else []) if isinstance(p, dict) and required <= p.keys()
+           and all(isinstance(p[k], str) for k in ("url", "repo", "head", "base", "default_base", "checks", "merge", "review"))
+           and all(isinstance(p[k], (int, float)) for k in ("threads", "threads_yours", "updated"))]
+    by_url = {p["url"]: p for p in prs}
+    owner = {}
+    for session in sessions:
+        for detail in session.get("pr_details") or []:
+            url = detail["url"]
+            row = by_url.get(url) or {}
+            owns = detail.get("own") or detail.get("source") == "created" or bool(row.get("head") and row["head"] == session.get("branch"))
+            if owns and (url not in owner or session.get("alive")):
+                owner[url] = session
+    heads = {(p.get("head_repo"), p["head"]): p["number"] for p in prs if p.get("head_repo")}
+    rows = []
+    for p in prs:
+        s = owner.get(p["url"])
+        name = (s.get("peer_name") or s["id"][:8]) if s else None
+        stacked = heads.get((p["repo"], p["base"])) if p["base"] != p["default_base"] else None
+        step, texts, who = pr_step(p, stacked, name if s and s.get("alive") else None)
+        rows.append(dict(p, step=step, texts=texts, who=who, stacked_on=stacked, author=saved.get("viewer") or "",
+                         session={"id": s["id"], "name": name, "alive": bool(s.get("alive"))} if s else None))
+    mine = {p["url"] for p in prs}
+    for r in review_requests([], reviews):
+        if r["url"] not in mine:  # your own PR can be asked of a team you're in; it's already listed
+            rows.append(dict(r, step=3, texts=["Review it"], who="you", session=None))
+    rows.sort(key=lambda r: (r["step"], r.get("updated") or 0))
+    return {"fetched": saved.get("fetched"), "viewer": saved.get("viewer"), "rows": rows,
+            "disabled": disabled, "truncated": saved.get("truncated", False), "state": "disabled" if disabled else _plan_state}
 
 
 def pr_cache():
@@ -1946,7 +2176,7 @@ class Dashboard:
             "gh": bool(shutil.which("gh")), "hooks": hooks_active(),
             "default_days": DEFAULT_DAYS, "port": self.port, "gh_install": GH_INSTALL, "preview": PREVIEW,
             "reviews": review_requests(sessions), "settings": settings_view(),
-            "notifications": inbox_items(),
+            "notifications": inbox_items(), "plan": pr_plan(sessions),
         }
         etag = hashlib.sha1(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:16]
         snap["generated"] = time.time()
@@ -2004,6 +2234,15 @@ class Dashboard:
         except OSError:
             pass
         os.execv(sys.executable, [sys.executable, target[1], "serve", "--port", str(self.port)])
+
+    def plan_loop(self):
+        while True:
+            try:
+                if refresh_pr_plan() is not None:
+                    self.wake.set()
+            except Exception as e:
+                print(f"pr plan error: {e!r}", file=sys.stderr)
+            time.sleep(300)
 
     def pr_loop(self):
         last_reviews = 0
@@ -2171,6 +2410,7 @@ class Dashboard:
         self.heartbeat()
         threading.Thread(target=self.scan_loop, daemon=True).start()
         threading.Thread(target=self.pr_loop, daemon=True).start()
+        threading.Thread(target=self.plan_loop, daemon=True).start()
         httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self.make_handler())
         httpd.daemon_threads = True
         print(f"ccdeck dashboard on http://localhost:{self.port}", flush=True)
@@ -2308,6 +2548,41 @@ def cmd_list(args):
         print(dim(f"\nDashboard: http://localhost:{load_json(DAEMON_FILE, {}).get('port', DEFAULT_PORT)}"))
 
 
+PR_STEPS = {1: "MERGE", 2: "FIX", 3: "REVIEW", 4: "WAITING", 5: "CLEAN UP"}
+
+
+def cmd_prs(args):
+    # Invocation-local results: CLI credentials may differ from the daemon's credentials.
+    plan = fetch_pr_plan()
+    unavailable = plan is None and os.environ.get("CCDECK_PR_PLAN") != "0"
+    if unavailable:
+        print("Authored PR list unavailable; check gh auth login.", file=sys.stderr)
+    scope = review_scope()
+    items = fetch_review_requests(scope)
+    if items is None and scope != "off":
+        print("Review requests unavailable; check gh auth login.", file=sys.stderr)
+    assembled = pr_plan(collect(include_all=True, days=10 ** 6),
+                        saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])
+    rows = assembled["rows"]
+    if assembled["truncated"]:
+        print("Warning: authored PRs limited to the first 100 results; stack targets may be missing.", file=sys.stderr)
+    if args.sessions:
+        rows = [r for r in rows if r["session"] or r["step"] == 3]
+    if not rows:
+        print("No available PR data." if unavailable else "No open PRs.")
+    width = shutil.get_terminal_size((120, 20)).columns
+    for step, label in PR_STEPS.items():
+        part = [r for r in rows if r["step"] == step]
+        if not part:
+            continue
+        print("\n" + bold(f"{step}. {label}") + dim(f"  {len(part)}"))
+        for r in part:
+            who, s = r["who"] or "", r["session"]
+            print(f"  {r['repo']}#{r['number']}  {one_line(r['title'], max(20, width - 70))}")
+            print(dim("      " + " · ".join(r["texts"]) + (f"  → {who}" if who else "")
+                      + (f"  [@{s['name']}]" if s and s["name"] != who else "")))
+
+
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -2405,6 +2680,26 @@ def cmd_mark(action):
 
 def cmd_resume(args):
     s = resolve(args.id)
+    peers = peer_sessions()
+    peer = peers.get(s["id"])
+    pids = (peer.get("pids") or [peer["pid"]]) if peer else []
+    if not peer and not args.extra:
+        registered = {pid for entry in peers.values() for pid in entry.get("pids", [entry["pid"]])}
+        pids = [p[0] for p in running_claude_processes() if p[0] not in registered and s["id"] in resumed_ids([p])]
+        hook = load_states().get(s["id"]) or {}
+        pid = hook.get("pid")
+        if (pid and pid not in registered and pid not in pids and not hook.get("headless")
+                and hook.get("status") != "ended" and hook.get("pid_start") is not None
+                and pid_alive(pid, hook["pid_start"])):
+            pids.append(pid)
+
+    if pids and not args.extra:
+        # already open: a second `claude --resume` would fork it, so go to its tab, like the dashboard does
+        label = next((label for pid in pids if (label := focus_terminal(pid))), None)
+        if label:
+            print(f"Switched to its {label} tab (@{(peer or {}).get('name') or s['id'][:8]}).")
+            return
+        sys.exit(f"Already open (@{(peer or {}).get('name') or s['id'][:8]}) in a terminal ccdeck can't switch to.")
     claude = shutil.which("claude")
     if not claude:
         sys.exit("`claude` is not on PATH.")
@@ -3367,7 +3662,9 @@ def main():
     s = sub.add_parser("note", help="attach a note (empty clears it)")
     s.add_argument("id")
     s.add_argument("text", nargs="*")
-    s = sub.add_parser("resume", help="resume a session in its folder")
+    s = sub.add_parser("prs", help="your open PRs in steps: merge, fix, review, wait, clean up")
+    s.add_argument("--sessions", action="store_true", help="only PRs one of your sessions owns, plus review requests")
+    s = sub.add_parser("resume", help="go to an open session's tab, or resume it in its folder")
     s.add_argument("id")
     s.add_argument("extra", nargs=argparse.REMAINDER)
     for name, hlp in (("serve", "run the dashboard server"), ("open", "open the dashboard")):
@@ -3404,7 +3701,7 @@ def main():
     args = p.parse_args()
 
     handlers = {
-        None: cmd_list, "list": cmd_list, "show": cmd_show, "resume": cmd_resume,
+        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
         "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,

@@ -40,6 +40,21 @@ if sys.argv[1:3] == ["search", "prs"]:
         {"number": 7, "title": "Mine, reviewer added me", "url": "https://github.com/me/app/pull/7", "isDraft": False,
          "repository": {"name": "app", "nameWithOwner": "me/app"}, "author": {"login": "me"}, "updatedAt": "2026-01-01T09:00:00Z"}][:1 if direct else 2]))
     sys.exit(0)
+if sys.argv[1:3] == ["api", "graphql"]:
+    def node(n, **kw):
+        return dict({"url": f"https://github.com/me/app/pull/{n}", "number": n, "title": f"PR {n}", "isDraft": False,
+                     "updatedAt": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+                     "headRepository": {"nameWithOwner": "me/app"}, "headRefName": f"b{n}", "baseRefName": "main",
+                     "mergeStateStatus": "CLEAN", "reviewDecision": None, "author": {"login": "me"},
+                     "repository": {"nameWithOwner": "me/app", "defaultBranchRef": {"name": "main"}},
+                     "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
+                     "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}}, **kw)
+    said = lambda who: {"isResolved": False, "comments": {"nodes": [{"author": {"login": who}}]}}
+    print(json.dumps({"data": {"viewer": {"login": "me"}, "mine": {"nodes": [
+        node(7, reviewThreads={"pageInfo": {"hasNextPage": False}, "nodes": [said("me"), said("bot"), {"isResolved": True}]}),
+        node(8, baseRefName="b7", commits={"nodes": [{"commit": {"statusCheckRollup": None}}]}),
+        node(9, reviewThreads={"pageInfo": {"hasNextPage": True}, "nodes": []})]}}}))
+    sys.exit(0)
 url = sys.argv[3]
 n = int(url.rsplit("/", 1)[1])
 fixtures = {
@@ -229,6 +244,139 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual([r["number"] for r in cc.review_requests([])], [6, 7])
         cc.REVIEWS_FILE.unlink()
 
+    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"})
+    def test_pr_plan_parse_stack_and_owner(self):
+        self.addCleanup(lambda: cc.PR_PLAN_FILE.unlink(missing_ok=True))
+        self.addCleanup(lambda: cc.REVIEWS_FILE.unlink(missing_ok=True))
+        plan = cc.fetch_pr_plan()
+        p7, p8, p9 = plan["prs"]
+        self.assertEqual((p7["threads"], p7["threads_yours"], p7["checks"]), (1, 1, "passing"))  # resolved one ignored
+        self.assertEqual(p8["checks"], "none")
+        self.assertTrue(p9["threads_more"])
+        cc.save_json(cc.PR_PLAN_FILE, dict(plan, fetched=time.time()))
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests()})
+        sess = [{"id": "abcdef123456", "peer_name": "app-1", "alive": True, "pr_details": [{"url": p8["url"], "own": True}]}]
+        rows = {r["number"]: r for r in cc.pr_plan(sess)["rows"]}
+        self.assertEqual((rows[7]["step"], rows[7]["texts"]), (2, ["1 review comment to answer"]))
+        self.assertEqual((rows[8]["step"], rows[8]["stacked_on"]), (4, 7))  # targets PR 7's branch
+        self.assertEqual(rows[8]["session"], {"id": "abcdef123456", "name": "app-1", "alive": True})
+        self.assertEqual((rows[9]["step"], rows[9]["texts"]), (4, ["Review status unknown: check GitHub"]))
+        self.assertEqual((rows[6]["step"], rows[6]["texts"]), (3, ["Review it"]))  # a review request, not yours
+
+    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "0"})
+    def test_plan_disabled(self):
+        self.assertIsNone(cc.fetch_pr_plan())
+        review = {"url": "https://github.com/me/app/pull/44", "number": 44}
+        result = cc.pr_plan([], saved={"prs": [{}]}, reviews=[review])
+        self.assertTrue(result["disabled"])
+        self.assertEqual([r["number"] for r in result["rows"]], [44])
+
+    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"})
+    def test_plan_ownership_reviews_and_forks(self):
+        plan = cc.fetch_pr_plan()
+        a, b, _ = plan["prs"]
+        sessions = [{"id": "running", "alive": True, "branch": b["head"],
+                     "pr_details": [{"url": b["url"], "source": "claude"}]},
+                    {"id": "closed", "alive": False, "branch": b["head"],
+                     "pr_details": [{"url": b["url"], "source": "claude"}]}]
+        rows = {r["number"]: r for r in cc.pr_plan(sessions, plan, cc.fetch_review_requests())["rows"]}
+        self.assertEqual(rows[8]["session"]["id"], "running")
+        self.assertIn(6, rows)
+        a["head_repo"] = "fork/app"
+        rows = {r["number"]: r for r in cc.pr_plan(sessions, plan, [])["rows"]}
+        self.assertIsNone(rows[8]["stacked_on"])
+        self.assertEqual(cc.pr_plan([], {"prs": [{}]}, [])["rows"], [])
+
+    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"})
+    def test_review_thread_pagination(self):
+        node = {"url": "https://github.com/me/app/pull/1", "mergeStateStatus": "CLEAN", "reviewThreads": {
+            "nodes": [{"isResolved": True}] * 100,
+            "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}
+        first = {"data": {"viewer": {"login": "me"}, "mine": {"nodes": [node]}}}
+        last = {"data": {"resource": {"reviewThreads": {"nodes": [{"isResolved": True}],
+                "pageInfo": {"hasNextPage": False}}}}}
+        responses = [type("R", (), {"returncode": 0, "stdout": json.dumps(data)}) for data in (first, last)]
+        with mock.patch.object(cc.subprocess, "run", side_effect=responses) as run:
+            plan = cc.fetch_pr_plan()
+        self.assertEqual(run.call_count, 2)
+        self.assertFalse(plan["prs"][0]["threads_more"])
+        self.assertEqual(plan["prs"][0]["threads"], 0)
+        self.assertEqual(cc.pr_step(plan["prs"][0], now=1)[0], 1)
+        import subprocess
+        with mock.patch.object(cc.subprocess, "run", side_effect=[responses[0], subprocess.TimeoutExpired("gh", 30)]):
+            incomplete = cc.fetch_pr_plan()
+        self.assertTrue(incomplete["prs"][0]["threads_more"])
+        self.assertEqual(cc.pr_step(incomplete["prs"][0], now=1)[0], 4)
+
+
+    def test_resume_focus_and_extra_arguments(self):
+        from argparse import Namespace
+        session = {"id": "exact", "cwd": "", "mark": {}}
+        with mock.patch.object(cc, "resolve", return_value=session), \
+             mock.patch.object(cc, "peer_sessions", return_value={"exact": {"pid": 11, "pids": [11, 12]}}), \
+             mock.patch.object(cc, "focus_terminal", side_effect=[None, "tmux"]) as focus, \
+             mock.patch.object(cc.os, "execv") as execv:
+            cc.cmd_resume(Namespace(id="exact", extra=[]))
+            self.assertEqual(focus.call_args_list, [mock.call(11), mock.call(12)])
+            execv.assert_not_called()
+            with mock.patch.object(cc.shutil, "which", return_value="/fake/claude"):
+                cc.cmd_resume(Namespace(id="exact", extra=["--continue"]))
+            execv.assert_called_once_with("/fake/claude", ["/fake/claude", "--resume", "exact", "--continue"])
+        with mock.patch.object(cc, "resolve", return_value=session), \
+             mock.patch.object(cc, "peer_sessions", return_value={}), \
+             mock.patch.object(cc, "running_claude_processes", return_value=[(21, "/tmp", ["claude", "--resume", "exact"])]), \
+             mock.patch.object(cc, "focus_terminal", return_value=None) as focus, \
+             mock.patch.object(cc.os, "execv") as execv:
+            with self.assertRaises(SystemExit):
+                cc.cmd_resume(Namespace(id="exact", extra=[]))
+            focus.assert_called_once_with(21)
+            execv.assert_not_called()
+
+    def test_private_cache(self):
+        target = TMP / "private-cache" / "plan.json"
+        cc.save_json(target, {"private": True})
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_pr_step(self):
+        now = time.time()
+        base = {"draft": False, "checks": "passing", "merge": "clean", "review": "", "base": "main",
+                "threads": 0, "threads_yours": 0, "threads_more": False, "updated": now}
+        old = now - 20 * 86400
+        cases = [  # (changes, stacked_on, session, expected)
+            ({}, None, None, (1, ["Merge it"], "you")),
+            ({"threads_yours": 2, "merge": "behind"}, None, None, (1, ["Resolve 2 threads", "Update the branch", "Merge it"], "you")),
+            ({"checks": "failing", "threads": 1}, None, "s1", (2, ["CI failing", "1 review comment to answer"], "s1")),
+            ({"merge": "dirty", "review": "changes_requested"}, None, None, (2, ["Conflicts with main", "Changes requested"], "you")),
+            ({"threads_more": True}, None, None, (4, ["Review status unknown: check GitHub"], None)),  # never Merge past one page
+            ({"checks": "failing"}, 9, None, (2, ["CI failing"], "you")),  # a fix comes before waiting for the base PR
+            ({}, 9, None, (4, ["After #9 merges"], None)),
+            ({"checks": "pending"}, None, None, (4, ["CI running"], None)),
+            ({"merge": "blocked", "threads_yours": 1}, None, None, (2, ["Resolve 1 thread", "Waiting for a review or a required check"], "you")),
+            ({"merge": "blocked"}, None, None, (4, ["Waiting for a review or a required check"], None)),
+            ({"merge": "unknown"}, None, None, (4, ["GitHub is still checking whether it can merge"], None)),
+            ({"draft": True, "checks": "failing"}, None, "s1", (4, ["Draft: the session is still on it"], None)),
+            ({"draft": True}, None, None, (5, ["Draft: finish or close"], "you")),
+            ({"merge": "blocked", "updated": old}, None, None, (5, ["No activity for 20 days: close or pick up"], "you")),
+            ({"merge": "dirty", "updated": old}, None, None, (5, ["No activity for 20 days: close or pick up", "Conflicts with main"], "you")),
+            ({"merge": "dirty", "updated": old}, None, "s1", (2, ["Conflicts with main"], "s1")),
+        ]
+        for changes, stacked, session, expected in cases:
+            with self.subTest(changes=changes, stacked=stacked, session=session):
+                self.assertEqual(cc.pr_step(dict(base, **changes), stacked, session, now), expected)
+        # every combination lands in a step with text, and only Merge, Fix and Clean up ask someone to act
+        import itertools
+        for draft, checks, merge, review, threads, yours, more, upd, stacked, session in itertools.product(
+                (False, True), ("passing", "failing", "pending", "none"),
+                ("clean", "blocked", "behind", "dirty", "unstable", "unknown", "has_hooks", "draft"),
+                ("", "approved", "changes_requested", "review_required"), (0, 2), (0, 1), (False, True),
+                (now, old), (None, 9), (None, "s1")):
+            p = dict(base, draft=draft, checks=checks, merge=merge, review=review, threads=threads,
+                     threads_yours=yours, threads_more=more, updated=upd)
+            step, texts, who = cc.pr_step(p, stacked, session, now)
+            self.assertIn(step, (1, 2, 4, 5))
+            self.assertTrue(texts and all(texts))
+            self.assertEqual(who is None, step == 4)
+
     def test_review_requests_setting(self):
         """mine leaves out team requests; a cache fetched for another setting isn't shown; off fetches nothing."""
         self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
@@ -285,6 +433,142 @@ class ClassifyTest(unittest.TestCase):
             self.assertEqual(by_id(cc.collect(True, 10 ** 6))["s-closed"]["state"], "parked")
         finally:
             cc.apply_action("s-closed", "unpark")
+
+
+class PrCommandTest(unittest.TestCase):
+    def run_ccdeck(self, *args, code=None):
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix="ccdeck-command-") as home:
+            env = dict(os.environ, HOME=home, CLAUDE_CONFIG_DIR=home + "/.claude",
+                       CCDECK_PR_PLAN="1", CCDECK_REVIEW_REQUESTS="1", CCDECK_AUTOSTART="0")
+            command = [sys.executable, "-c", code] if code else [sys.executable, str(ROOT / "ccdeck"), *args]
+            return subprocess.run(command, capture_output=True, text=True, env=env, timeout=30)
+
+    def test_prs_prints_plan_and_review_requests(self):
+        result = self.run_ccdeck("prs")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PR 7", result.stdout)
+        self.assertIn("Colleague's change", result.stdout)
+
+    def test_command_paths_with_controlled_dependencies(self):
+        setup = ("import runpy, sys; from unittest.mock import patch; "
+                 "from argparse import Namespace; "
+                 "m=runpy.run_path(" + repr(str(ROOT / "ccdeck")) + "); "
+                 "g=m['cmd_prs'].__globals__; ")
+        cases = [
+            ("with patch.dict(g, save_json=lambda *a: (_ for _ in ()).throw(OSError('read only'))):\n"
+             "    g['cmd_prs'](Namespace(sessions=False))", "PR 7", ""),
+            ("with patch.dict(g, fetch_pr_plan=lambda: None):\n"
+             "    g['cmd_prs'](Namespace(sessions=False))", "Colleague's change", "unavailable"),
+            ("s={'id':'registered', 'cwd':'', 'mark':{}}\n"
+             "with patch.dict(g, resolve=lambda ref:s, peer_sessions=lambda:{'registered':{'pid':77}}, "
+             "focus_terminal=lambda pid:'test', **{}), patch.object(g['os'], 'execv', side_effect=AssertionError('must not exec')):\n"
+             "    g['cmd_resume'](Namespace(id='registered', extra=[]))", "Switched", ""),
+            ("s={'id':'registered', 'cwd':'', 'mark':{}}\n"
+             "with patch.dict(g, resolve=lambda ref:s, peer_sessions=lambda:{'registered':{'pid':77}}), "
+             "patch.object(g['shutil'], 'which', return_value='/fake/claude'), "
+             "patch.object(g['os'], 'execv', side_effect=lambda *a:print('EXEC',a)):\n"
+             "    g['cmd_resume'](Namespace(id='registered', extra=['--verbose']))", "EXEC", "")]
+        for code, output, warning in cases:
+            with self.subTest(output=output, warning=warning):
+                result = self.run_ccdeck(code=setup + "\n" + code)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(output, result.stdout)
+                self.assertIn(warning, result.stderr)
+
+    def test_cli_uses_only_invocation_results(self):
+        from argparse import Namespace
+        import contextlib
+        import io
+        stale = {"url": "https://github.com/old/app/pull/99", "number": 99, "title": "old account"}
+        for plan in (None, {"prs": [], "viewer": "new"}):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(cc, "fetch_pr_plan", return_value=plan), \
+                 mock.patch.object(cc, "fetch_review_requests", return_value=[]), \
+                 mock.patch.object(cc, "collect", return_value=[]), \
+                 mock.patch.object(cc, "load_json", return_value={"prs": [stale], "items": [stale]}), \
+                 mock.patch.object(cc, "save_json", side_effect=AssertionError("CLI must not write shared caches")), \
+                 mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"}), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                cc.cmd_prs(Namespace(sessions=False))
+            self.assertNotIn("old account", out.getvalue())
+            if plan is None:
+                self.assertIn("unavailable", err.getvalue())
+                self.assertNotIn("No open PRs", out.getvalue())
+            else:
+                self.assertIn("No open PRs", out.getvalue())
+
+    def test_plan_polling_is_independent(self):
+        dash = cc.Dashboard.__new__(cc.Dashboard)
+        dash.wake = threading.Event()
+        dash.lock = threading.Lock()
+        dash.snapshot = {"sessions": []}
+        with mock.patch.object(cc, "refresh_pr_plan", return_value={"prs": []}) as plan, \
+             mock.patch.object(cc.time, "sleep", side_effect=StopIteration), \
+             mock.patch.object(cc, "fetch_review_requests", return_value=[]), \
+             mock.patch.object(cc, "save_json"):
+            with self.assertRaises(StopIteration):
+                dash.plan_loop()
+            self.assertTrue(dash.wake.is_set())
+            plan.assert_called_once()
+            plan.reset_mock()
+            with self.assertRaises(StopIteration):
+                dash.pr_loop()
+            plan.assert_not_called()
+
+    def test_resume_uses_only_verified_interactive_hook(self):
+        from argparse import Namespace
+        session = {"id": "hook-session", "cwd": "", "mark": {}}
+        for changes, focused in (({}, True), ({"headless": True}, False), ({"status": "ended"}, False)):
+            hook = dict({"pid": 71, "pid_start": 123, "status": "idle"}, **changes)
+            with mock.patch.object(cc, "resolve", return_value=session), \
+                 mock.patch.object(cc, "peer_sessions", return_value={}), \
+                 mock.patch.object(cc, "running_claude_processes", return_value=[]), \
+                 mock.patch.object(cc, "load_states", return_value={session["id"]: hook}), \
+                 mock.patch.object(cc, "pid_alive", return_value=True), \
+                 mock.patch.object(cc, "focus_terminal", return_value=None) as focus, \
+                 mock.patch.object(cc.os, "execv") as execv, \
+                 mock.patch.object(cc.shutil, "which", return_value="/fake/claude"):
+                if focused:
+                    with self.assertRaises(SystemExit):
+                        cc.cmd_resume(Namespace(id=session["id"], extra=[]))
+                    focus.assert_called_once_with(71)
+                    execv.assert_not_called()
+                else:
+                    cc.cmd_resume(Namespace(id=session["id"], extra=[]))
+                    focus.assert_not_called()
+                    execv.assert_called_once()
+
+    def test_refresh_serializes_observations(self):
+        with tempfile.TemporaryDirectory() as root:
+            data = Path(root)
+            entered, release = threading.Event(), threading.Event()
+            calls = []
+            def fetch():
+                calls.append(len(calls))
+                if len(calls) == 1:
+                    entered.set()
+                    release.wait(5)
+                return {"prs": [], "viewer": "me"}
+            with mock.patch.object(cc, "DATA_DIR", data), \
+                 mock.patch.object(cc, "PR_PLAN_FILE", data / "pr-plan.json"), \
+                 mock.patch.object(cc, "fetch_pr_plan", side_effect=fetch), \
+                 mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"}):
+                first = threading.Thread(target=cc.refresh_pr_plan)
+                second = threading.Thread(target=cc.refresh_pr_plan)
+                first.start()
+                self.assertTrue(entered.wait(5))
+                second.start()
+                try:
+                    self.assertEqual(len(calls), 1)
+                finally:
+                    release.set()
+                    first.join(5)
+                    second.join(5)
+                self.assertEqual(len(calls), 2)
+                self.assertFalse(first.is_alive() or second.is_alive())
+                self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE((data / "pr-plan.json").stat().st_mode), 0o600)
 
 
 class UsageTest(unittest.TestCase):

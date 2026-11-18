@@ -129,6 +129,16 @@ The groups say what you have to do, most urgent first:
 
 **Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs`. Your own sessions' PRs are left out. By default the list includes requests made to a team you're in. If your teams get many of those, `ccdeck review-requests mine` lists only the PRs where you were asked by name; `ccdeck review-requests all` goes back. `ccdeck review-requests off` (or `CCDECK_REVIEW_REQUESTS=0`) turns the list off.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:392bc7ccb56d2c91096788c2c352919e3a8a8479fb4e04fba4528cfac3e03452 -->
+
+**PRs view.** The "Sessions | PRs" switch at the top shows every open PR you authored in five steps: 1 merge (green and mergeable; resolve the threads you already replied to), 2 fix (CI failing, conflicts, changes requested, or review comments someone else left last), 3 review (your review requests), 4 waiting (CI, reviewers, a base PR it's stacked on, or a draft its session is still working on), 5 clean up (other drafts, or no activity for 14 days). A fix goes to the session that owns the PR while it runs, with a button that copies a message for it. "From sessions" and `ccdeck prs --sessions` include session-owned PRs plus review requests, including PRs without a session owner. No AI: `gh api graphql` refreshes every 5 minutes, fetching additional review-thread pages as needed, the same data as `ccdeck prs`. Authored results are limited to 100, with a notice when incomplete. `CCDECK_PR_PLAN=0` turns it off.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+**Session names.** A session's `@name` (what other sessions use to message it) shows on its row and card. When the session is open in a terminal, clicking the name goes to its tab, like clicking a notification; otherwise it opens the details.
+
 **Settings.** The gear button in the dashboard's header opens a settings panel for review requests, desktop notifications and approvals from the dashboard. It saves to `~/.claude/ccdeck/config.json`, the same file the `ccdeck review-requests`, `ccdeck notifications` and `ccdeck approvals` commands change.
 
 Each card shows:
@@ -182,7 +192,8 @@ Hooks keep running from your installed ccdeck, so a PR that changes the hooks on
 ccdeck                 sessions grouped by state, then review requests (done ones and closed ones older than 14 days are hidden)
 ccdeck -a              everything
 ccdeck show 3          details: PRs with state, links, files, last messages
-ccdeck resume 3        cd into the folder and claude --resume
+ccdeck resume 3        go to its terminal tab if it is open, otherwise cd into the folder and claude --resume
+ccdeck prs             your open PRs in steps: merge, fix, review, waiting, clean up
 ccdeck done 3 [note]   mark solved             ccdeck undone 3
 ccdeck park 3          set aside               ccdeck unpark 3
 ccdeck note 3 text     attach a note
