@@ -34,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -41,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.2"
+VERSION = "0.9.6"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -52,6 +53,7 @@ MARKS_FILE = DATA_DIR / "marks.json"
 CACHE_FILE = DATA_DIR / "index-cache.json"
 PR_CACHE_FILE = DATA_DIR / "prs.json"
 REVIEWS_FILE = DATA_DIR / "reviews.json"  # open PRs that ask you for a review
+PR_PLAN_FILE = DATA_DIR / "pr-plan.json"  # your open PRs with what the PR focus plan needs
 LAST_LIST_FILE = DATA_DIR / "last-list.json"
 TOKEN_FILE = DATA_DIR / "token"
 DAEMON_FILE = DATA_DIR / "daemon.json"
@@ -70,7 +72,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 12
+CACHE_VERSION = 15  # 15: a /compact summary isn't a prompt
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -136,6 +138,13 @@ def dim(t):
 
 
 def load_json(path, default):
+    if path.parent == DATA_DIR:
+        try:  # tighten files older versions wrote; a read-only mount mustn't make the file unreadable
+            if path.exists():  # can raise too (a link into a directory you can't enter)
+                path.parent.chmod(0o700)
+                path.chmod(0o600)
+        except OSError:
+            pass
     try:
         with open(path, encoding="utf-8") as f:
             val = json.load(f)
@@ -147,11 +156,19 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=1)
-    os.replace(tmp, path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.parent == DATA_DIR:
+        path.parent.chmod(0o700)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def parse_ts(s):
@@ -403,6 +420,10 @@ def _running_claude_ps():
 # ----------------------------------------------------------------- transcripts
 
 PR_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# `gh stack submit` names a stack's PRs without links: "✓ Created PR #12 for feat/x", "PR #11 for feat/w is up to date"
+STACK_PR_RE = re.compile(r"^\s*(?:✓\s*)?(?:(?:Created|Updated) PR #(\d+) for \S+|PR #(\d+) for \S+ is up to date)\s*$", re.M)
+# the whole remote: https://github.com/o/r(.git), ssh://git@github.com/o/r, git@github.com:o/r (not notgithub.com)
+GITHUB_REMOTE_RE = re.compile(r"(?:https?://(?:[^@/\s]+@)?|ssh://git@|git@)github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?")
 REF_RES = [  # links shown on a session (Linear issues are handled on their own below)
     ("artifact", re.compile(r"https://claude\.ai/(?:code/)?artifacts?/[\w-]+")),
     ("notion", re.compile(r"https://(?:www\.|app\.)?notion\.(?:so|site|com)/[\w./?=&%#-]+")),
@@ -441,7 +462,7 @@ def json_objects(text):
         elif isinstance(x, list):
             stack.extend(x)
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-CREATING_TOOL_HINTS = ("create", "publish", "Artifact", "save_", "push", "Bash:create")
+CREATING_TOOL_HINTS = ("create", "publish", "Artifact", "save_", "push", "Bash:create", "Bash:stack")
 DECISION_RE = re.compile(
     r"\b(should I|shall I|do you want|would you like|want me to|which (?:one|option|approach)"
     r"|your call|please (?:confirm|decide|choose|pick)|let me know (?:which|whether|if you want))\b",
@@ -579,6 +600,137 @@ def is_headless(info):
     return str(info.get("entrypoint") or "").startswith("sdk")
 
 
+GIT_LOCATION_VARS = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+
+
+SHELL_OPS = ("&&", "||", ";;", ";", "|", "&", "(", ")", "\n")
+
+
+def shell_tokens(cmd):
+    """A shell command as (is_operator, text) tokens: quotes and backslashes make text a word, so a quoted
+    `(` or `;` is never an operator, and `);` is two operators. None for an unclosed quote."""
+    out, word, quoted, i = [], [], False, 0
+    def flush():
+        nonlocal quoted
+        if word or quoted:
+            out.append((False, "".join(word)))
+        word.clear()
+        quoted = False
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch in "'\"":
+            end = cmd.find(ch, i + 1)
+            while ch == '"' and end != -1 and cmd[end - 1] == "\\":
+                end = cmd.find(ch, end + 1)
+            if end == -1:
+                return None
+            word.append(cmd[i + 1:end])
+            quoted, i = True, end + 1
+        elif ch == "\\" and i + 1 < len(cmd):
+            if cmd[i + 1] != "\n":  # a backslash-newline joins two lines: both go
+                word.append(cmd[i + 1])
+            i += 2
+        elif ch == "#" and not word and not quoted:  # a comment, to the end of the line
+            nl = cmd.find("\n", i)
+            i = len(cmd) if nl == -1 else nl
+        elif ch in " \t":
+            flush()
+            i += 1
+        elif op := next((o for o in SHELL_OPS if cmd.startswith(o, i)), None):
+            flush()
+            out.append((True, op))
+            i += len(op)
+        else:
+            word.append(ch)
+            i += 1
+    flush()
+    return out
+
+
+def gh_stack_dirs(cmd, cwd):
+    """The folder each `gh stack` in a shell command runs in, following `cd`; [] if it runs none. It runs
+    as a command's first word (after && || ; | a newline, or VAR=value words), not as quoted text such as
+    `echo 'gh stack submit'`, whose output isn't gh stack's. A folder is None when it can't be told (`cd -`)."""
+    if "gh" not in cmd or "stack" not in cmd:
+        return []
+    tokens = shell_tokens(cmd)
+    if tokens is None:
+        return []
+    out, here, start, saved = [], cwd or None, True, []
+    for i, (op, w) in enumerate(tokens):
+        if op:
+            if w == "(":  # a subshell's cd ends with it: `(cd /b && make)` leaves the folder as it was
+                saved.append(here)
+            elif w == ")" and saved:
+                here = saved.pop()
+            start = True
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else (True, "")
+        if start and w == "gh" and nxt == (False, "stack"):
+            out.append(here)
+        elif start and w == "cd":
+            j, physical = i + 1, False  # skip options (-P, -L, -e, -@) and --: the folder comes after them
+            while j < len(tokens) and not tokens[j][0] and tokens[j][1].startswith("-") and tokens[j][1] != "-":
+                if tokens[j][1] == "--":
+                    j += 1
+                    break
+                for flag in tokens[j][1][1:]:  # in order, as cd reads them: in -PL the L comes last and wins
+                    physical = True if flag == "P" else False if flag == "L" else physical
+                j += 1
+            nxt = tokens[j] if j < len(tokens) else (True, "")
+            arg = os.path.expanduser(nxt[1] if not nxt[0] else "~")
+            if arg == "-" or not (here or os.path.isabs(arg)):
+                here = None
+            else:  # -P resolves symlinks before `..`; plain cd collapses `..` in the path as typed
+                path = os.path.join(here or "/", arg)
+                here = os.path.realpath(path) if physical else os.path.normpath(path)
+        elif start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w, re.S):
+            continue  # `CI=1 gh stack submit`: assignments before the command keep its first word to come
+        start = False
+    return out
+
+
+def runs_gh_stack(cmd):
+    return bool(gh_stack_dirs(cmd, None))
+
+
+_repo_cache = {}  # folder -> (owner/name or None, when): an answer is kept, a failure is asked again after a minute
+
+
+def github_repo(cwd):
+    """owner/name of the GitHub repo a folder's origin remote points at, or None."""
+    if not cwd:
+        return None
+    hit = _repo_cache.get(cwd)
+    if hit and (hit[0] or time.time() - hit[1] < 60):
+        return hit[0]
+    # an inherited GIT_DIR (a hook run inside another repo) would beat -C and answer for that repo
+    env = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION_VARS}
+    try:
+        out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True,
+                             timeout=3, env=env).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    m = GITHUB_REMOTE_RE.fullmatch(out.strip())
+    _repo_cache[cwd] = (m.group(1) if m else None, time.time())
+    return _repo_cache[cwd][0]
+
+
+def with_stack_prs(info):
+    """The session with the PRs `gh stack submit` named, as links: each in the repo of the folder that
+    command ran in. Resolved on every scan, not in the cached parse, so a failed lookup is tried again."""
+    found = {}
+    for cwd, n in info.get("stack_prs") or ():
+        repo = github_repo(cwd)
+        if repo:
+            found[f"https://github.com/{repo}/pull/{n}"] = "created"
+    if not found:
+        return info
+    sources = dict(info.get("pr_sources") or {}, **found)
+    return dict(info, prs=list(dict.fromkeys(list(info.get("prs") or []) + list(found))), pr_sources=sources)
+
+
 def parse_transcript(path):
     info = {
         "id": path.stem, "cwd": None, "branch": None, "title": None, "ai_title": None,
@@ -589,6 +741,8 @@ def parse_transcript(path):
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
     refs, linear, keys, tool_titles, not_created, questions = {}, {}, {}, {}, {}, {}
+    stack_dirs = {}  # tool id -> the folder its gh stack ran in (None: several, or unknown)
+    stack_prs = {}  # (folder, PR number) that `gh stack submit` printed, without links; with_stack_prs resolves them
     seen_msgs = set()
 
     def note_ref(url, kind, title, source):
@@ -664,6 +818,11 @@ def parse_transcript(path):
             if t == "summary":
                 info["summary"] = e.get("summary") or info["summary"]
                 continue
+            if t == "pr-link":  # Claude Code's own record of a PR it linked to this session
+                url = e.get("prUrl")
+                if isinstance(url, str) and PR_RE.fullmatch(url):
+                    prs[url] = "created"
+                continue
             if t not in ("user", "assistant") or e.get("isSidechain"):
                 continue
             ts = parse_ts(e.get("timestamp"))
@@ -689,6 +848,9 @@ def parse_transcript(path):
                             if creating or "linear" in name.lower():
                                 src = "created" if creating else "tool"
                                 add_refs(body, src, with_prs=creating)
+                                if name == "Bash:stack":
+                                    for x, y in STACK_PR_RE.findall(body) if stack_dirs.get(tid) else ():
+                                        stack_prs[(stack_dirs[tid], int(x or y))] = None
                                 add_json_titles(body, src)
                                 if tid in tool_titles:  # an Artifact publish: title from its own input
                                     for r in refs.values():
@@ -696,9 +858,15 @@ def parse_transcript(path):
                                             r["title"] = tool_titles[tid]
                 if is_real_prompt(e):
                     text = block_text(content)
-                    add_refs(text, "you")
+                    # /compact writes its summary as a user message, but nobody asked anything: the session
+                    # keeps the turn it had (as a prompt it read as working, then as quiet)
+                    compact = bool(e.get("isCompactSummary"))
+                    if not compact:
+                        add_refs(text, "you")
                     info["prompts"] += 1
                     info["first_prompt"] = info["first_prompt"] or text
+                    if compact:
+                        continue
                     info["last_prompt"] = text
                     info["last_role"] = "user"
                     info["last_text"] = text
@@ -755,12 +923,19 @@ def parse_transcript(path):
                             files[fp] = None
                     elif name == "Bash":
                         cmd = str(inp.get("command", ""))
-                        if "gh pr create" in cmd or "git push" in cmd:
+                        dirs = gh_stack_dirs(cmd, e.get("cwd") or info["cwd"])
+                        if dirs:
+                            tool_names[b.get("id")] = "Bash:stack"
+                            # its number-only lines belong to the folder it ran in; two folders can't be told apart
+                            same = {os.path.realpath(d) if d else None for d in dirs}  # /var/x is /private/var/x
+                            stack_dirs[b.get("id")] = dirs[0] if len(same) == 1 and None not in same else None
+                        elif "gh pr create" in cmd or "git push" in cmd:
                             tool_names[b.get("id")] = "Bash:create"
     info["pending_tool"] = list(pending.values())[-1] if pending else None
     info["pending_input"] = pending_inputs.get(list(pending)[-1]) if pending else None
     info["pending_question"] = questions.get(list(pending)[-1]) if pending else None
     info["pending_id"] = list(pending)[-1] if pending else None
+    info["stack_prs"] = [[cwd, n] for cwd, n in stack_prs if cwd]
     info["prs"] = list(prs)
     info["pr_sources"] = dict(prs)
     for r in refs.values():
@@ -809,7 +984,7 @@ def scan_transcripts():
                     continue
                 prev = sessions.get(info["id"])
                 if not prev or info["last_ts"] > prev["last_ts"]:
-                    sessions[info["id"]] = dict(info)
+                    sessions[info["id"]] = dict(with_stack_prs(info))
             sub_usage = {}
             for path in PROJECTS_DIR.glob("*/*/subagents/*.jsonl"):
                 try:
@@ -941,15 +1116,263 @@ def fetch_review_requests(scope=None):
     return out
 
 
-def review_requests(sessions):
+def gh_viewer():
+    """The GitHub login gh is signed in as, or None."""
+    try:
+        r = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
+def review_requests(sessions, items=None, viewer=None):
     """Cached review requests, less PRs that one of your sessions made. Nothing while the cache
-    was fetched for another setting (the PR loop fetches again within seconds)."""
+    was fetched for another setting (the PR loop fetches again within seconds), or, given a viewer,
+    for another GitHub account: one account's requests never sit next to another's PRs."""
     own = {p["url"] for s in sessions for p in s.get("pr_details") or [] if p.get("own")}
     cache = load_json(REVIEWS_FILE, {}) or {}
-    if cache.get("scope", "all") != review_scope():
+    if items is None and cache.get("scope", "all") != review_scope():
         return []
-    items = cache.get("items") or []
+    if items is None and viewer and cache.get("viewer") != viewer:  # another account's, or nobody knows whose
+        return []
+    items = (cache.get("items") or []) if items is None else items
     return [r for r in items if r.get("url") not in own]
+
+
+# Authored search is capped; expose GitHub pagination state to both consumers.
+PR_PLAN_QUERY = """query {
+  viewer { login }
+  mine: search(type: ISSUE, query: "is:pr is:open author:@me archived:false", first: 100) { pageInfo { hasNextPage } nodes { ... on PullRequest {
+    url number title isDraft updatedAt headRefName baseRefName mergeStateStatus reviewDecision
+    headRepository { nameWithOwner }
+    repository { nameWithOwner defaultBranchRef { name } } author { login }
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    reviewThreads(first: 100) { pageInfo { hasNextPage endCursor } nodes { isResolved comments(last: 1) { nodes { author { login } } } } }
+  } } }
+}"""
+ROLLUP = {"SUCCESS": "passing", "FAILURE": "failing", "ERROR": "failing", "PENDING": "pending", "EXPECTED": "pending"}
+STALE_AFTER = 14 * 86400
+
+
+def fetch_pr_plan():
+    """Your open PRs with CI, merge state and who spoke last on each open review thread, in one
+    GraphQL call (about 50 points for 20 PRs). Off with CCDECK_PR_PLAN=0."""
+    global _plan_state
+    if os.environ.get("CCDECK_PR_PLAN") == "0" or not shutil.which("gh"):
+        return None
+    try:
+        r = subprocess.run(["gh", "api", "graphql", "-f", "query=" + PR_PLAN_QUERY],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        _plan_state = "auth_required" if any(word in r.stderr.lower() for word in ("auth login", "authentication", "401", "not logged")) else "failed"
+        return None
+    try:
+        data = json.loads(r.stdout)["data"]
+        # one budget for every extra page: past it, PRs keep hasNextPage, read as "maybe more", never Merge
+        deadline = time.monotonic() + 45
+        for node in (data.get("mine") or {}).get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            threads = node.get("reviewThreads") or {}
+            seen = set()
+            while (threads.get("pageInfo") or {}).get("hasNextPage"):
+                cursor = (threads.get("pageInfo") or {}).get("endCursor")
+                left = deadline - time.monotonic()
+                if not cursor or cursor in seen or left < 1:
+                    break
+                seen.add(cursor)
+                query = """query($url: URI!, $cursor: String!) {
+                  resource(url: $url) { ... on PullRequest {
+                    reviewThreads(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { isResolved comments(last: 1) { nodes { author { login } } } }
+                    }
+                  } }
+                }"""
+                try:
+                    page = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query,
+                                           "-f", "url=" + node["url"], "-f", "cursor=" + cursor],
+                                          capture_output=True, text=True, timeout=min(30, left))
+                except (OSError, subprocess.SubprocessError):
+                    break  # retain the authored rows with an explicitly unknown review status
+                try:
+                    more = json.loads(page.stdout)["data"]["resource"]["reviewThreads"] if page.returncode == 0 else None
+                    if not isinstance(more, dict) or not isinstance(more.get("nodes"), list) or not isinstance(more.get("pageInfo", {}).get("hasNextPage"), bool):
+                        break
+                    threads.setdefault("nodes", []).extend(more["nodes"])
+                    threads["pageInfo"] = more["pageInfo"]
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    break
+        return parse_pr_plan(data)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+_plan_state = "pending"
+
+
+def refresh_pr_plan():
+    """Serialize observations across daemon and CLI processes; cache writes are best effort."""
+    global _plan_state
+    if os.environ.get("CCDECK_PR_PLAN") == "0":
+        _plan_state = "disabled"
+        return None
+    lock = None
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        DATA_DIR.chmod(0o700)
+        fd = os.open(DATA_DIR / "pr-plan.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        lock = os.fdopen(fd, "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError as e:
+        if lock:
+            lock.close()
+            lock = None
+        print(f"Warning: PR cache lock unavailable: {e}", file=sys.stderr)
+    try:
+        _plan_state = "pending"
+        plan = fetch_pr_plan()
+        if plan is None:
+            _plan_state = "auth_required" if _plan_state == "auth_required" else "failed"
+            return None
+        plan = dict(plan, fetched=time.time())
+        saved = False
+        if lock:
+            try:
+                save_json(PR_PLAN_FILE, plan)
+                saved = True
+            except OSError as e:
+                print(f"Warning: could not save PR plan: {e}", file=sys.stderr)
+        # the dashboard reads the file: it's only "ready" once the fresh plan is in it
+        _plan_state = "ready" if saved else "failed"
+        return plan
+    finally:
+        if lock:
+            lock.close()
+
+
+def parse_pr_plan(d):
+    """GraphQL data -> {"viewer", "prs"}."""
+    viewer = (d.get("viewer") or {}).get("login") or ""
+    prs = []
+    for n in (d.get("mine") or {}).get("nodes") or []:
+        if not isinstance(n, dict) or not isinstance(n.get("url"), str):
+            continue
+        repo = n.get("repository") or {}
+        commit = (((n.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+        rollup = (commit.get("statusCheckRollup") or {}).get("state")
+        last = [((((t.get("comments") or {}).get("nodes") or [{}])[0] or {}).get("author") or {}).get("login")
+                for t in (n.get("reviewThreads") or {}).get("nodes") or [] if not t.get("isResolved")]
+        prs.append({
+            "url": n["url"], "number": n.get("number"), "title": n.get("title") or "",
+            "repo": repo.get("nameWithOwner") or "", "draft": bool(n.get("isDraft")),
+            "updated": parse_ts(n.get("updatedAt")) or 0,
+            "head_repo": (n.get("headRepository") or {}).get("nameWithOwner") or "",
+            "head": n.get("headRefName") or "", "base": n.get("baseRefName") or "",
+            "default_base": (repo.get("defaultBranchRef") or {}).get("name") or "",
+            "merge": (n.get("mergeStateStatus") or "unknown").lower(),  # clean | blocked | behind | dirty | unstable | unknown
+            "review": (n.get("reviewDecision") or "").lower(),
+            "checks": ROLLUP.get(rollup, "none") if rollup else "none",
+            # someone else spoke last: work for the author; you did: only you can resolve the thread
+            "threads": sum(1 for a in last if a != viewer), "threads_yours": sum(1 for a in last if a == viewer),
+            "threads_more": bool((((n.get("reviewThreads") or {}).get("pageInfo")) or {}).get("hasNextPage")),
+        })
+    return {"viewer": viewer, "prs": prs, "truncated": bool(((d.get("mine") or {}).get("pageInfo") or {}).get("hasNextPage"))}
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def pr_step(p, stacked_on=None, session=None, now=None, working=False):
+    """(step, texts, who) for one of your open PRs. Steps: 1 merge, 2 fix, 4 waiting, 5 clean up
+    (3, review, is for review requests). stacked_on: the open PR whose branch this one targets.
+    session: name of a running session that owns the PR; it gets the fixes. working: that session is busy
+    right now (not waiting for you). who: "you", "session" (the owning session) or None (nobody yet)."""
+    days = int(((now or time.time()) - p["updated"]) // 86400)
+    stale = [f"No activity for {days} days: close or pick up"] if days * 86400 >= STALE_AFTER else None
+    if p["draft"]:
+        # a draft is yours to look over, unless its session is still writing it
+        if session and working:
+            return 4, ["Draft: the session is working on it"], None
+        return (5, ["Draft. " + stale[0]], "you") if stale and not session else (2, ["Draft: look it over, then mark it ready"], "you")
+    fix = []
+    if p["checks"] == "failing":
+        fix.append("CI failing")
+    if p["merge"] == "dirty":
+        fix.append(f"Conflicts with {p['base']}")
+    if p["review"] == "changes_requested":
+        fix.append("Changes requested")
+    if p["threads"]:  # known work stays work even when a later page of threads couldn't be read
+        fix.append(plural(p["threads"], "review comment") + " to answer" + (", maybe more" if p.get("threads_more") else ""))
+    if fix:
+        # untouched for weeks and no session on it: decide its fate before fixing it
+        return (5, stale + fix, "you") if stale and not session else (2, fix, "session" if session else "you")
+    if p.get("threads_more"):
+        return 4, ["Review status unknown: check GitHub"], None
+    if p["merge"] == "blocked" and p["threads_yours"]:
+        return 2, ["Resolve " + plural(p["threads_yours"], "thread"), "Waiting for a review or a required check"], "you"
+    if stacked_on:
+        wait = f"After #{stacked_on} merges"
+    elif p["checks"] == "pending":
+        wait = "CI running"
+    elif p["merge"] == "blocked":
+        wait = "Waiting for a review or a required check"
+    elif p["merge"] not in ("clean", "has_hooks", "unstable", "behind"):
+        wait = "GitHub is still checking whether it can merge"
+    else:
+        texts = ["Resolve " + plural(p["threads_yours"], "thread")] if p["threads_yours"] else []
+        if p["merge"] == "behind":
+            texts.append("Update the branch")
+        return 1, texts + ["Merge it"], "you"
+    return (5, stale, "you") if stale else (4, [wait], None)
+
+
+def pr_key(url):
+    """A PR's identity for joins: GitHub owner and repo names are case-insensitive."""
+    return str(url).lower().rstrip("/")
+
+
+def pr_plan(sessions, saved=None, reviews=None):
+    """Your saved PRs with their step, who acts and the owning session (`own` in pr_details), plus
+    review requests as step 3."""
+    disabled = os.environ.get("CCDECK_PR_PLAN") == "0"
+    saved = {} if disabled else (load_json(PR_PLAN_FILE, {}) if saved is None else saved)
+    saved = saved or {}
+    required = {"url", "repo", "head", "base", "default_base", "number", "title", "draft", "checks", "merge", "review", "threads", "threads_yours", "updated"}
+    cached_prs = saved.get("prs")
+    prs = [p for p in (cached_prs if isinstance(cached_prs, list) else []) if isinstance(p, dict) and required <= p.keys()
+           and all(isinstance(p[k], str) for k in ("url", "repo", "head", "base", "default_base", "checks", "merge", "review"))
+           and all(isinstance(p[k], (int, float)) for k in ("threads", "threads_yours", "updated"))]
+    by_key = {pr_key(p["url"]): p for p in prs}
+    owner = {}  # GitHub names are case-insensitive: a transcript's Acme/App/pull/7 is the plan's acme/app/pull/7
+    for session in sessions:
+        for detail in session.get("pr_details") or []:
+            key = pr_key(detail["url"])
+            row = by_key.get(key) or {}
+            owns = detail.get("own") or detail.get("source") == "created" or bool(row.get("head") and row["head"] == session.get("branch"))
+            if owns and (key not in owner or session.get("alive")):
+                owner[key] = session
+    heads = {(p.get("head_repo"), p["head"]): p["number"] for p in prs if p.get("head_repo")}
+    rows = []
+    for p in prs:
+        s = owner.get(pr_key(p["url"]))
+        name = (s.get("peer_name") or s["id"][:8]) if s else None
+        stacked = heads.get((p["repo"], p["base"])) if p["base"] != p["default_base"] else None
+        live = bool(s and s.get("alive"))
+        step, texts, actor = pr_step(p, stacked, name if live else None, working=live and s.get("state") == "working")
+        # actor: who acts, "you", "session" or None; who: what to call them (a session may be named "you")
+        rows.append(dict(p, step=step, texts=texts, actor=actor, who=name if actor == "session" else actor, stacked_on=stacked, author=saved.get("viewer") or "",
+                         session={"id": s["id"], "name": name, "alive": bool(s.get("alive"))} if s else None))
+    mine = {pr_key(p["url"]) for p in prs}
+    for r in review_requests([], reviews, saved.get("viewer")):
+        if pr_key(r["url"]) not in mine:  # your own PR can be asked of a team you're in; it's already listed
+            rows.append(dict(r, step=3, texts=["Review it"], actor="you", who="you", session=None))
+    rows.sort(key=lambda r: (r["step"], r.get("updated") or 0))
+    return {"fetched": saved.get("fetched"), "viewer": saved.get("viewer"), "rows": rows,
+            "disabled": disabled, "truncated": saved.get("truncated", False), "state": "disabled" if disabled else _plan_state}
 
 
 def pr_cache():
@@ -1114,6 +1537,8 @@ def resumed_ids(procs):
     out = set()
     for _, _, argv in interactive_processes(procs):
         for i, a in enumerate(argv):
+            if a == "--":  # the rest is prompt text, not options
+                break
             if a in ("--resume", "-r") and i + 1 < len(argv):
                 out.add(argv[i + 1])
             elif a.startswith("--resume="):
@@ -1946,7 +2371,7 @@ class Dashboard:
             "gh": bool(shutil.which("gh")), "hooks": hooks_active(),
             "default_days": DEFAULT_DAYS, "port": self.port, "gh_install": GH_INSTALL, "preview": PREVIEW,
             "reviews": review_requests(sessions), "settings": settings_view(),
-            "notifications": inbox_items(),
+            "notifications": inbox_items(), "plan": pr_plan(sessions),
         }
         etag = hashlib.sha1(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:16]
         snap["generated"] = time.time()
@@ -2005,6 +2430,15 @@ class Dashboard:
             pass
         os.execv(sys.executable, [sys.executable, target[1], "serve", "--port", str(self.port)])
 
+    def plan_loop(self):
+        while True:
+            try:
+                if refresh_pr_plan() is not None:
+                    self.wake.set()
+            except Exception as e:
+                print(f"pr plan error: {e!r}", file=sys.stderr)
+            time.sleep(300)
+
     def pr_loop(self):
         last_reviews = 0
         while True:
@@ -2013,9 +2447,13 @@ class Dashboard:
             if time.time() - last_reviews > 300 or cached.get("scope", "all") != scope:
                 last_reviews = time.time()
                 try:
+                    # whose requests: asked before and after the search, kept only if both agree (an account
+                    # switch in between leaves it unknown, and pr_plan doesn't pair unknown rows with its PRs)
+                    before = gh_viewer() if scope != "off" else None
                     items = fetch_review_requests(scope)
                     if items is not None or scope == "off":
-                        save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or []})
+                        viewer = before if items and before and gh_viewer() == before else None
+                        save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or [], "viewer": viewer})
                         if items != cached.get("items") or scope != cached.get("scope", "all"):
                             self.wake.set()
                 except Exception as e:
@@ -2063,6 +2501,16 @@ class Dashboard:
         if action in ("done", "undone", "park", "unpark", "note"):
             text = body.get("text")
             apply_action(sid, action, text if isinstance(text, str) else None)
+        elif action == "focus":
+            # the name chip: go to the open tab, never start Claude (the snapshot it saw may be stale)
+            peer = peer_sessions().get(sid)
+            pids = [p for p in (peer.get("pids") or [peer["pid"]]) if not pid_is_headless(p)] if peer else []
+            if not pids:
+                return 409, {"error": f"@{s.get('peer_name') or sid[:8]} isn't open any more; use Resume to start it"}
+            # the same order as ccdeck resume: the first tab that can be switched to
+            result["focused"] = next((label for pid in pids if (label := focus_terminal(pid))), None)
+            if not result["focused"]:
+                return 409, {"error": f"Already open (@{peer.get('name') or sid[:8]}) in a terminal ccdeck can't switch to"}
         elif action == "resume" and (peer := peer_sessions().get(sid)):
             # already open: a second `claude --resume` would fork the session, so go to its tab instead
             result["focused"] = focus_terminal(peer["pid"])
@@ -2171,6 +2619,7 @@ class Dashboard:
         self.heartbeat()
         threading.Thread(target=self.scan_loop, daemon=True).start()
         threading.Thread(target=self.pr_loop, daemon=True).start()
+        threading.Thread(target=self.plan_loop, daemon=True).start()
         httpd = ThreadingHTTPServer(("127.0.0.1", self.port), self.make_handler())
         httpd.daemon_threads = True
         print(f"ccdeck dashboard on http://localhost:{self.port}", flush=True)
@@ -2308,6 +2757,42 @@ def cmd_list(args):
         print(dim(f"\nDashboard: http://localhost:{load_json(DAEMON_FILE, {}).get('port', DEFAULT_PORT)}"))
 
 
+PR_STEPS = {1: "MERGE", 2: "FIX", 3: "REVIEW", 4: "WAITING", 5: "CLEAN UP"}
+
+
+def cmd_prs(args):
+    # Invocation-local results: CLI credentials may differ from the daemon's credentials.
+    plan = fetch_pr_plan()
+    unavailable = plan is None and os.environ.get("CCDECK_PR_PLAN") != "0"
+    if unavailable:
+        print("Authored PR list unavailable; check gh auth login.", file=sys.stderr)
+    scope = review_scope()
+    items = fetch_review_requests(scope)
+    if items is None and scope != "off":
+        unavailable = True  # an empty list would claim nobody asked for your review
+        print("Review requests unavailable; check gh auth login.", file=sys.stderr)
+    assembled = pr_plan(collect(include_all=True, days=10 ** 6),
+                        saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])
+    rows = assembled["rows"]
+    if assembled["truncated"]:
+        print("Warning: authored PRs limited to the first 100 results; stack targets may be missing.", file=sys.stderr)
+    if args.sessions:
+        rows = [r for r in rows if r["session"] or r["step"] == 3]
+    if not rows:
+        print("No available PR data." if unavailable else "No open PRs.")
+    width = shutil.get_terminal_size((120, 20)).columns
+    for step, label in PR_STEPS.items():
+        part = [r for r in rows if r["step"] == step]
+        if not part:
+            continue
+        print("\n" + bold(f"{step}. {label}") + dim(f"  {len(part)}"))
+        for r in part:
+            who, s = r["who"] or "", r["session"]
+            print(f"  {r['repo']}#{r['number']}  {one_line(r['title'], max(20, width - 70))}")
+            print(dim("      " + " · ".join(r["texts"]) + (f"  → {who}" if who else "")
+                      + (f"  [@{s['name']}]" if s and s["name"] != who else "")))
+
+
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -2405,6 +2890,29 @@ def cmd_mark(action):
 
 def cmd_resume(args):
     s = resolve(args.id)
+    peers = peer_sessions()
+    peer = peers.get(s["id"])
+    # a `claude -p` run on it doesn't make it open: only interactive processes are tabs to go to
+    pids = [p for p in (peer.get("pids") or [peer["pid"]]) if not pid_is_headless(p)] if peer else []
+    if not pids:
+        peer = None
+    if not peer and not args.extra:
+        registered = {pid for entry in peers.values() for pid in entry.get("pids", [entry["pid"]])}
+        pids = [p[0] for p in running_claude_processes() if p[0] not in registered and s["id"] in resumed_ids([p])]
+        hook = load_states().get(s["id"]) or {}
+        pid = hook.get("pid")
+        if (pid and pid not in registered and pid not in pids and not hook.get("headless")
+                and hook.get("status") != "ended" and hook.get("pid_start") is not None
+                and pid_alive(pid, hook["pid_start"])):
+            pids.append(pid)
+
+    if pids and not args.extra:
+        # already open: a second `claude --resume` would fork it, so go to its tab, like the dashboard does
+        label = next((label for pid in pids if (label := focus_terminal(pid))), None)
+        if label:
+            print(f"Switched to its {label} tab (@{(peer or {}).get('name') or s['id'][:8]}).")
+            return
+        sys.exit(f"Already open (@{(peer or {}).get('name') or s['id'][:8]}) in a terminal ccdeck can't switch to.")
     claude = shutil.which("claude")
     if not claude:
         sys.exit("`claude` is not on PATH.")
@@ -3367,7 +3875,9 @@ def main():
     s = sub.add_parser("note", help="attach a note (empty clears it)")
     s.add_argument("id")
     s.add_argument("text", nargs="*")
-    s = sub.add_parser("resume", help="resume a session in its folder")
+    s = sub.add_parser("prs", help="your open PRs in steps: merge, fix, review, wait, clean up")
+    s.add_argument("--sessions", action="store_true", help="only PRs one of your sessions owns, plus review requests")
+    s = sub.add_parser("resume", help="go to an open session's tab, or resume it in its folder")
     s.add_argument("id")
     s.add_argument("extra", nargs=argparse.REMAINDER)
     for name, hlp in (("serve", "run the dashboard server"), ("open", "open the dashboard")):
@@ -3404,7 +3914,7 @@ def main():
     args = p.parse_args()
 
     handlers = {
-        None: cmd_list, "list": cmd_list, "show": cmd_show, "resume": cmd_resume,
+        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
         "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,

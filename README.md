@@ -129,6 +129,16 @@ The groups say what you have to do, most urgent first:
 
 **Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs`. Your own sessions' PRs are left out. By default the list includes requests made to a team you're in. If your teams get many of those, `ccdeck review-requests mine` lists only the PRs where you were asked by name; `ccdeck review-requests all` goes back. `ccdeck review-requests off` (or `CCDECK_REVIEW_REQUESTS=0`) turns the list off.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:392bc7ccb56d2c91096788c2c352919e3a8a8479fb4e04fba4528cfac3e03452 -->
+
+**PRs view.** The "Sessions | PRs" switch at the top shows every open PR you authored in five steps: 1 merge (green and mergeable; resolve the threads you already replied to), 2 fix (CI failing, conflicts, changes requested, or review comments someone else left last), 3 review (your review requests), 4 waiting (CI, reviewers, a base PR it's stacked on, or a draft its session is still working on), 5 clean up (other drafts, or no activity for 14 days). A fix goes to the session that owns the PR while it runs, with a button that copies a message for it. "From sessions" and `ccdeck prs --sessions` include session-owned PRs plus review requests, including PRs without a session owner. No AI: `gh api graphql` refreshes every 5 minutes, fetching additional review-thread pages as needed, the same data as `ccdeck prs`. Authored results are limited to 100, with a notice when incomplete. `CCDECK_PR_PLAN=0` turns it off.
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+**Session names.** A session's `@name` (what other sessions use to message it) shows on its row and card. When the session is open in a terminal, clicking the name goes to its tab, like clicking a notification; otherwise it opens the details.
+
 **Settings.** The gear button in the dashboard's header opens a settings panel for review requests, desktop notifications and approvals from the dashboard. It saves to `~/.claude/ccdeck/config.json`, the same file the `ccdeck review-requests`, `ccdeck notifications` and `ccdeck approvals` commands change.
 
 Each card shows:
@@ -182,7 +192,8 @@ Hooks keep running from your installed ccdeck, so a PR that changes the hooks on
 ccdeck                 sessions grouped by state, then review requests (done ones and closed ones older than 14 days are hidden)
 ccdeck -a              everything
 ccdeck show 3          details: PRs with state, links, files, last messages
-ccdeck resume 3        cd into the folder and claude --resume
+ccdeck resume 3        go to its terminal tab if it is open, otherwise cd into the folder and claude --resume
+ccdeck prs             your open PRs in steps: merge, fix, review, waiting, clean up
 ccdeck done 3 [note]   mark solved             ccdeck undone 3
 ccdeck park 3          set aside               ccdeck unpark 3
 ccdeck note 3 text     attach a note
@@ -192,6 +203,8 @@ ccdeck review-requests mine   list only PRs where you were asked to review by na
 ccdeck preview 16      try PR #16 next to your dashboard (ccdeck preview stop)
 ```
 
+**`ccdeck resume`.** A closed session starts again: ccdeck goes to its folder and runs `claude --resume`. An open one is never started a second time: ccdeck switches to its terminal tab, and if it can't (a terminal it doesn't know), it says so and stops. Extra arguments (`ccdeck resume 3 --model opus`) skip the tab and go to `claude`, so they start it again.
+
 `3` is the row number from the last list. A prefix of the session id also works.
 
 ## How it works
@@ -199,7 +212,7 @@ ccdeck preview 16      try PR #16 next to your dashboard (ccdeck preview stop)
 - **Transcripts.** `~/.claude/projects/*/*.jsonl` provides each session's title, folder, branch and messages, plus the PR, artifact and document links Claude posted or created, and the files it wrote. Parsing is cached by file size and modification time.
 - **Hooks.** The hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Notification`, `Stop`, `SessionEnd`) write a small state file for each session to `~/.claude/ccdeck/state/`. That's how the tool knows exactly whether a session is working, waiting for permission or finished. The file also records the Claude process, so a crashed session isn't shown as running. Without hooks, these states are guessed from running `claude` processes and the end of each transcript.
 - **PR states.** `gh pr view` is called for PRs in sessions that aren't done. Open PRs are re-checked every 3 minutes, and every minute while CI is running.
-- **The server** listens only on `127.0.0.1`. The API needs a random token, stored in `~/.claude/ccdeck/token`, which only the dashboard page receives. Requests whose `Host` header isn't localhost are rejected. Together, these stop other websites from reading your sessions or opening terminals.
+- **The server** listens only on `127.0.0.1`. The API needs a random token, stored in `~/.claude/ccdeck/token`, which only the dashboard page receives. Requests whose `Host` header isn't localhost are rejected. Together, these stop other websites from reading your sessions or opening terminals. They don't separate OS accounts: anyone logged in to the same machine can open the page, so it can see your sessions and PRs (titles, branches, states). On a shared machine, don't run the dashboard.
 - **Token usage** comes from the `usage` that Claude Code saves with each response. Each response is counted once, even though it's saved on several entries. The context bar uses the size of the latest request against the model's window: 1M for current models, 200K for Claude Haiku 4.5 and older models. To use a different limit, set `CCDECK_CONTEXT_LIMIT`. Tokens are shown rather than dollars, because many people use Claude Code on a subscription and prices differ by model.
 - **Dashboard autostart.** With the plugin, the `SessionStart` hook starts `ccdeck serve` in the background when nothing answers on the port; it logs to `~/.claude/ccdeck/serve.log`. It doesn't do this when the systemd service or launchd agent is installed. To turn it off, set `CCDECK_AUTOSTART=0`.
 - **Notifications** appear when a session moves into *Needs you*, *PRs to fix* or *Your turn*. Clicking one goes to that session's terminal tab:

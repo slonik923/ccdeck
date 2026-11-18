@@ -810,3 +810,22 @@ a.ref-title:hover { text-decoration: underline; }
   .ccd .menu-wrap:has(> .bellbtn) { position: static; }
   .ccd .inboxpop { top: 100%; left: 16px; right: 16px; width: auto; max-width: none; }
 }
+
+/* PR focus plan */
+.ccd .viewsw { padding-bottom: 0; }
+.ccd .viewsw-gap { flex: 0 0 var(--s-5); }
+.ccd .plan li { grid-template-columns: auto minmax(0, 1fr) auto auto 56px 96px 44px; }
+.ccd .plan-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ccd .plan-next { color: var(--text-2); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ccd .rrlist[data-g="need"] .plan-next { color: var(--need-fg, var(--text)); font-weight: 600; }
+.ccd .namechip { gap: 6px; cursor: pointer; font-family: var(--font-mono, monospace); }
+.ccd .namechip[data-on="off"] { opacity: .65; }
+.ccd .namechip[data-on="on"] .run-dot { border-color: var(--turn); background: var(--turn); }
+.ccd .plan-who { font-size: 12px; font-weight: 650; white-space: nowrap; }
+.ccd .plan-who[data-who="none"] { color: var(--text-3); font-weight: 500; }
+.ccd .plan-who[data-who="session"] { color: var(--work); }
+@media (max-width: 760px) {
+  .ccd .plan li { grid-template-columns: auto minmax(0, 1fr) auto 40px; }
+  .ccd .plan .rr-repo, .ccd .plan .rr-by, .ccd .plan .plan-who { display: none; }
+  .ccd .plan .namechip { grid-column: 2; justify-self: start; }
+}

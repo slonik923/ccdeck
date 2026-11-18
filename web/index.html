@@ -195,6 +195,7 @@ let data = null, etag = "", lastOk = 0, failures = 0;
 const ui = {
   filter: "all", showDone: ls.get("showDone", false), showOld: ls.get("showOld", false), q: "",
   menu: "", drawer: "", settings: false, focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false), notifOpen: "",
+  view: ls.get("view", "sessions"), scope: ls.get("prScope", "sessions"), step: 0,
 };
 const offline = () => !!data && failures > 0 && Date.now() - lastOk > 6000;
 
@@ -226,6 +227,7 @@ async function act(id, action, extra) {
     if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
     const msgs = {
       resume: j.focused ? "Switched to its " + j.focused + " tab" : "Opening a terminal" + (j.terminal ? " (" + j.terminal + ")" : "") + "…", done: "Marked done",
+      focus: "Switched to its " + (j.focused || "terminal") + " tab",
       undone: "Reopened", park: "Parked", unpark: "Unparked", note: "Note saved",
       open_folder: "Opening the folder…", refresh_prs: "PR states refreshed",
       dismiss: "Dismissed", dismiss_all: "Notifications cleared",
@@ -429,9 +431,19 @@ function chipRow(s, max, withTitle) {
 const linkChip = (l, full) => h("a", { class: "lchip", href: l.url, target: "_blank", rel: "noopener noreferrer", title: l.url }, ic(l.icon), full ? l.full : l.label);
 const noteEl = (s) => s.note ? h("span", { class: "note" }, ic("note"), s.note) : null;
 const loc = (s) => h("div", { class: "loc" }, ic("folder"), h("span", { class: "mono", title: s.cwd }, s.project),
-  s.name ? h("span", { class: "mono", title: "Session name: what other sessions use to message it" }, "@" + s.name) : null, ic("branch"),
+  nameChip(s), ic("branch"),
   h("span", { class: "mono" }, s.branch), h("span", { class: "sep" }, "·"), h("span", {}, s.prompts + (s.prompts === 1 ? " prompt" : " prompts")),
   h("span", { class: "sep" }, "·"), h("span", { class: "mono", title: s.id }, s.sid));
+let lastById = {};
+// A session's messaging name. Open in a terminal: a click goes to its tab, like a clicked notification. Otherwise: its details.
+function nameChip(s, key) {
+  if (!s.name) return null;
+  key = key || "n:" + s.id;  // a session can own several PRs: each row's chip needs its own focus key
+  return h("button", { class: "lchip namechip", "data-on": s.run ? "on" : "off", "data-key": key,
+    title: (s.peerOpen ? "Go to its terminal tab" : (s.run ? "Running" : "Not running") + " · open the details") + "\nOther sessions message it as @" + s.name,
+    onclick: (e) => { e.stopPropagation(); if (s.peerOpen) act(s.id, "focus"); else openDrawer(s.id, key); } },
+    h("span", { class: "run-dot" }), "@" + s.name);
+}
 const nmark = (s) => s.notif ? h("span", { class: "nmark", title: "Notification: " + s.notif.title }, ic("bell", "i-xs"), h("span", { class: "sr" }, "Notification waiting")) : null;
 const titleBtn = (s, cls) => h("button", { class: cls || "title-btn", "data-nav": s.id, "data-key": "t:" + s.id, onclick: () => openDrawer(s.id) }, s.title, nmark(s));
 
@@ -492,7 +504,7 @@ function row(s) {
     pill(s),
     h("div", { class: "row-main" }, titleBtn(s), h("span", { class: "row-reason", title: s.reason }, s.reason)),
     h("span", { class: "row-loc", title: s.cwd }, s.project, " ", h("span", {}, "/"), " ", s.branch),
-    h("span", { class: "row-prs" }, chipRow(s, 2), noteEl(s)),
+    h("span", { class: "row-prs" }, nameChip(s), chipRow(s, 2), noteEl(s)),
     ctx(s), h("span", { class: "ago" }, s.ago),
     h("span", { class: "row-acts" }, resumeBtn(s, "btn btn-sm resume", null, "i-sm"), menuBtn(s, false, "More actions for " + s.title)));
 }
@@ -523,6 +535,8 @@ function focusPanel(items) {
 
 // ---- header pieces ----
 function renderLive() {
+  // an unchanged snapshot (304) redraws nothing: keep the PR view's "From GitHub, … ago" moving
+  for (const el of document.querySelectorAll("[data-ago-from]")) el.textContent = agoText(Math.round(Date.now() / 1000 - Number(el.dataset.agoFrom)));
   const off = offline() || (!data && failures > 0);
   $("live").dataset.on = off ? "off" : "on";
   $("liveText").textContent = off ? "Offline" : data ? "Live" : "Connecting";
@@ -561,6 +575,14 @@ function renderHint() {
 
 function renderLegend() {
   $("legendBtn").setAttribute("aria-expanded", ui.legend ? "true" : "false");
+  $("legendBtn").setAttribute("aria-label", ui.view === "prs" ? "Legend: what the PR steps mean" : "Legend: what the states mean");
+  const gicon = (i) => h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(i, "i-xs"));
+  if (ui.legend && ui.view === "prs") return $("legendHost").replaceChildren(h("div", { class: "legend", role: "dialog", "aria-label": "PR steps legend", onclick: (e) => e.stopPropagation() },
+    STEPS.map((st) => h("div", { "data-g": st.g, "data-key": "lg:" + st.s },
+      h("h4", {}, gicon(st.i), st.s + ". " + st.l),
+      h("ul", {}, st.d.map((t) => h("li", {}, h("span", {}, t)))))),
+    h("div", { "data-key": "lg:who" }, h("h4", {}, "Who acts"),
+      h("ul", {}, WHO.map(([l, k, t]) => h("li", {}, h("span", { class: "plan-who", "data-who": k }, l), h("span", { style: "padding-top: 2px" }, t)))))));
   $("legendHost").replaceChildren(ui.legend ? h("div", { class: "legend", role: "dialog", "aria-label": "State legend", onclick: (e) => e.stopPropagation() },
     GR.map((g) => h("div", { "data-g": g.k },
       h("h4", {}, h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(g.i, "i-xs")), g.l),
@@ -649,6 +671,16 @@ function render() {
   const listed = groups.reduce((a, g) => a + g.items.length, 0);
 
   const out = [];
+  renderInbox();
+  if (!isOff && data.plan) out.push(viewSwitch(all.length - doneN));
+  if (!isOff && ui.view === "prs" && data.plan) {
+    lastById = Object.fromEntries(all.map((s) => [s.id, s]));
+    out.push(...planView(q));
+    $("main").replaceChildren(...out);
+    renderDrawer(all);
+    if (keep) focusKey(keep);
+    return;
+  }
   if (isOff) {
     out.push(h("div", { class: "banners" }, h("div", { class: "banner", "data-tone": "error", role: "alert" }, ic("wifi-off"),
       h("span", { class: "banner-text" }, h("b", {}, "Can’t reach the ccdeck server on localhost:" + data.port + "."),
@@ -754,6 +786,91 @@ function reviewSection(items) {
       h("span", { class: "rr-repo mono" }, r.repo), h("span", { class: "rr-by" }, r.author ? "by " + r.author : ""),
       h("span", { class: "ago" }, agoShort(r.updated))))));
 }
+// ---- PR focus plan: every open PR in one of five steps, from GitHub statuses only ----
+const STEPS = [
+  { s: 1, l: "Merge", g: "turn", i: "merge", k: "approved", hint: "Green and mergeable; resolve your replied threads first",
+    d: ["Checks pass, nothing blocks it: merge it.", "Threads you replied to: resolve them first.", "Behind its base: update the branch."] },
+  { s: 2, l: "Fix", g: "need", i: "x-circle", k: "fail", hint: "CI, conflicts, review comments or a draft to look over",
+    d: ["CI failing, conflicts, changes requested or review comments to answer: the owning session fixes them if it's running, otherwise you.",
+        "A draft: look it over and mark it ready. Only a session working on it right now keeps it off this step."] },
+  { s: 3, l: "Review", g: "pr", i: "pr", k: "ready", hint: "Colleagues' PRs that ask for your review",
+    d: ["A colleague asked you, or a team you're in, to review it."] },
+  { s: 4, l: "Waiting", g: "work", i: "clock", k: "run", hint: "CI, reviewers, a base PR, or a session working on it",
+    d: ["Nothing for you yet: CI running, a review or required check pending, the PR below it in a stack still open, or GitHub still checking whether it can merge.",
+        "A draft whose session is working on it."] },
+  { s: 5, l: "Clean up", g: "closed", i: "slash", k: "draft", hint: "No activity for 14 days",
+    d: ["No activity for 14 days: close it or pick it up.", "One with something to fix stays in Fix while its session runs; a draft, while it has a session."] },
+];
+const WHO = [["You", "you", "You act on it."], ["Session", "session", "Its running session acts; Message copies a request for it."], ["—", "none", "Nobody can act yet."]];
+const planRows = () => ((data.plan && data.plan.rows) || []).filter((r) => ui.scope === "all" || r.session || r.step === 3);
+function viewSwitch(nSessions) {
+  const rows = planRows();
+  const yours = rows.filter((r) => r.actor === "you").length;
+  const pick = (v) => { ui.view = v; ls.set("view", v); render(); };
+  return h("nav", { class: "filters viewsw", "aria-label": "View" },
+    h("button", { class: "fchip", "aria-pressed": ui.view !== "prs" ? "true" : "false", "data-key": "v:sessions", onclick: () => pick("sessions") },
+      ic("deck", "i-sm"), "Sessions ", h("b", {}, nSessions)),
+    h("button", { class: "fchip", "aria-pressed": ui.view === "prs" ? "true" : "false", "data-key": "v:prs", onclick: () => pick("prs"),
+      title: yours + " of " + rows.length + " open PRs wait on you" }, ic("pr", "i-sm"), "PRs ", h("b", {}, rows.length)));
+}
+function planView(q) {
+  let rows = planRows();
+  if (q) rows = rows.filter((r) => [r.repo, r.title, r.head, "#" + r.number, r.session ? "@" + r.session.name : ""].join(" ").toLowerCase().includes(q.toLowerCase()));
+  const setScope = (v) => { ui.scope = v; ls.set("prScope", v); render(); };
+  const out = [h("nav", { class: "filters", "aria-label": "Which PRs and which step" },
+    h("button", { class: "fchip", "aria-pressed": ui.scope !== "all" ? "true" : "false", "data-key": "sc:sessions", onclick: () => setScope("sessions"),
+      title: "PRs your sessions own, plus review requests" }, "From sessions"),
+    h("button", { class: "fchip", "aria-pressed": ui.scope === "all" ? "true" : "false", "data-key": "sc:all", onclick: () => setScope("all"),
+      title: "Every open PR you authored, with or without a session" }, "All mine"),
+    h("span", { class: "viewsw-gap" }),
+    ...STEPS.map((st) => {
+      const n = rows.filter((r) => r.step === st.s).length;
+      return h("button", { class: "fchip", "data-g": st.g, "data-zero": n ? "false" : "true", "data-alarm": st.s === 2 && n ? "true" : "false",
+        "aria-pressed": ui.step === st.s ? "true" : "false", "data-key": "st:" + st.s,
+        onclick: () => { ui.step = ui.step === st.s ? 0 : st.s; render(); } }, h("span", { class: "dot" }), st.s + " " + st.l + " ", h("b", {}, n));
+    }))];
+  const p = data.plan;
+  if (p.truncated) out.push(h("p", { role: "status" }, "Authored PRs limited to the first 100 results; stack targets may be missing."));
+  if (!p.fetched) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, "No PR data yet"),
+    h("p", {}, p.disabled ? "PR plan fetching is disabled (CCDECK_PR_PLAN=0). Review requests remain available." : p.state === "auth_required" ? "GitHub authentication required: run gh auth login." : p.state === "failed" ? "GitHub request failed. Check your connection and run gh auth login if authentication is required." : data.gh ? "ccdeck asks GitHub every 5 minutes; the first answer is on its way." : "This view needs the GitHub CLI: install gh and run gh auth login.")));
+  if ((p.fetched || rows.length) && !rows.some((r) => !ui.step || r.step === ui.step)) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, q ? "No PRs match “" + q + "”" : "No open PRs"),
+    h("p", {}, ui.scope === "all" ? "Nothing open that you authored or are asked to review." : "Your sessions own no open PRs. Try “All mine”."), ui.step ? h("button", { class: "btn", onclick: () => {
+      const k = "st:" + ui.step; ui.step = 0; render();
+      const chip = document.querySelector('[data-key="' + k + '"]'); if (chip) chip.focus();  // this button is gone: back to the step chip
+    } }, "Clear step selection") : null));
+  for (const st of STEPS) {
+    if (ui.step && ui.step !== st.s) continue;
+    const part = rows.filter((r) => r.step === st.s);
+    if (!part.length) continue;
+    out.push(h("section", { class: "section", "data-g": st.g, "aria-labelledby": "h-step" + st.s },
+      h("div", { class: st.s === 2 ? "ghdr ghdr-strong" : st.s >= 4 ? "ghdr ghdr-quiet" : "ghdr" },
+        h("h2", { id: "h-step" + st.s }, h("span", { class: "gicon" }, ic(st.i)), st.s + ". " + st.l + " ", h("span", { class: "gcount" }, part.length)),
+        h("span", { class: "rule" }), h("span", { class: "ghint" }, st.hint)),
+      h("ul", { class: "rrlist plan", "data-g": st.g }, part.map((r) => planRow(r, st)))));
+  }
+  out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"),
+    p.disabled ? "PR plan fetching is disabled" : p.fetched ? [(p.state === "failed" || p.state === "auth_required" ? "Refresh failed; cached data from GitHub, " : "From GitHub, "),
+      h("span", { "data-ago-from": String(p.fetched) }, agoText(Math.round(Date.now() / 1000 - p.fetched))), " · refreshes every 5 min · no AI, statuses only"] : "Waiting for GitHub")));
+  return out;
+}
+function planRow(r, st) {
+  const s = r.session;
+  const validUrl = /^https?:\/\//i.test(r.url || "");
+  const link = validUrl ? { href: r.url, target: "_blank", rel: "noopener noreferrer" } : {};
+  const msg = st.s === 2 && s && s.alive && r.actor === "session" ? r.repo + "#" + r.number + " needs work: " + r.texts.join("; ") + ". Please fix what's worth fixing and reply on the review threads; I resolve them. " + r.url : "";
+  return h("li", { "data-key": "pr:" + r.url },
+    h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l, "data-key": "prn:" + r.url }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
+    h("div", { class: "plan-main" },
+      h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title, "data-key": "prt:" + r.url }, link), r.title),
+      h("span", { class: "plan-next" }, r.texts.join(" · "))),
+    h("span", { class: "rr-repo mono" }, r.repo),
+    s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }), "n:" + s.id + ":" + r.url)
+      : h("span", { class: "rr-by" }, st.s === 3 ? "by " + r.author : "no session"),
+    h("span", { class: "plan-who", "data-who": r.actor || "none" }, r.actor === "you" ? "You" : r.actor === "session" ? "Session" : "—"),
+    msg ? h("button", { class: "btn btn-sm", "data-key": "prm:" + r.url, title: "Copy a message for @" + s.name, onclick: () => copy(msg, "Message for @" + s.name) }, ic("copy", "i-sm"), "Message")
+      : h("span", {}),
+    h("span", { class: "ago" }, agoShort(r.updated)));
+}
 function staleMore(all) {
   const parts = GR.filter((g) => g.k !== "need" && g.k !== "done").map((g) => [all.filter((s) => s.g === g.k).length, g.l.toLowerCase()]).filter((x) => x[0]);
   if (!parts.length) return null;
@@ -808,8 +925,8 @@ function notifText(s) {
       same ? h("span", { class: "dnotif-same" }, "Same as the last message below") : null),
     open ? h("div", { class: "msg md", id: "dr-notif-text" }, md(body)) : null);
 }
-function openDrawer(id) { ui.drawer = id; ui.menu = ""; drawerSig = ""; render(); setTimeout(() => focusKey("dr-close"), 0); }
-function closeDrawer() { const id = ui.drawer; ui.drawer = ""; drawerSig = ""; renderDrawer([]); if (id) focusKey("t:" + id); }
+function openDrawer(id, returnKey) { ui.drawerReturn = returnKey || "t:" + id; ui.drawer = id; ui.menu = ""; drawerSig = ""; render(); setTimeout(() => focusKey("dr-close"), 0); }
+function closeDrawer() { const id = ui.drawer; ui.drawer = ""; drawerSig = ""; renderDrawer([]); if (id) focusKey(ui.drawerReturn || "t:" + id); }
 function renderDrawer(all) {
   if (all.length) lastAll = all;
   const host = $("drawerHost");

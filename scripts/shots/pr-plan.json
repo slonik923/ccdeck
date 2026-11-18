@@ -1,0 +1,15 @@
+{
+  "shots": [
+    { "name": "prs", "width": 1440, "height": 1000, "full": true, "scale": 1,
+      "steps": [ { "click": "[data-key='v:prs']", "wait": 400 }, { "click": "[data-key='sc:all']", "wait": 400 } ],
+      "highlight": [
+        { "sel": ".viewsw", "label": "New: Sessions | PRs" },
+        { "sel": "#h-step1", "label": "Resolve your replied threads, then merge" },
+        { "sel": "#h-step2", "label": "Fix: CI, conflicts, comments left by others" },
+        { "sel": "#h-step4", "label": "Waiting: CI, reviewers, a base PR, a working session" }
+      ] },
+    { "name": "board", "width": 1440, "height": 1000, "scale": 1,
+      "steps": [ { "click": "[data-key='v:sessions']", "wait": 400 } ],
+      "highlight": [ { "sel": ".viewsw", "label": "New: switch to the PRs view" } ] }
+  ]
+}
