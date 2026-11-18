@@ -466,13 +466,33 @@ class ClassifyTest(unittest.TestCase):
                                   result("g1", 79, out), asst([text("Submitted.")], 78)])
         write_session("s-stack-view", [user("show it", 80), asst([tool("g2", "Bash", {"command": "gh pr list"})], 79),
                                        result("g2", 79, "✓ Created PR #13 for feat/c"), asst([text("Listed.")], 78)])
-        cc.github_repo.cache_clear()
-        with mock.patch.object(cc.subprocess, "run", return_value=type("R", (), {"stdout": "git@github.com:acme/app.git\n"})):
-            info = cc.parse_transcript(PROJ / "s-stack.jsonl")
-            other = cc.parse_transcript(PROJ / "s-stack-view.jsonl")
-        cc.github_repo.cache_clear()
+        info = cc.parse_transcript(PROJ / "s-stack.jsonl")
+        other = cc.parse_transcript(PROJ / "s-stack-view.jsonl")
+        self.assertEqual(info["prs"], [])  # numbers only: links come from the folder's remote, on every scan
+        remotes = {str(WORK): "git@github.com:acme/app.git\n", "/elsewhere": "https://github.com/acme/other\n"}
+        failing = [True]
+        def git(argv, **kw):
+            if failing[0]:
+                raise cc.subprocess.TimeoutExpired(argv, 3)
+            return type("R", (), {"stdout": remotes.get(argv[2], "")})
+        cc._repo_cache.clear()
+        self.addCleanup(cc._repo_cache.clear)
+        with mock.patch.object(cc.subprocess, "run", side_effect=git), mock.patch.object(cc.time, "time", return_value=1000.0):
+            self.assertEqual(cc.with_stack_prs(info)["prs"], [])  # git timed out
+            failing[0] = False
+            self.assertEqual(cc.with_stack_prs(info)["prs"], [])  # a failure is asked again only after a minute
+        with mock.patch.object(cc.subprocess, "run", side_effect=git), mock.patch.object(cc.time, "time", return_value=1061.0):
+            info = cc.with_stack_prs(info)
         self.assertEqual(sorted(info["prs"]), ["https://github.com/acme/app/pull/11", "https://github.com/acme/app/pull/12"])
         self.assertEqual(set(info["pr_sources"].values()), {"created"})
+        # each result keeps the folder it ran in
+        moved = dict(result("g3", 70, "✓ Created PR #4 for feat/d"), cwd="/elsewhere")
+        write_session("s-two-repos", [user("submit", 80), asst([tool("g1", "Bash", {"command": "gh stack submit"})], 79), result("g1", 79, out),
+                                      asst([tool("g3", "Bash", {"command": "cd /elsewhere && gh stack submit"})], 71), moved])
+        with mock.patch.object(cc.subprocess, "run", side_effect=git):
+            two = cc.with_stack_prs(cc.parse_transcript(PROJ / "s-two-repos.jsonl"))
+        self.assertEqual(sorted(two["prs"]), ["https://github.com/acme/app/pull/11", "https://github.com/acme/app/pull/12",
+                                              "https://github.com/acme/other/pull/4"])
         self.assertEqual(other["prs"], [])  # only gh stack's own output counts
         # Claude Code's pr-link entries name the session's PRs with links
         write_session("s-linked", [user("ship", 80), asst([text("Opened it.")], 79),
@@ -481,9 +501,11 @@ class ClassifyTest(unittest.TestCase):
         linked = cc.parse_transcript(PROJ / "s-linked.jsonl")
         self.assertEqual((linked["prs"], linked["pr_sources"]), ([PR.format(5)], {PR.format(5): "created"}))
         for remote, repo in (("https://github.com/acme/app.git", "acme/app"), ("https://github.com/acme/my.app", "acme/my.app"),
+                             ("ssh://git@github.com/acme/app.git", "acme/app"), ("https://token@github.com/acme/app", "acme/app"),
+                             ("https://notgithub.com/acme/app.git", None), ("git@notgithub.com:acme/app.git", None),
                              ("git@gitlab.com:acme/app.git", None), ("", None)):
             with self.subTest(remote=remote):
-                m = cc.GITHUB_REMOTE_RE.search(remote)
+                m = cc.GITHUB_REMOTE_RE.fullmatch(remote)
                 self.assertEqual(m.group(1) if m else None, repo)
 
     def test_links_and_files(self):

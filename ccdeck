@@ -23,7 +23,6 @@ ID is a row number from the last list or any unique prefix of a session id.
 
 import argparse
 import fcntl
-import functools
 import importlib.util
 import hashlib
 import json
@@ -73,7 +72,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 13  # 13: PRs from pr-link entries and gh stack output
+CACHE_VERSION = 14  # 14: PRs from pr-link entries and gh stack output (resolved per folder)
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -423,7 +422,8 @@ def _running_claude_ps():
 PR_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 # `gh stack submit` names a stack's PRs without links: "✓ Created PR #12 for feat/x", "PR #11 for feat/w is up to date"
 STACK_PR_RE = re.compile(r"^\s*(?:✓\s*)?(?:(?:Created|Updated) PR #(\d+) for \S+|PR #(\d+) for \S+ is up to date)\s*$", re.M)
-GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+# the whole remote: https://github.com/o/r(.git), ssh://git@github.com/o/r, git@github.com:o/r (not notgithub.com)
+GITHUB_REMOTE_RE = re.compile(r"(?:https?://(?:[^@/\s]+@)?|ssh://git@|git@)github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?")
 REF_RES = [  # links shown on a session (Linear issues are handled on their own below)
     ("artifact", re.compile(r"https://claude\.ai/(?:code/)?artifacts?/[\w-]+")),
     ("notion", re.compile(r"https://(?:www\.|app\.)?notion\.(?:so|site|com)/[\w./?=&%#-]+")),
@@ -600,17 +600,37 @@ def is_headless(info):
     return str(info.get("entrypoint") or "").startswith("sdk")
 
 
-@functools.lru_cache(maxsize=256)
+_repo_cache = {}  # folder -> (owner/name or None, when): an answer is kept, a failure is asked again after a minute
+
+
 def github_repo(cwd):
     """owner/name of the GitHub repo a folder's origin remote points at, or None."""
     if not cwd:
         return None
+    hit = _repo_cache.get(cwd)
+    if hit and (hit[0] or time.time() - hit[1] < 60):
+        return hit[0]
     try:
         out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=3).stdout
     except (OSError, subprocess.SubprocessError):
-        return None
-    m = GITHUB_REMOTE_RE.search(out.strip())
-    return m.group(1) if m else None
+        out = ""
+    m = GITHUB_REMOTE_RE.fullmatch(out.strip())
+    _repo_cache[cwd] = (m.group(1) if m else None, time.time())
+    return _repo_cache[cwd][0]
+
+
+def with_stack_prs(info):
+    """The session with the PRs `gh stack submit` named, as links: each in the repo of the folder that
+    command ran in. Resolved on every scan, not in the cached parse, so a failed lookup is tried again."""
+    found = {}
+    for cwd, n in info.get("stack_prs") or ():
+        repo = github_repo(cwd)
+        if repo:
+            found[f"https://github.com/{repo}/pull/{n}"] = "created"
+    if not found:
+        return info
+    sources = dict(info.get("pr_sources") or {}, **found)
+    return dict(info, prs=list(dict.fromkeys(list(info.get("prs") or []) + list(found))), pr_sources=sources)
 
 
 def parse_transcript(path):
@@ -623,7 +643,7 @@ def parse_transcript(path):
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
     refs, linear, keys, tool_titles, not_created, questions = {}, {}, {}, {}, {}, {}
-    stack_prs = set()  # PR numbers `gh stack submit` printed; their repo is the session folder's
+    stack_prs = {}  # (folder, PR number) that `gh stack submit` printed, without links; with_stack_prs resolves them
     seen_msgs = set()
 
     def note_ref(url, kind, title, source):
@@ -730,7 +750,8 @@ def parse_transcript(path):
                                 src = "created" if creating else "tool"
                                 add_refs(body, src, with_prs=creating)
                                 if name == "Bash:create":
-                                    stack_prs.update(int(x or y) for x, y in STACK_PR_RE.findall(body))
+                                    for x, y in STACK_PR_RE.findall(body):
+                                        stack_prs[(e.get("cwd") or info["cwd"], int(x or y))] = None
                                 add_json_titles(body, src)
                                 if tid in tool_titles:  # an Artifact publish: title from its own input
                                     for r in refs.values():
@@ -803,9 +824,7 @@ def parse_transcript(path):
     info["pending_input"] = pending_inputs.get(list(pending)[-1]) if pending else None
     info["pending_question"] = questions.get(list(pending)[-1]) if pending else None
     info["pending_id"] = list(pending)[-1] if pending else None
-    repo = github_repo(info["cwd"]) if stack_prs else None
-    for n in sorted(stack_prs) if repo else ():
-        prs[f"https://github.com/{repo}/pull/{n}"] = "created"
+    info["stack_prs"] = [[cwd, n] for cwd, n in stack_prs if cwd]
     info["prs"] = list(prs)
     info["pr_sources"] = dict(prs)
     for r in refs.values():
@@ -854,7 +873,7 @@ def scan_transcripts():
                     continue
                 prev = sessions.get(info["id"])
                 if not prev or info["last_ts"] > prev["last_ts"]:
-                    sessions[info["id"]] = dict(info)
+                    sessions[info["id"]] = dict(with_stack_prs(info))
             sub_usage = {}
             for path in PROJECTS_DIR.glob("*/*/subagents/*.jsonl"):
                 try:
