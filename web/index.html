@@ -799,7 +799,7 @@ const STEPS = [
     d: ["Nothing for you yet: CI running, a review or required check pending, the PR below it in a stack still open, or GitHub still checking whether it can merge.",
         "A draft whose session is working on it."] },
   { s: 5, l: "Clean up", g: "closed", i: "slash", k: "draft", hint: "No activity for 14 days",
-    d: ["No activity for 14 days and no running session: close it or pick it up."] },
+    d: ["No activity for 14 days: close it or pick it up.", "One with something to fix stays in Fix while its session runs; a draft, while it has a session."] },
 ];
 const WHO = [["You", "you", "You act on it."], ["Session", "session", "Its running session acts; Message copies a request for it."], ["—", "none", "Nobody can act yet."]];
 const planRows = () => ((data.plan && data.plan.rows) || []).filter((r) => ui.scope === "all" || r.session || r.step === 3);
