@@ -500,8 +500,18 @@ class ClassifyTest(unittest.TestCase):
                                  result("g4", 79, "✓ Created PR #5 for feat/e\n✓ Created PR #6 for feat/f"), asst([text("Done.")], 78)])
         with mock.patch.object(cc.subprocess, "run", side_effect=git):
             self.assertEqual(cc.with_stack_prs(cc.parse_transcript(PROJ / "s-both.jsonl"))["prs"], [])
+        # two spellings of one folder (a symlink) are one folder
+        with tempfile.TemporaryDirectory() as root:
+            real = Path(root) / "repo"
+            real.mkdir()
+            (Path(root) / "link").symlink_to(real)
+            twice = f"cd {real} && gh stack submit; cd {Path(root) / 'link'} && gh stack submit"
+            write_session("s-twice", [user("submit", 80), asst([tool("g5", "Bash", {"command": twice})], 79),
+                                      result("g5", 79, "✓ Created PR #7 for feat/g"), asst([text("Done.")], 78)])
+            self.assertEqual(cc.parse_transcript(PROJ / "s-twice.jsonl")["stack_prs"], [[str(real), 7]])
         for cmd, dirs in (("gh stack submit", ["/w/a"]), ("cd /w/b && gh stack submit", ["/w/b"]), ("cd sub && gh stack push", ["/w/a/sub"]),
-                          ("cd /w/a && gh stack submit; cd /w/b && gh stack submit", ["/w/a", "/w/b"]), ("cd - && gh stack submit", [None])):
+                          ("cd /w/a && gh stack submit; cd /w/b && gh stack submit", ["/w/a", "/w/b"]), ("cd - && gh stack submit", [None]),
+                          ("(cd /w/b && make)\ngh stack submit", ["/w/a"]), ("(cd /w/b && gh stack submit)", ["/w/b"])):
             with self.subTest(cmd=cmd):
                 self.assertEqual(cc.gh_stack_dirs(cmd, "/w/a"), dirs)
         self.assertEqual(other["prs"], [])  # only gh stack's own output counts

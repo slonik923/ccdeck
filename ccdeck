@@ -617,9 +617,13 @@ def gh_stack_dirs(cmd, cwd):
     except ValueError:
         return []
     ops = ("&&", "||", ";", "|", "\n", "(", ")", "&")
-    out, here, start = [], cwd or None, True
+    out, here, start, saved = [], cwd or None, True, []
     for i, w in enumerate(words):
         if w in ops:
+            if w == "(":  # a subshell's cd ends with it: `(cd /b && make)` leaves the folder as it was
+                saved.append(here)
+            elif w == ")" and saved:
+                here = saved.pop()
             start = True
             continue
         if start and w == "gh" and i + 1 < len(words) and words[i + 1] == "stack":
@@ -864,7 +868,8 @@ def parse_transcript(path):
                         if dirs:
                             tool_names[b.get("id")] = "Bash:stack"
                             # its number-only lines belong to the folder it ran in; two folders can't be told apart
-                            stack_dirs[b.get("id")] = dirs[0] if len(set(dirs)) == 1 else None
+                            same = {os.path.realpath(d) if d else None for d in dirs}  # /var/x is /private/var/x
+                            stack_dirs[b.get("id")] = dirs[0] if len(same) == 1 and None not in same else None
                         elif "gh pr create" in cmd or "git push" in cmd:
                             tool_names[b.get("id")] = "Bash:create"
     info["pending_tool"] = list(pending.values())[-1] if pending else None
