@@ -1438,6 +1438,14 @@ class ResumedIdsTest(unittest.TestCase):
                  (8, "/w", ["claude", "--print", "--resume=e"])]
         self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c"})
 
+    def test_print_flag_in_a_cluster(self):
+        for a in ("-p", "--print", "-pc", "-cp"):
+            self.assertTrue(cc.is_print_flag(a), a)
+        for a in ("-c", "--permission-mode", "-p=x", "-1p", "explain -p usage", "p"):
+            self.assertFalse(cc.is_print_flag(a), a)
+        procs = [(1, "/w", ["claude", "-pc", "query"]), (2, "/w", ["claude", "-c"])]
+        self.assertEqual([p[0] for p in cc.interactive_processes(procs)], [2])
+
 
 class GuessLiveTest(unittest.TestCase):
     def test_headless_processes_do_not_keep_older_sessions_alive(self):

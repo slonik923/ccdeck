@@ -1089,8 +1089,13 @@ def classify(s, hook, alive):
     return "closed_midtask" if s.get("last_role") in ("user", "tool") else "closed"
 
 
+def is_print_flag(a):
+    """-p, --print, or a cluster of short flags with p in it (-pc): claude -p never waits for you."""
+    return a == "--print" or bool(re.fullmatch(r"-[A-Za-z]*p[A-Za-z]*", a))
+
+
 def interactive_processes(procs):
-    return [p for p in procs if not any(a in ("-p", "--print") for a in p[2][1:])]
+    return [p for p in procs if not any(is_print_flag(a) for a in p[2][1:])]
 
 
 def resumed_ids(procs):
