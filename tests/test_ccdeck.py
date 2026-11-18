@@ -591,27 +591,42 @@ class HookTest(unittest.TestCase):
         """claude -p --resume <id> fires the same hooks: they mustn't open the session, mark it working, end it,
         or take over the record of the interactive process that has it open."""
         build_fixtures()
-        sid, me = "s-closed", os.getpid()
+        sid, me, headless_pid = "s-closed", os.getpid(), 999_999
         path = cc.STATE_DIR / f"{sid}.json"
         path.unlink(missing_ok=True)
         self.addCleanup(path.unlink, missing_ok=True)
-        def hook(event, headless, **kw):
-            with mock.patch.object(cc, "find_claude_ancestor", return_value=me), \
-                    mock.patch.object(cc, "pid_is_headless", return_value=headless):
+        def hook(event, sender, **kw):
+            with mock.patch.object(cc, "find_claude_ancestor", return_value=sender), \
+                    mock.patch.object(cc, "pid_is_headless", lambda p: p == headless_pid):
                 self.run_hook(dict({"session_id": sid, "hook_event_name": event, "cwd": str(WORK)}, **kw))
         def row():
             with mock.patch.object(cc, "peer_sessions", return_value={}), \
                     mock.patch.object(cc, "running_claude_processes", return_value=[]):
                 return by_id(cc.collect(True, 10 ** 6))[sid]
-        hook("UserPromptSubmit", True)
+        hook("UserPromptSubmit", headless_pid)
         self.assertFalse(path.exists())                       # headless first: nothing recorded
         self.assertFalse(row()["alive"])
-        hook("UserPromptSubmit", False)
-        hook("Stop", False)
+        hook("UserPromptSubmit", me)
+        hook("Stop", me)
         self.assertEqual((row()["alive"], row()["state"]), (True, "idle"))
-        hook("UserPromptSubmit", True)                        # a -p run on the open session
-        hook("SessionEnd", True, reason="other")
+        for event, kw in (("UserPromptSubmit", {}), ("SessionEnd", {"reason": "other"})):  # a -p run on the open session
+            before = path.read_text()
+            hook(event, headless_pid, **kw)
+            self.assertEqual(path.read_text(), before, event)  # not a field changed
         self.assertEqual((row()["alive"], row()["state"]), (True, "idle"))
+        # the interactive process is gone: a -p run still doesn't take the record over
+        cc.save_json(path, dict(json.loads(path.read_text()), pid=999_998, pid_start=None))
+        before = path.read_text()
+        hook("UserPromptSubmit", headless_pid)
+        self.assertEqual(path.read_text(), before)
+
+    def test_a_duplicate_event_looks_up_no_process(self):
+        build_fixtures()
+        sid = "s-closed"
+        self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
+        self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
+        with mock.patch.object(cc, "find_claude_ancestor", side_effect=AssertionError("looked up")):
+            self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
 
     def test_resumed_session_isnt_held_back_by_the_ended_hook(self):
         build_fixtures()
@@ -1469,6 +1484,12 @@ class ResumedIdsTest(unittest.TestCase):
                  (7, "/w", ["claude", "-p", "--resume", "d"]),
                  (8, "/w", ["claude", "--print", "--resume=e"])]
         self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c"})
+
+    def test_after_double_dash_comes_the_prompt(self):
+        self.assertTrue(cc.is_print_argv(["claude", "-c", "-p", "q"]))
+        self.assertFalse(cc.is_print_argv(["claude", "--", "-p"]))
+        self.assertTrue(cc.is_print_argv(["claude", "-p", "--", "-x"]))
+        self.assertEqual([p[0] for p in cc.interactive_processes([(1, "/w", ["claude", "--", "-p"])])], [1])
 
     def test_headless_pid(self):
         with mock.patch.object(cc, "_process_argv", lambda p: {1: ["claude", "-pc", "q"], 2: ["claude", "-c"]}.get(p, [])):

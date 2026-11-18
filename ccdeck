@@ -200,7 +200,7 @@ def one_line(s, n):
 # ------------------------------------------------------------------ processes
 
 USE_PROC = os.path.exists("/proc/self/stat") and os.environ.get("CCDECK_NO_PROC") != "1"  # set to test the macOS path
-_ps_cache = {"t": 0.0, "rows": {}}
+_ps_cache = {"t": 0.0, "rows": {}, "timeout": 10}  # a hook lowers the timeout: it must exit fast
 
 
 def parse_ps(text):
@@ -223,7 +223,7 @@ def ps_table():
         return _ps_cache["rows"]
     try:
         out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,lstart=,command="], capture_output=True,
-                             text=True, timeout=10, env=dict(os.environ, LC_ALL="C")).stdout
+                             text=True, timeout=_ps_cache["timeout"], env=dict(os.environ, LC_ALL="C")).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
     _ps_cache.update(t=now, rows=parse_ps(out))
@@ -1095,8 +1095,18 @@ def is_print_flag(a):
     return a == "--print" or bool(re.fullmatch(r"-[A-Za-z]*p[A-Za-z]*", a))
 
 
+def is_print_argv(argv):
+    """Whether a claude command line runs headless. After `--` come prompt words, not options (`claude -- -p`)."""
+    for a in argv[1:]:
+        if a == "--":
+            return False
+        if is_print_flag(a):
+            return True
+    return False
+
+
 def interactive_processes(procs):
-    return [p for p in procs if not any(is_print_flag(a) for a in p[2][1:])]
+    return [p for p in procs if not is_print_argv(p[2])]
 
 
 def resumed_ids(procs):
@@ -2707,9 +2717,6 @@ def cmd_hook(_args):
     sid = str(data["session_id"])
     if not re.fullmatch(r"[\w-]+", sid):
         return
-    sender = find_claude_ancestor()
-    if pid_is_headless(sender):
-        return  # a `claude -p` run (even `-p --resume <id>`): it never waits for you, and mustn't speak for the session
     event = data.get("hook_event_name", "")
     path = STATE_DIR / f"{sid}.json"
     state = load_json(path, {})
@@ -2718,6 +2725,11 @@ def cmd_hook(_args):
             and event not in ("PostToolUse", "PostToolUseFailure", "PermissionRequest")
             and time.time() - (state.get("ts") or 0) < 1.0):
         return  # same event twice (hooks installed both as a plugin and in settings.json)
+    # A hook must exit fast: give ps 2 s here. If it can't say, the sender counts as interactive, as before.
+    _ps_cache["timeout"] = 2
+    sender = find_claude_ancestor()
+    if pid_is_headless(sender):
+        return  # a `claude -p` run (even `-p --resume <id>`): it never waits for you, and mustn't speak for the session
     state.update(session_id=sid, event=event, ts=time.time(),
                  cwd=data.get("cwd") or state.get("cwd"),
                  ccdeck={"version": VERSION, "script": str(SCRIPT)})  # lets a running dashboard upgrade itself
@@ -2795,8 +2807,7 @@ def input_hash(tool_name, tool_input):
 
 
 def pid_is_headless(pid):
-    argv = (_process_argv(pid) or proc_cmdline(pid)) if pid else []
-    return any(is_print_flag(a) for a in argv[1:])
+    return is_print_argv((_process_argv(pid) or proc_cmdline(pid)) if pid else [])
 
 
 def claude_is_headless():
