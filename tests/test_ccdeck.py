@@ -511,7 +511,10 @@ class ClassifyTest(unittest.TestCase):
             self.assertEqual(cc.parse_transcript(PROJ / "s-twice.jsonl")["stack_prs"], [[str(real), 7]])
         for cmd, dirs in (("gh stack submit", ["/w/a"]), ("cd /w/b && gh stack submit", ["/w/b"]), ("cd sub && gh stack push", ["/w/a/sub"]),
                           ("cd /w/a && gh stack submit; cd /w/b && gh stack submit", ["/w/a", "/w/b"]), ("cd - && gh stack submit", [None]),
-                          ("(cd /w/b && make)\ngh stack submit", ["/w/a"]), ("(cd /w/b && gh stack submit)", ["/w/b"])):
+                          ("(cd /w/b && make)\ngh stack submit", ["/w/a"]), ("(cd /w/b && gh stack submit)", ["/w/b"]),
+                          ("echo '('; cd /w/b; echo ')'; gh stack submit", ["/w/b"]),  # quoted parentheses are text
+                          ("(cd /w/b && gh stack submit); gh stack submit", ["/w/b", "/w/a"]),  # `);` is two operators
+                          ('cd "/w/my dir" && gh stack submit', ["/w/my dir"]), ("echo 'unclosed", [])):
             with self.subTest(cmd=cmd):
                 self.assertEqual(cc.gh_stack_dirs(cmd, "/w/a"), dirs)
         self.assertEqual(other["prs"], [])  # only gh stack's own output counts

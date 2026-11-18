@@ -604,33 +604,69 @@ GIT_LOCATION_VARS = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FI
                      "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
 
 
+SHELL_OPS = ("&&", "||", ";;", ";", "|", "&", "(", ")", "\n")
+
+
+def shell_tokens(cmd):
+    """A shell command as (is_operator, text) tokens: quotes and backslashes make text a word, so a quoted
+    `(` or `;` is never an operator, and `);` is two operators. None for an unclosed quote."""
+    out, word, quoted, i = [], [], False, 0
+    def flush():
+        nonlocal quoted
+        if word or quoted:
+            out.append((False, "".join(word)))
+        word.clear()
+        quoted = False
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch in "'\"":
+            end = cmd.find(ch, i + 1)
+            while ch == '"' and end != -1 and cmd[end - 1] == "\\":
+                end = cmd.find(ch, end + 1)
+            if end == -1:
+                return None
+            word.append(cmd[i + 1:end])
+            quoted, i = True, end + 1
+        elif ch == "\\" and i + 1 < len(cmd):
+            word.append(cmd[i + 1])
+            i += 2
+        elif ch in " \t":
+            flush()
+            i += 1
+        elif op := next((o for o in SHELL_OPS if cmd.startswith(o, i)), None):
+            flush()
+            out.append((True, op))
+            i += len(op)
+        else:
+            word.append(ch)
+            i += 1
+    flush()
+    return out
+
+
 def gh_stack_dirs(cmd, cwd):
     """The folder each `gh stack` in a shell command runs in, following `cd`; [] if it runs none. It runs
     as a command's first word (after && || ; | a newline, or VAR=value words), not as quoted text such as
     `echo 'gh stack submit'`, whose output isn't gh stack's. A folder is None when it can't be told (`cd -`)."""
     if "gh" not in cmd or "stack" not in cmd:
         return []
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace = " \t"  # newlines separate commands
-        words = list(lex)
-    except ValueError:
+    tokens = shell_tokens(cmd)
+    if tokens is None:
         return []
-    ops = ("&&", "||", ";", "|", "\n", "(", ")", "&")
     out, here, start, saved = [], cwd or None, True, []
-    for i, w in enumerate(words):
-        if w in ops:
+    for i, (op, w) in enumerate(tokens):
+        if op:
             if w == "(":  # a subshell's cd ends with it: `(cd /b && make)` leaves the folder as it was
                 saved.append(here)
             elif w == ")" and saved:
                 here = saved.pop()
             start = True
             continue
-        if start and w == "gh" and i + 1 < len(words) and words[i + 1] == "stack":
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else (True, "")
+        if start and w == "gh" and nxt == (False, "stack"):
             out.append(here)
         elif start and w == "cd":
-            arg = words[i + 1] if i + 1 < len(words) and words[i + 1] not in ops else "~"
-            arg = os.path.expanduser(arg)
+            arg = os.path.expanduser(nxt[1] if not nxt[0] else "~")
             here = None if arg == "-" or not (here or os.path.isabs(arg)) else os.path.normpath(os.path.join(here or "/", arg))
         elif start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w, re.S):
             continue  # `CI=1 gh stack submit`: assignments before the command keep its first word to come
