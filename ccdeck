@@ -1220,14 +1220,19 @@ def title_of(s):
             or one_line(s.get("first_prompt"), 90) or "(untitled)")
 
 
-def has_live_owner(sid, hooks, peers):
+def has_live_owner(sid, hooks, peers, owner, resumed):
     """A session open in a terminal stays on the dashboard while `claude -p --resume` writes to it: its
-    latest entries then say "sdk", but an interactive process still runs it. Hooks from print runs are
-    ignored, so a live hook pid is interactive; a registry pid counts unless its arguments say print."""
-    hook = hooks.get(sid) or {}
-    if hook.get("pid") and hook.get("status") != "ended" and pid_alive(hook["pid"], hook.get("pid_start")):
+    latest entries then say "sdk", but an interactive process still runs it. Evidence: its live hook (unless
+    the registry says that process now runs another session), an interactive registry process, or an
+    unregistered interactive `--resume <id>`. Print-run processes never count."""
+    if sid in resumed:
         return True
-    return any(not pid_is_headless(pid) for pid in (peers.get(sid) or {}).get("pids", []))
+    hook = hooks.get(sid) or {}
+    pid = hook.get("pid")
+    if pid and hook.get("status") != "ended" and owner.get(pid, sid) == sid \
+            and pid_alive(pid, hook.get("pid_start")) and not pid_is_headless(pid):
+        return True
+    return any(not pid_is_headless(p) for p in (peers.get(sid) or {}).get("pids", []))
 
 
 def collect(include_all=False, days=DEFAULT_DAYS):
@@ -1237,13 +1242,14 @@ def collect(include_all=False, days=DEFAULT_DAYS):
     procs = running_claude_processes()
     prc = pr_cache()
     peers = peer_sessions()
-    sessions = {sid: s for sid, s in sessions.items() if not is_headless(s) or has_live_owner(sid, hooks, peers)}
 
     # one session per process: the registry knows what a process runs now, its --resume argument
     # only what it started on (/resume switches sessions in place)
     owner = {pid: sid for sid, p in peers.items() for pid in p["pids"]}  # what each registered process runs now
     reg_pids = set(owner)
     resumed = resumed_ids([p for p in procs if p[0] not in reg_pids])
+    sessions = {sid: s for sid, s in sessions.items()
+                if not is_headless(s) or has_live_owner(sid, hooks, peers, owner, resumed)}
     guessed_live = guess_live_sessions(sessions, hooks, procs, resumed, reg_pids, set(peers))
 
     resolve_linear(sessions)

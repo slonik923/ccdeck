@@ -1593,9 +1593,15 @@ class GuessLiveTest(unittest.TestCase):
         self.assertNotIn("s-printing", ids)  # only the print run itself has it open
         me = os.getpid()
         hooks = {"s-h": {"pid": me, "pid_start": cc.proc_start_time(me)}, "s-ended": {"pid": me, "status": "ended"}}
-        self.assertTrue(cc.has_live_owner("s-h", hooks, {}))
-        self.assertFalse(cc.has_live_owner("s-ended", hooks, {}))
-        self.assertFalse(cc.has_live_owner("s-none", hooks, {}))
+        with mock.patch.object(cc, "pid_is_headless", lambda p: False):
+            self.assertTrue(cc.has_live_owner("s-h", hooks, {}, {}, set()))
+            self.assertTrue(cc.has_live_owner("s-h", hooks, {}, {me: "s-h"}, set()))
+            self.assertFalse(cc.has_live_owner("s-h", hooks, {}, {me: "s-b"}, set()))  # /resume moved it to s-b
+            self.assertFalse(cc.has_live_owner("s-ended", hooks, {}, {}, set()))
+            self.assertFalse(cc.has_live_owner("s-none", hooks, {}, {}, set()))
+            self.assertTrue(cc.has_live_owner("s-none", hooks, {}, {}, {"s-none"}))  # an interactive --resume
+        with mock.patch.object(cc, "pid_is_headless", lambda p: p == me):
+            self.assertFalse(cc.has_live_owner("s-h", hooks, {}, {}, set()))  # an older release's hook from a -p run
 
     def test_duplicate_sessions_filter_headless_after_selecting_latest(self):
         for older_ep, newer_ep, has_prompt in (("cli", "sdk-cli", True),
