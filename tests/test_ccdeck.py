@@ -576,6 +576,13 @@ class ClassifyTest(unittest.TestCase):
         info = cc.parse_transcript(PROJ / "s-compacted.jsonl")
         self.assertEqual((info["last_role"], info["last_text"], info["prompts"]), ("assistant", "Shipped.", 2))
         self.assertEqual(info["prs"], [])  # links in the summary aren't ones you just shared
+        refs = ("Spec https://www.notion.so/acme/Email-spec-" + "c" * 32 + ", ticket https://linear.app/acme/issue/ENG-7/queue, also ENG-9")
+        noted = lambda i: (len(i["refs"]), sorted(i["linear"]), i["issue_keys"])
+        write_session("s-compacted-refs", [user("ship it", 80), asst([text("Shipped.")], 79),
+                                           dict(user("Continued. " + refs, 40), isCompactSummary=True)])
+        self.assertEqual(noted(cc.parse_transcript(PROJ / "s-compacted-refs.jsonl")), (0, [], []))
+        write_session("s-prompt-refs", [user("ship it", 80), asst([text("Shipped.")], 79), user(refs, 40)])  # the same text as a prompt
+        self.assertEqual(noted(cc.parse_transcript(PROJ / "s-prompt-refs.jsonl")), (1, ["ENG-7"], ["ENG-9"]))
         self.assertEqual(cc.classify(info, None, True), "idle")
         write_session("s-continued", [summary])  # a session continued in a new file is still listed
         self.assertEqual(cc.parse_transcript(PROJ / "s-continued.jsonl")["prompts"], 1)
