@@ -828,7 +828,7 @@ function viewSwitch(nSessions) {
 }
 function planView(q) {
   let rows = planRows();
-  if (q) rows = rows.filter((r) => [r.repo, r.title, r.head, "#" + r.number, r.session ? "@" + r.session.name : ""].join(" ").toLowerCase().includes(q.toLowerCase()));
+  if (q) rows = rows.filter((r) => [r.repo, r.title, r.head, "#" + r.number, r.session ? "@" + r.session.name : "", r.goal || "", r.session_next || ""].join(" ").toLowerCase().includes(q.toLowerCase()));
   const setScope = (v) => { ui.scope = v; ls.set("prScope", v); render(); };
   const out = [h("nav", { class: "filters", "aria-label": "Which PRs and which step" },
     h("button", { class: "fchip", "aria-pressed": ui.scope !== "all" ? "true" : "false", "data-key": "sc:sessions", onclick: () => setScope("sessions"),
@@ -901,10 +901,10 @@ function todoSection(todos) {
 }
 function todoRow(t, withGoal) {
   const s = lastById[t.sid];
-  const key = t.sid + ":" + t.n;
+  const key = t.sid + ":" + t.id;
   return h("li", { "data-key": "td:" + key },
     h("button", { class: "ibtn ibtn-sm", "data-key": "tdd:" + key, "aria-label": "Done: " + t.text, title: "Done: remove it from the session's report",
-      onclick: () => act(t.sid, "todo_done", { n: t.n, text: t.text }) }, ic("check", "i-sm")),
+      onclick: () => act(t.sid, "todo_done", { todo: t.id }) }, ic("check", "i-sm")),
     h("div", { class: "plan-main" }, h("span", { class: "rr-title", title: t.text }, t.text),
       h("span", { class: "plan-next" }, [t.kind, t.size].filter(Boolean).join(" · ") || "To do"),
       withGoal && t.goal ? h("span", { class: "plan-say" }, goalChip(t.goal, "g:td:" + key)) : null),
@@ -954,7 +954,7 @@ function goalSession(s) {
       s.reportStale ? h("span", { class: "plan-say stale-note" }, ic("clock", "i-xs"), "Reported " + agoShort(r.updated) + " ago; the session has moved on since") : null),
     h("span", { class: "rr-by" }, w),
     nameChip(s, "n:g:" + s.id) || h("span", { class: "rr-by mono" }, s.sid),
-    h("span", { class: "ago" }, s.ago));
+    h("span", { class: "goal-acts" }, h("span", { class: "ago" }, s.ago), menuBtn(s, false, "More actions for " + s.title)));
 }
 const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
 // The sessions view grouped by goal: the goals' order from the server (open first, by priority), then "No goal".

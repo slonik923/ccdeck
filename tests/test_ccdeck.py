@@ -824,7 +824,7 @@ class ReportTest(unittest.TestCase):
                 self.assertIn(msg, r.stderr)
         r = self.run_report("--next", "x", sid="../../etc/passwd")
         self.assertIn("not a session id", r.stderr)
-        self.assertEqual([f.name for f in cc.REPORTS_DIR.iterdir()], [self.A + ".json"])
+        self.assertEqual([f.name for f in cc.REPORTS_DIR.glob("*.json")], [self.A + ".json"])
         self.assertIn("to-do 1:", self.run_report().stdout)  # no options: prints the report
         self.assertNotIn("to-do", self.run_report("--done", "1").stdout)
         self.assertIn("cleared", self.run_report("--clear").stdout)
@@ -855,19 +855,24 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((r["waiting"], r["priority"], r["goal"], r["updated"]), ("", "normal", "", 0))
         self.assertEqual(r["after"], ["https://github.com/a/b/pull/1"] * 5)
         self.assertEqual(len(r["todos"]), cc.REPORT_TODOS)
-        self.assertEqual(r["todos"][0], {"text": "t0", "kind": "", "size": "", "url": ""})
+        self.assertEqual(dict(r["todos"][0], id=None), {"id": None, "text": "t0", "kind": "", "size": "", "url": ""})
+        self.assertRegex(r["todos"][0]["id"], "^[0-9a-f]{8}$")  # a file without ids gets stable ones
+        self.assertEqual(r["todos"], cc.sanitize_report({"todos": r["todos"]})["todos"])
+        self.assertEqual(cc.sanitize_report({"updated": float("nan")})["updated"], 0)  # NaN would break the API's JSON
         cc.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         (cc.REPORTS_DIR / "not.a-session.json").write_text('{"next": "x"}')
         (cc.REPORTS_DIR / (self.A + ".json")).write_text("not json")
         self.assertEqual(cc.load_reports(), {})
 
-    def test_todo_done_checks_it_is_the_same(self):
-        cc.update_report(self.A, {}, {"text": "one", "kind": "", "size": "", "url": ""})
-        cc.update_report(self.A, {}, {"text": "two", "kind": "", "size": "", "url": ""})
+    def test_todo_done_by_id(self):
+        for url in ("https://a.example/1", "https://a.example/2"):  # same text, different to-dos
+            cc.update_report(self.A, {}, {"text": "Check it", "kind": "", "size": "", "url": url})
+        first, second = cc.load_reports()[self.A]["todos"]
+        self.assertNotEqual(first["id"], second["id"])
+        cc.remove_todo(self.A, first["id"])
         with self.assertRaises(ValueError):
-            cc.remove_todo(self.A, 0, "two")  # the page showed an older list
-        cc.remove_todo(self.A, 1, "two")
-        self.assertEqual([t["text"] for t in cc.load_reports()[self.A]["todos"]], ["one"])
+            cc.remove_todo(self.A, first["id"])  # a repeated click doesn't take the other one
+        self.assertEqual(cc.load_reports()[self.A]["todos"], [second])
 
     def test_goal_board(self):
         now = time.time()
@@ -889,9 +894,11 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((ship["priority"], [s["id"] for s in ship["sessions"]], [p["url"] for p in ship["prs"]]),
                          ("high", ["s1", "s2"], [PR.format(1), PR.format(2)]))
         self.assertEqual(ship["summary"], "2 PRs: 1 to merge, 1 waiting, 1 to-do for you")
-        self.assertEqual(ship["todos"], [{"text": "Submit to the stores", "kind": "", "size": "", "url": "", "sid": "s1", "n": 0}])
+        self.assertEqual([(x["text"], x["sid"]) for x in ship["todos"]], [("Submit to the stores", "s1")])
         self.assertEqual((board[3]["open"], board[3]["todos"], board[3]["summary"]), (False, [], "Done"))  # a done session's to-dos are over
         self.assertTrue(board[2]["other"])
+        self.assertEqual(board[3]["since"], now - 100)  # a done goal: its last report, so snapshots don't change by themselves
+        self.assertEqual(cc.goal_board(sessions, rows, now=now + 60)[3]["since"], now - 100)
 
     def test_dashboard_and_server(self):
         write_session(self.A, [user("ship it", 20), asst([tool("r1", "Bash", {"command": "gh pr create"})], 19),
@@ -911,9 +918,10 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((row["goal"], row["session_next"], row["after"]), ("Ship 1.2", "Waiting for the review", [PR.format(8)]))
         goal = snap["goals"][0]
         self.assertEqual((goal["goal"], goal["summary"]), ("Ship 1.2", "1 PR: 1 to merge, 1 to-do for you"))
-        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "n": 0, "text": "Other"})[0], 409)
-        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "n": True, "text": "Check the preview"})[0], 409)
-        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "n": 0, "text": "Check the preview"})[0], 200)
+        tid = goal["todos"][0]["id"]
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": "0000ffff"})[0], 409)
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": 0})[0], 409)
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": tid})[0], 200)
         self.assertEqual(cc.load_reports()[self.A]["todos"], [])
         cc.REPORTS_DIR.joinpath(self.A + ".json").write_text(json.dumps(dict(cc.load_reports()[self.A], updated=time.time() - 30 * 3600)))
         dash.refresh()

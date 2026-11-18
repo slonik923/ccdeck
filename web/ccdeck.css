@@ -828,6 +828,8 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .prio { margin-left: 8px; padding: 1px 6px; border-radius: var(--r-sm); font-size: var(--t-12); font-weight: 500; background: var(--surface-2); color: var(--text-2); vertical-align: middle; }
 .ccd .prio[data-p="high"] { background: var(--need-tint, var(--surface-2)); color: var(--need-fg, var(--text)); }
 .ccd .goal-body { display: flex; flex-direction: column; gap: 8px; }
+.ccd .goal-body .rrlist:not(.plan):not(.todos) li { grid-template-columns: auto minmax(0, 1fr) auto auto 76px; }
+.ccd .goal-acts { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
 .ccd .rrlist .title-btn.rr-title { text-align: left; background: none; border: 0; padding: 0; cursor: pointer; font: inherit; font-weight: 600; }
 .ccd .namechip[data-on="off"] { opacity: .65; }
 .ccd .namechip[data-on="on"] .run-dot { border-color: var(--turn); background: var(--turn); }

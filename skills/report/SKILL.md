@@ -1,12 +1,12 @@
 ---
 name: report
 description: Tell ccdeck what this session is working toward, its next step, what it waits on, and what only the user can do. Use after you open or update a PR, when you end a turn waiting on the user, when you hand the user a task (a manual step, something to validate, decide or review), and when the goal or priority changes.
-allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/ccdeck report *)
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/ccdeck" report *)
 ---
 
 ccdeck shows the user one plan across all sessions, grouped by goal. It knows PR statuses from GitHub. It knows the rest only from what sessions report. Each call merges into this session's report.
 
-Run it as `python3 ${CLAUDE_PLUGIN_ROOT}/ccdeck report …`; the examples below shorten that to `ccdeck report`.
+Run it as `python3 "${CLAUDE_PLUGIN_ROOT}/ccdeck" report …` (quoted: the path can contain spaces); the examples below shorten that to `ccdeck report`.
 
 1. **Goal.** Run `ccdeck report --goals` first and reuse a goal that fits, word for word ("Ship 0.7.4", not "0.7.4 release"). Make a new goal only for separate work. If the command prints "Did you mean", decide whether it's the same goal and fix it.
 2. **State:**
