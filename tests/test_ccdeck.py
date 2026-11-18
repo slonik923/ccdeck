@@ -569,6 +569,17 @@ class ClassifyTest(unittest.TestCase):
                 m = cc.GITHUB_REMOTE_RE.fullmatch(remote)
                 self.assertEqual(m.group(1) if m else None, repo)
 
+    def test_compact_summary_isnt_a_prompt(self):
+        """After /compact the session still waits for you: its summary isn't a question to answer."""
+        summary = dict(user("This session is being continued from a previous conversation. See " + PR.format(9), 40), isCompactSummary=True)
+        write_session("s-compacted", [user("ship it", 80), asst([text("Shipped.")], 79), summary])
+        info = cc.parse_transcript(PROJ / "s-compacted.jsonl")
+        self.assertEqual((info["last_role"], info["last_text"], info["prompts"]), ("assistant", "Shipped.", 2))
+        self.assertEqual(info["prs"], [])  # links in the summary aren't ones you just shared
+        self.assertEqual(cc.classify(info, None, True), "idle")
+        write_session("s-continued", [summary])  # a session continued in a new file is still listed
+        self.assertEqual(cc.parse_transcript(PROJ / "s-continued.jsonl")["prompts"], 1)
+
     def test_links_and_files(self):
         s = self.rows["s-links"]
         self.assertEqual(s["links"]["artifact"], ["https://claude.ai/code/artifact/abc-123"])

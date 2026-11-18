@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -72,7 +72,7 @@ GH_INSTALL = "brew install gh" if IS_MAC else "sudo apt install gh"
 PLIST_FILE = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 DESKTOP_FILE = HOME / ".local" / "share" / "applications" / "ccdeck.desktop"
 DEFAULT_PORT = int(os.environ.get("CCDECK_PORT", "7799"))
-CACHE_VERSION = 14  # 14: PRs from pr-link entries and gh stack output (resolved per folder)
+CACHE_VERSION = 15  # 15: a /compact summary isn't a prompt
 DEFAULT_DAYS = 14
 QUIET_AFTER = 15 * 60  # "working" with no activity for this long => probably interrupted
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Notification",
@@ -858,9 +858,15 @@ def parse_transcript(path):
                                             r["title"] = tool_titles[tid]
                 if is_real_prompt(e):
                     text = block_text(content)
-                    add_refs(text, "you")
+                    # /compact writes its summary as a user message, but nobody asked anything: the session
+                    # keeps the turn it had (as a prompt it read as working, then as quiet)
+                    compact = bool(e.get("isCompactSummary"))
+                    if not compact:
+                        add_refs(text, "you")
                     info["prompts"] += 1
                     info["first_prompt"] = info["first_prompt"] or text
+                    if compact:
+                        continue
                     info["last_prompt"] = text
                     info["last_role"] = "user"
                     info["last_text"] = text
