@@ -430,6 +430,8 @@ class HookTest(unittest.TestCase):
         build_fixtures()
         sid = "s-closed"
         (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        # pid 123 is made up, but it can be a real, live process: don't leave it for later tests, pass or fail
+        self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
         dash = cc.Dashboard(0)
         def scan():
             rows = cc.collect(True, 10 ** 6)
@@ -454,8 +456,6 @@ class HookTest(unittest.TestCase):
             cc.inbox_clear(second["id"])  # dismissal must survive another scan of the same prompt
             scan()
             self.assertFalse(any(d["sid"] == sid for d in cc.inbox_items()))
-        # pid 123 is made up, but it can be a real, live process: don't leave it for later tests
-        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
 
     def test_closing_doesnt_bring_back_a_dismissed_pr_notification(self):
         dash = cc.Dashboard(0)
@@ -1399,6 +1399,12 @@ class PsProcessTest(unittest.TestCase):
                 self.assertEqual(procs, [(1, "/w", args)])
                 self.assertEqual(cc.guess_live_sessions(sessions, {}, procs, set()), expected)
 
+    def test_an_empty_cmdline_reads_as_unreadable(self):
+        with mock.patch.object(cc.sys, "platform", "linux"), mock.patch.object(cc.Path, "read_bytes", return_value=b""):
+            self.assertEqual(cc._process_argv(123), [])
+        with mock.patch.object(cc.sys, "platform", "linux"), mock.patch.object(cc.Path, "read_bytes", return_value=b"claude\0-c\0"):
+            self.assertEqual(cc._process_argv(123), ["claude", "-c"])
+
     def test_unreadable_arguments_dont_hide_an_open_session(self):
         with mock.patch.object(cc, "ps_table", return_value={1: (0, "", "claude --resume s")}), \
                 mock.patch.object(cc, "_process_argv", return_value=[]), \
@@ -1556,11 +1562,14 @@ class MacDesktopTest(unittest.TestCase):
             20: (19, "claude"), 19: (18, "-zsh"), 18: (1, "/Applications/iTerm.app/Contents/MacOS/iTerm2 --server login"),
             30: (1, "claude"),  # no terminal above it (an IDE, ssh, …)
             40: (8, "claude look at /Applications/iTerm.app/Contents/Info.plist"),  # in Terminal; its prompt names iTerm
+            50: (51, "claude"), 51: (1, "/Users/me/Local Apps/iTerm.app/Contents/MacOS/iTerm2"),  # a space in the path
         }
+        exact = {51: ["/Users/me/Local Apps/iTerm.app/Contents/MacOS/iTerm2"]}  # what the kernel says; ps splits it
         def app_for(peers, term_program=""):
             with mock.patch.object(cc, "peer_sessions", lambda: {f"s{i}": {"pid": p} for i, p in enumerate(peers)}), \
                     mock.patch.object(cc, "proc_ppid", lambda p: procs.get(p, (None,))[0]), \
                     mock.patch.object(cc, "proc_cmdline", lambda p: procs[p][1].split() if p in procs else []), \
+                    mock.patch.object(cc, "_process_argv", lambda p: exact.get(p, [])), \
                     mock.patch.object(cc.Path, "exists", lambda self: "iTerm.app" in str(self)), \
                     mock.patch.dict(os.environ, {"TERM_PROGRAM": term_program}):
                 cmd = cc.mac_terminal_command("/tmp", ["claude"])
@@ -1569,6 +1578,7 @@ class MacDesktopTest(unittest.TestCase):
         self.assertEqual(app_for([20, 10, 20]), "iterm")        # most sessions
         self.assertEqual(app_for([10, 20]), "terminal")         # a tie: Terminal
         self.assertEqual(app_for([40]), "terminal")             # only the program counts, not a path in a prompt
+        self.assertEqual(app_for([50], "Apple_Terminal"), "iterm")  # iTerm in a folder with a space
         self.assertEqual(app_for([30], "Apple_Terminal"), "terminal")  # no session says: where the dashboard started
         self.assertEqual(app_for([], "iTerm.app"), "iterm")
         self.assertEqual(app_for([]), "iterm")                  # nothing says: iTerm when it's installed, as before

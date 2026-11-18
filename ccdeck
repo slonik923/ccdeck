@@ -350,9 +350,10 @@ def _process_argv(pid):
     """Read argument boundaries; ps command text cannot distinguish flags from prompt words."""
     if sys.platform != "darwin":  # also supports CCDECK_NO_PROC on Linux
         try:
-            return Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").decode(errors="replace").split("\0")
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0")
         except OSError:
             return []
+        return raw.decode(errors="replace").split("\0") if raw else []  # empty: a zombie, let ps say
     import ctypes
     import struct
     try:
@@ -1590,7 +1591,8 @@ def mac_terminal_app_of(pid):
     for _ in range(12):
         if not pid or pid <= 1:
             return None
-        exe = (proc_cmdline(pid) or [""])[0]  # the program, not its arguments: a prompt can name iTerm.app
+        # the program, not its arguments (a prompt can name iTerm.app); exact, as a path can have a space in it
+        exe = (_process_argv(pid) or proc_cmdline(pid) or [""])[0]
         if "/Terminal.app/" in exe:
             return "terminal"
         if "/iTerm.app/" in exe or "/iTerm2.app/" in exe:
