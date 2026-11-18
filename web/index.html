@@ -575,6 +575,14 @@ function renderHint() {
 
 function renderLegend() {
   $("legendBtn").setAttribute("aria-expanded", ui.legend ? "true" : "false");
+  $("legendBtn").setAttribute("aria-label", ui.view === "prs" ? "Legend: what the PR steps mean" : "Legend: what the states mean");
+  const gicon = (i) => h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(i, "i-xs"));
+  if (ui.legend && ui.view === "prs") return $("legendHost").replaceChildren(h("div", { class: "legend", role: "dialog", "aria-label": "PR steps legend", onclick: (e) => e.stopPropagation() },
+    STEPS.map((st) => h("div", { "data-g": st.g, "data-key": "lg:" + st.s },
+      h("h4", {}, gicon(st.i), st.s + ". " + st.l),
+      h("ul", {}, st.d.map((t) => h("li", {}, h("span", {}, t)))))),
+    h("div", { "data-key": "lg:who" }, h("h4", {}, "Who acts"),
+      h("ul", {}, WHO.map(([l, k, t]) => h("li", {}, h("span", { class: "plan-who", "data-who": k }, l), h("span", { style: "padding-top: 2px" }, t)))))));
   $("legendHost").replaceChildren(ui.legend ? h("div", { class: "legend", role: "dialog", "aria-label": "State legend", onclick: (e) => e.stopPropagation() },
     GR.map((g) => h("div", { "data-g": g.k },
       h("h4", {}, h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(g.i, "i-xs")), g.l),
@@ -780,12 +788,20 @@ function reviewSection(items) {
 }
 // ---- PR focus plan: every open PR in one of five steps, from GitHub statuses only ----
 const STEPS = [
-  { s: 1, l: "Merge", g: "turn", i: "merge", k: "approved", hint: "Green and mergeable; resolve your replied threads first" },
-  { s: 2, l: "Fix", g: "need", i: "x-circle", k: "fail", hint: "CI, conflicts or review comments · the owning session if it's running" },
-  { s: 3, l: "Review", g: "pr", i: "pr", k: "ready", hint: "Colleagues' PRs that ask for your review" },
-  { s: 4, l: "Waiting", g: "work", i: "clock", k: "run", hint: "CI, reviewers, a base PR, or a session still on it" },
-  { s: 5, l: "Clean up", g: "closed", i: "slash", k: "draft", hint: "Drafts nobody works on, or no activity for 14 days" },
+  { s: 1, l: "Merge", g: "turn", i: "merge", k: "approved", hint: "Green and mergeable; resolve your replied threads first",
+    d: ["Checks pass, nothing blocks it: merge it.", "Threads you replied to: resolve them first.", "Behind its base: update the branch."] },
+  { s: 2, l: "Fix", g: "need", i: "x-circle", k: "fail", hint: "CI, conflicts, review comments or a draft to look over",
+    d: ["CI failing, conflicts, changes requested or review comments to answer: the owning session fixes them if it's running, otherwise you.",
+        "A draft: look it over and mark it ready. Only a session working on it right now keeps it off this step."] },
+  { s: 3, l: "Review", g: "pr", i: "pr", k: "ready", hint: "Colleagues' PRs that ask for your review",
+    d: ["A colleague asked you, or a team you're in, to review it."] },
+  { s: 4, l: "Waiting", g: "work", i: "clock", k: "run", hint: "CI, reviewers, a base PR, or a session working on it",
+    d: ["Nothing for you yet: CI running, a review or required check pending, the PR below it in a stack still open, or GitHub still checking whether it can merge.",
+        "A draft whose session is working on it."] },
+  { s: 5, l: "Clean up", g: "closed", i: "slash", k: "draft", hint: "No activity for 14 days",
+    d: ["No activity for 14 days and no running session: close it or pick it up."] },
 ];
+const WHO = [["You", "you", "You act on it."], ["Session", "session", "Its running session acts; Message copies a request for it."], ["—", "none", "Nobody can act yet."]];
 const planRows = () => ((data.plan && data.plan.rows) || []).filter((r) => ui.scope === "all" || r.session || r.step === 3);
 function viewSwitch(nSessions) {
   const rows = planRows();

@@ -1,0 +1,13 @@
+{
+  "shots": [
+    { "name": "prs-drafts", "width": 1440, "height": 1000, "full": true, "scale": 1,
+      "steps": [ { "click": "[data-key='v:prs']", "wait": 400 }, { "click": "[data-key='sc:all']", "wait": 400 } ],
+      "highlight": [
+        { "sel": "[data-key='pr:https://github.com/acme/web-app/pull/299']", "label": "Draft whose session waits for you: now in Fix" }
+      ] },
+    { "name": "prs-legend", "width": 1440, "height": 1000, "scale": 1,
+      "steps": [ { "click": "[data-key='v:prs']", "wait": 400 }, { "click": "#legendBtn", "wait": 300 } ],
+      "clip": ".legend",
+      "highlight": [ { "sel": ".legend", "label": "Now explains the PR steps" } ] }
+  ]
+}
