@@ -139,6 +139,10 @@ The groups say what you have to do, most urgent first:
 
 **Session names.** A session's `@name` (what other sessions use to message it) shows on its row and card. When the session is open in a terminal, clicking the name goes to its tab, like clicking a notification; otherwise it opens the details.
 
+**Goals and session reports.** Sessions tell ccdeck about their own work with `ccdeck report`; the plugin's `report` skill tells them when (after opening or updating a PR, when they wait on you, when they hand you something). A report has a goal ("Ship 1.2"), a priority, the next step, what the session waits on, PRs or issues that must land first, and to-dos only you can do (review, validate, decide or hands-on, with a size). Reports are kept apart from your notes, in `~/.claude/ccdeck/reports/`. Before setting a goal, a session sees the goals already in use (`ccdeck report --goals`), and a goal close to an existing one gets a "Did you mean" hint, so one goal keeps one name. Goals that differ only in case or spacing are the same goal.
+
+The "Goals" view shows one section per goal, with its sessions, their PRs and their steps, your to-dos, and a summary such as "2 PRs: 1 to merge, 1 waiting, 1 to-do for you". Goals are sorted by priority, then by their oldest open item. A goal is done once it has no open PRs, no to-dos and no running session. The Sessions view can be grouped by goal ("By goal"), and a goal's chip on a row shows only that goal. The PRs view adds the session's own next step and an "After #N" link to each row, and a "To do for you" list on top, where you tick off what you've done. A report much older than the session's last activity is marked as possibly out of date. No AI is involved: ccdeck shows what the sessions said.
+
 **Settings.** The gear button in the dashboard's header opens a settings panel for review requests, desktop notifications and approvals from the dashboard. It saves to `~/.claude/ccdeck/config.json`, the same file the `ccdeck review-requests`, `ccdeck notifications` and `ccdeck approvals` commands change.
 
 Each card shows:
@@ -193,7 +197,8 @@ ccdeck                 sessions grouped by state, then review requests (done one
 ccdeck -a              everything
 ccdeck show 3          details: PRs with state, links, files, last messages
 ccdeck resume 3        go to its terminal tab if it is open, otherwise cd into the folder and claude --resume
-ccdeck prs             your open PRs in steps: merge, fix, review, waiting, clean up
+ccdeck prs             to-dos for you, then your open PRs in steps: merge, fix, review, waiting, clean up
+ccdeck report --goals  the goals sessions use (sessions write reports; see "Goals and session reports")
 ccdeck done 3 [note]   mark solved             ccdeck undone 3
 ccdeck park 3          set aside               ccdeck unpark 3
 ccdeck note 3 text     attach a note

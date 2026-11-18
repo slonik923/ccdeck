@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.6"
+VERSION = "0.9.7"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -60,6 +60,7 @@ DAEMON_FILE = DATA_DIR / "daemon.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 INBOX_DIR = DATA_DIR / "inbox"  # notifications not acted on yet, one file each
 REQ_DIR = DATA_DIR / "requests"
+REPORTS_DIR = DATA_DIR / "reports"  # what each session says about its own work (`ccdeck report`), one file each
 SCRIPT = Path(__file__).resolve()
 WEB_DIR = SCRIPT.parent / "web"
 IS_MAC = sys.platform == "darwin"
@@ -1364,8 +1365,10 @@ def pr_plan(sessions, saved=None, reviews=None):
         live = bool(s and s.get("alive"))
         step, texts, actor = pr_step(p, stacked, name if live else None, working=live and s.get("state") == "working")
         # actor: who acts, "you", "session" or None; who: what to call them (a session may be named "you")
+        rep = (s or {}).get("report") or {}
         rows.append(dict(p, step=step, texts=texts, actor=actor, who=name if actor == "session" else actor, stacked_on=stacked, author=saved.get("viewer") or "",
-                         session={"id": s["id"], "name": name, "alive": bool(s.get("alive"))} if s else None))
+                         session={"id": s["id"], "name": name, "alive": bool(s.get("alive"))} if s else None,
+                         goal=rep.get("goal") or "", session_next=rep.get("next") or "", after=rep.get("after") or []))
     mine = {pr_key(p["url"]) for p in prs}
     for r in review_requests([], reviews, saved.get("viewer")):
         if pr_key(r["url"]) not in mine:  # your own PR can be asked of a team you're in; it's already listed
@@ -1667,6 +1670,7 @@ def collect(include_all=False, days=DEFAULT_DAYS):
     procs = running_claude_processes()
     prc = pr_cache()
     peers = peer_sessions()
+    reports = load_reports()
 
     # one session per process: the registry knows what a process runs now, its --resume argument
     # only what it started on (/resume switches sessions in place)
@@ -1697,6 +1701,7 @@ def collect(include_all=False, days=DEFAULT_DAYS):
         s["peer_name"] = (peers.get(sid) or {}).get("name")
         s["peer_open"] = sid in peers  # open in a terminal Claude Code knows; it may have no name
         s["mark"] = marks.get(sid) or {}
+        s["report"] = reports.get(sid)
         s["pr_details"] = pr_details(s, prc)
         st = classify(s, hook, alive)
         s["state"] = st
@@ -1745,6 +1750,247 @@ def apply_action(sid, action, text=None):
         set_mark(sid, note=(text or "").strip()[:500] or None)
     else:
         raise ValueError(action)
+
+
+# ----------------------------------------------------------------- reports
+# A session's own account of its work, written by the session (`ccdeck report`), never by you: notes are yours.
+
+REPORT_WAITING = ("you", "ci", "review", "session")
+REPORT_PRIORITY = ("high", "normal", "low")
+TODO_KINDS = ("review", "validate", "decide", "hands-on")
+TODO_SIZES = ("small", "medium", "large")
+REPORT_TEXT, REPORT_GOAL, REPORT_TODOS, REPORT_AFTER = 200, 80, 10, 10
+REPORT_STALE = 3 * 3600  # a report this much older than the session's last activity may no longer hold
+
+
+def _http(u):
+    return isinstance(u, str) and re.match(r"https?://\S+$", u) is not None and len(u) <= 500
+
+
+def _text(v, n):
+    return " ".join(v.split())[:n] if isinstance(v, str) else ""
+
+
+def sanitize_report(d):
+    """A report as the page and the CLI may use it, or None. Files are written by sessions: check everything."""
+    if not isinstance(d, dict):
+        return None
+    out = {"next": _text(d.get("next"), REPORT_TEXT), "goal": _text(d.get("goal"), REPORT_GOAL)}
+    w = d.get("waiting")
+    out["waiting"] = w if w in REPORT_WAITING or _http(w) else ""
+    out["priority"] = d.get("priority") if d.get("priority") in REPORT_PRIORITY else "normal"
+    after = d.get("after") if isinstance(d.get("after"), list) else []
+    out["after"] = [u for u in after if _http(u)][:REPORT_AFTER]
+    todos = []
+    for t in d.get("todos") if isinstance(d.get("todos"), list) else []:
+        if isinstance(t, dict) and _text(t.get("text"), REPORT_TEXT):
+            todos.append({"text": _text(t.get("text"), REPORT_TEXT),
+                          "kind": t.get("kind") if t.get("kind") in TODO_KINDS else "",
+                          "size": t.get("size") if t.get("size") in TODO_SIZES else "",
+                          "url": t.get("url") if _http(t.get("url")) else ""})
+    out["todos"] = todos[:REPORT_TODOS]
+    up = d.get("updated")
+    out["updated"] = up if isinstance(up, (int, float)) and not isinstance(up, bool) else 0
+    return out
+
+
+REPORT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")  # session ids are UUIDs; demo data uses names
+
+
+def report_file(sid):
+    if not REPORT_ID_RE.fullmatch(sid or ""):  # the id names a file: no dots or slashes
+        raise ValueError(f"not a session id: {sid!r}")
+    return REPORTS_DIR / f"{sid}.json"
+
+
+def load_reports():
+    out = {}
+    for f in REPORTS_DIR.glob("*.json") if REPORTS_DIR.is_dir() else []:
+        r = sanitize_report(load_json(f, None))
+        if r and REPORT_ID_RE.fullmatch(f.stem):
+            out[f.stem] = r
+    return out
+
+
+def goal_key(goal):
+    """Goals that differ only in case or spacing are one goal."""
+    return " ".join(str(goal or "").lower().split())
+
+
+def edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def goals_in_use(reports, skip=None, done=frozenset()):
+    """{goal key: [spelling, number of sessions]} over reports of sessions not marked done."""
+    out = {}
+    for sid, r in reports.items():
+        if sid != skip and sid not in done and r.get("goal"):
+            e = out.setdefault(goal_key(r["goal"]), [r["goal"], 0])
+            e[1] += 1
+    return out
+
+
+def similar_goal(goal, used):
+    """An existing goal that's probably the same one under another name, or None."""
+    k = goal_key(goal)
+    for key, (spelling, _n) in used.items():
+        if key != k and (sorted(key.split()) == sorted(k.split()) or edit_distance(key, k) <= 3):
+            return spelling
+    return None
+
+
+def update_report(sid, changes, add_todo=None, done_todo=None):
+    """Merge changes into a session's report and save it. Returns (report, notes): notes say what to check."""
+    path = report_file(sid)
+    reports = load_reports()
+    cur = reports.get(sid) or sanitize_report({})
+    notes = []
+    if "goal" in changes and changes["goal"]:
+        used = goals_in_use(reports, skip=sid, done=done_session_ids())
+        same = used.get(goal_key(changes["goal"]))
+        if same:
+            changes["goal"] = same[0]  # one spelling per goal
+        elif (other := similar_goal(changes["goal"], used)):
+            notes.append(f'Did you mean "{other}"? If it\'s the same goal: ccdeck report --goal "{other}"')
+    cur.update(changes)
+    if add_todo:
+        cur["todos"].append(add_todo)
+        if len(cur["todos"]) > REPORT_TODOS:
+            notes.append(f"Only {REPORT_TODOS} to-dos are kept; the oldest was dropped.")
+            cur["todos"] = cur["todos"][-REPORT_TODOS:]
+    if done_todo is not None:
+        if not 1 <= done_todo <= len(cur["todos"]):
+            raise ValueError(f"no to-do {done_todo}; there are {len(cur['todos'])}")
+        cur["todos"].pop(done_todo - 1)
+    cur["updated"] = time.time()
+    report = sanitize_report(cur)
+    save_json(path, report)
+    return report, notes
+
+
+def done_session_ids():
+    return {sid for sid, m in load_json(MARKS_FILE, {}).items() if isinstance(m, dict) and m.get("done")}
+
+
+def remove_todo(sid, n, text):
+    """The dashboard's tick: drop to-do n only if it's still the one the page showed."""
+    reports = load_reports()
+    todos = (reports.get(sid) or {}).get("todos") or []
+    if not 0 <= n < len(todos) or todos[n]["text"] != text:
+        raise ValueError("that to-do changed; reload and try again")
+    r = reports[sid]
+    r["todos"].pop(n)
+    save_json(report_file(sid), r)  # `updated` stays: that's when the session last reported
+
+
+PRIORITY_RANK = {p: i for i, p in enumerate(REPORT_PRIORITY)}
+
+
+def goal_board(sessions, plan_rows, now=None):
+    """Goals from session reports: each with its sessions, their open PRs, to-dos for you and a summary.
+    Open goals first, by priority, then by their oldest open item; sessions that reported no goal last."""
+    now = now or time.time()
+    by_owner = {}
+    for r in plan_rows:
+        if r.get("session") and r["step"] != 3:
+            by_owner.setdefault(r["session"]["id"], []).append(r)
+    goals = {}
+    for s in sessions:
+        rep = s.get("report")
+        if not rep:
+            continue
+        key = goal_key(rep["goal"])
+        g = goals.setdefault(key, {"key": key, "goal": rep["goal"] or "Other", "other": not key, "sessions": [], "prs": [],
+                                   "todos": [], "priority": "low", "since": now, "open": False})
+        done = (s.get("mark") or {}).get("done") or s.get("group") == "done"
+        g["sessions"].append({"id": s["id"], "done": bool(done)})
+        prs = by_owner.get(s["id"], [])
+        g["prs"] += [{"url": p["url"], "step": p["step"]} for p in prs]
+        todos = [] if done else [dict(t, sid=s["id"], n=i) for i, t in enumerate(rep["todos"])]
+        g["todos"] += todos
+        if not done:
+            if PRIORITY_RANK[rep["priority"]] < PRIORITY_RANK[g["priority"]]:
+                g["priority"] = rep["priority"]
+            g["since"] = min([g["since"], rep["updated"] or now] + [p["updated"] for p in prs])
+        g["open"] = g["open"] or bool(prs or todos or (not done and s.get("alive")))
+    for g in goals.values():
+        steps = [p["step"] for p in g["prs"]]
+        parts = [f"{steps.count(n)} {w}" for n, w in ((1, "to merge"), (2, "to fix"), (4, "waiting"), (5, "to clean up")) if steps.count(n)]
+        if steps:
+            parts[0] = plural(len(steps), "PR") + ": " + parts[0]
+        if g["todos"]:
+            parts.append(plural(len(g["todos"]), "to-do") + " for you")
+        g["summary"] = ", ".join(parts) or ("Done" if not g["open"] else "Sessions working")
+    return sorted(goals.values(), key=lambda g: (not g["open"], g["other"], PRIORITY_RANK[g["priority"]], g["since"]))
+
+
+def report_session_id():
+    """The session running this command: Claude Code exports it; otherwise the registry entry of the Claude
+    process above us."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        return sid
+    pid = find_claude_ancestor()
+    d = load_json(CLAUDE_DIR / "sessions" / f"{pid}.json", {}) if pid else {}
+    return d.get("sessionId") if isinstance(d.get("sessionId"), str) else None
+
+
+def format_report(r):
+    lines = [f"next: {r['next'] or '—'}", f"waiting: {r['waiting'] or '—'}", f"priority: {r['priority']}",
+             f"goal: {r['goal'] or '—'}"]
+    lines += [f"after: {u}" for u in r["after"]]
+    lines += [f"to-do {i}: {t['text']}" + "".join(f"  [{x}]" for x in (t["kind"], t["size"], t["url"]) if x)
+              for i, t in enumerate(r["todos"], 1)]
+    return "\n".join(lines)
+
+
+def cmd_report(args):
+    if args.goals:
+        used = goals_in_use(load_reports(), done=done_session_ids())
+        for spelling, n in sorted(used.values(), key=lambda x: (-x[1], x[0].lower())):
+            print(f"{spelling}  ({plural(n, 'session')})")
+        if not used:
+            print("No goals yet.")
+        return
+    sid = args.session or report_session_id()
+    if not sid:
+        sys.exit("ccdeck report runs inside a Claude Code session (or pass --session ID).")
+    try:
+        path = report_file(sid)
+        if args.clear:
+            path.unlink(missing_ok=True)
+            print("Report cleared.")
+            return
+        changes = {k: getattr(args, k) for k in ("next", "waiting", "priority", "goal", "after") if getattr(args, k) is not None}
+        if changes.get("waiting") and changes["waiting"] not in REPORT_WAITING and not _http(changes["waiting"]):
+            raise ValueError("--waiting is you, ci, review, session or a URL")
+        bad = [u for u in changes.get("after") or [] if not _http(u)]
+        if bad:
+            raise ValueError(f"--after takes PR or issue URLs, not {bad[0]!r}")
+        todo = None
+        if args.todo:
+            todo = {"text": args.todo, "kind": args.kind or "", "size": args.size or "", "url": args.url or ""}
+            if todo["url"] and not _http(todo["url"]):
+                raise ValueError("--url must be an http(s) URL")
+        elif args.kind or args.size or args.url:
+            raise ValueError("--kind, --size and --url describe a --todo")
+        if not (changes or todo or args.done):
+            r = load_reports().get(sid)
+            print(format_report(r) if r else "No report yet.")
+            return
+        report, notes = update_report(sid, changes, todo, args.done)
+    except ValueError as e:
+        sys.exit(str(e))
+    print(format_report(report))
+    for n in notes:
+        print(n)
 
 
 # ------------------------------------------------------------- desktop glue
@@ -2311,8 +2557,9 @@ MSG_LIMIT = 8000  # characters of the last message sent to the page
 def session_json(s):
     keep = ("id", "display_title", "title", "cwd", "branch", "first_ts", "last_ts", "prompts",
             "last_role", "pending_tool", "pending_input", "links", "files", "alive", "live_source",
-            "mark", "pr_details", "state", "group", "label", "hook_message", "peer_name", "peer_open")
+            "mark", "pr_details", "state", "group", "label", "hook_message", "peer_name", "peer_open", "report")
     d = {k: s.get(k) for k in keep}
+    d["report_stale"] = bool(d["report"] and (s.get("last_ts") or 0) - d["report"]["updated"] > REPORT_STALE)
     d["last_text"] = (s.get("last_text") or "")[-MSG_LIMIT:]
     d["last_text_cut"] = len(s.get("last_text") or "") > MSG_LIMIT
     d["last_prompt"] = (s.get("last_prompt") or "")[-1500:]
@@ -2373,6 +2620,7 @@ class Dashboard:
             "reviews": review_requests(sessions), "settings": settings_view(),
             "notifications": inbox_items(), "plan": pr_plan(sessions),
         }
+        snap["goals"] = goal_board(sessions, snap["plan"]["rows"])
         etag = hashlib.sha1(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:16]
         snap["generated"] = time.time()
         with self.lock:
@@ -2501,6 +2749,14 @@ class Dashboard:
         if action in ("done", "undone", "park", "unpark", "note"):
             text = body.get("text")
             apply_action(sid, action, text if isinstance(text, str) else None)
+        elif action == "todo_done":
+            n, text = body.get("n"), body.get("text")
+            try:
+                if not isinstance(n, int) or isinstance(n, bool) or not isinstance(text, str):
+                    raise ValueError("todo_done takes n and text")
+                remove_todo(sid, n, text)
+            except ValueError as e:
+                return 409, {"error": str(e)}
         elif action == "focus":
             # the name chip: go to the open tab, never start Claude (the snapshot it saw may be stale)
             peer = peer_sessions().get(sid)
@@ -2771,16 +3027,23 @@ def cmd_prs(args):
     if items is None and scope != "off":
         unavailable = True  # an empty list would claim nobody asked for your review
         print("Review requests unavailable; check gh auth login.", file=sys.stderr)
-    assembled = pr_plan(collect(include_all=True, days=10 ** 6),
-                        saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])
+    sessions = collect(include_all=True, days=10 ** 6)
+    assembled = pr_plan(sessions, saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])
     rows = assembled["rows"]
+    names = {s["id"]: "@" + s["peer_name"] if s.get("peer_name") else s["id"][:8] for s in sessions}
+    todos = [(g["goal"], t) for g in goal_board(sessions, rows) for t in g["todos"]]
     if assembled["truncated"]:
         print("Warning: authored PRs limited to the first 100 results; stack targets may be missing.", file=sys.stderr)
     if args.sessions:
         rows = [r for r in rows if r["session"] or r["step"] == 3]
+    width = shutil.get_terminal_size((120, 20)).columns
     if not rows:
         print("No available PR data." if unavailable else "No open PRs.")
-    width = shutil.get_terminal_size((120, 20)).columns
+    if todos:
+        print("\n" + bold("To do for you") + dim(f"  {len(todos)}"))
+        for goal, td in todos:
+            print(f"  {one_line(td['text'], max(20, width - 30))}")
+            print(dim("      " + " · ".join(x for x in (goal, td["kind"], td["size"], names.get(td["sid"], td["sid"][:8]), td["url"]) if x)))
     for step, label in PR_STEPS.items():
         part = [r for r in rows if r["step"] == step]
         if not part:
@@ -3877,6 +4140,20 @@ def main():
     s.add_argument("text", nargs="*")
     s = sub.add_parser("prs", help="your open PRs in steps: merge, fix, review, wait, clean up")
     s.add_argument("--sessions", action="store_true", help="only PRs one of your sessions owns, plus review requests")
+    s = sub.add_parser("report", help="run by a session: its next step, what it waits on, its goal and to-dos for you")
+    s.add_argument("--next", help="the next step, one line")
+    s.add_argument("--waiting", help="who it waits on: you, ci, review, session (it's working), or a URL")
+    s.add_argument("--priority", choices=REPORT_PRIORITY)
+    s.add_argument("--goal", help='what the work is for, e.g. "Ship 0.7.4"; see --goals first ("" clears it)')
+    s.add_argument("--after", action="append", metavar="URL", help="a PR or issue that must land first (repeat; replaces the list)")
+    s.add_argument("--todo", metavar="TEXT", help="add something only the user can do")
+    s.add_argument("--kind", choices=TODO_KINDS, help="of the --todo")
+    s.add_argument("--size", choices=TODO_SIZES, help="of the --todo")
+    s.add_argument("--url", help="of the --todo: where to do it")
+    s.add_argument("--done", type=int, metavar="N", help="remove to-do N (from the list this prints)")
+    s.add_argument("--clear", action="store_true", help="delete the report")
+    s.add_argument("--goals", action="store_true", help="list the goals sessions use, to pick one")
+    s.add_argument("--session", help=argparse.SUPPRESS)
     s = sub.add_parser("resume", help="go to an open session's tab, or resume it in its folder")
     s.add_argument("id")
     s.add_argument("extra", nargs=argparse.REMAINDER)
@@ -3914,7 +4191,7 @@ def main():
     args = p.parse_args()
 
     handlers = {
-        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "show": cmd_show, "resume": cmd_resume,
+        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "report": cmd_report, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
         "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,
