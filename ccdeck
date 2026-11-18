@@ -604,28 +604,38 @@ GIT_LOCATION_VARS = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FI
                      "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
 
 
-def runs_gh_stack(cmd):
-    """Whether a shell command runs `gh stack` (first word, or after && || ; | or a newline). Quoted text,
-    as in `echo 'gh stack submit'`, doesn't: its output isn't gh stack's."""
+def gh_stack_dirs(cmd, cwd):
+    """The folder each `gh stack` in a shell command runs in, following `cd`; [] if it runs none. It runs
+    as a command's first word (after && || ; | a newline, or VAR=value words), not as quoted text such as
+    `echo 'gh stack submit'`, whose output isn't gh stack's. A folder is None when it can't be told (`cd -`)."""
     if "gh" not in cmd or "stack" not in cmd:
-        return False
+        return []
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lex.whitespace = " \t"  # newlines separate commands
         words = list(lex)
     except ValueError:
-        return False
-    start = True
+        return []
+    ops = ("&&", "||", ";", "|", "\n", "(", ")", "&")
+    out, here, start = [], cwd or None, True
     for i, w in enumerate(words):
-        if w in ("&&", "||", ";", "|", "\n", "(", ")", "&"):
+        if w in ops:
             start = True
             continue
         if start and w == "gh" and i + 1 < len(words) and words[i + 1] == "stack":
-            return True
-        if start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w, re.S):
+            out.append(here)
+        elif start and w == "cd":
+            arg = words[i + 1] if i + 1 < len(words) and words[i + 1] not in ops else "~"
+            arg = os.path.expanduser(arg)
+            here = None if arg == "-" or not (here or os.path.isabs(arg)) else os.path.normpath(os.path.join(here or "/", arg))
+        elif start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w, re.S):
             continue  # `CI=1 gh stack submit`: assignments before the command keep its first word to come
         start = False
-    return False
+    return out
+
+
+def runs_gh_stack(cmd):
+    return bool(gh_stack_dirs(cmd, None))
 
 
 _repo_cache = {}  # folder -> (owner/name or None, when): an answer is kept, a failure is asked again after a minute
@@ -674,6 +684,7 @@ def parse_transcript(path):
     }
     prs, files, tool_names, pending, pending_inputs = {}, {}, {}, {}, {}
     refs, linear, keys, tool_titles, not_created, questions = {}, {}, {}, {}, {}, {}
+    stack_dirs = {}  # tool id -> the folder its gh stack ran in (None: several, or unknown)
     stack_prs = {}  # (folder, PR number) that `gh stack submit` printed, without links; with_stack_prs resolves them
     seen_msgs = set()
 
@@ -781,8 +792,8 @@ def parse_transcript(path):
                                 src = "created" if creating else "tool"
                                 add_refs(body, src, with_prs=creating)
                                 if name == "Bash:stack":
-                                    for x, y in STACK_PR_RE.findall(body):
-                                        stack_prs[(e.get("cwd") or info["cwd"], int(x or y))] = None
+                                    for x, y in STACK_PR_RE.findall(body) if stack_dirs.get(tid) else ():
+                                        stack_prs[(stack_dirs[tid], int(x or y))] = None
                                 add_json_titles(body, src)
                                 if tid in tool_titles:  # an Artifact publish: title from its own input
                                     for r in refs.values():
@@ -849,8 +860,11 @@ def parse_transcript(path):
                             files[fp] = None
                     elif name == "Bash":
                         cmd = str(inp.get("command", ""))
-                        if runs_gh_stack(cmd):
+                        dirs = gh_stack_dirs(cmd, e.get("cwd") or info["cwd"])
+                        if dirs:
                             tool_names[b.get("id")] = "Bash:stack"
+                            # its number-only lines belong to the folder it ran in; two folders can't be told apart
+                            stack_dirs[b.get("id")] = dirs[0] if len(set(dirs)) == 1 else None
                         elif "gh pr create" in cmd or "git push" in cmd:
                             tool_names[b.get("id")] = "Bash:create"
     info["pending_tool"] = list(pending.values())[-1] if pending else None

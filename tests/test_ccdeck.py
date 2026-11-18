@@ -494,6 +494,16 @@ class ClassifyTest(unittest.TestCase):
             two = cc.with_stack_prs(cc.parse_transcript(PROJ / "s-two-repos.jsonl"))
         self.assertEqual(sorted(two["prs"]), ["https://github.com/acme/app/pull/11", "https://github.com/acme/app/pull/12",
                                               "https://github.com/acme/other/pull/4"])
+        # one command, two folders: its number-only lines can't be split between them, so they're skipped
+        both = "cd /elsewhere && gh stack submit; cd " + str(WORK) + " && gh stack submit"
+        write_session("s-both", [user("submit both", 80), asst([tool("g4", "Bash", {"command": both})], 79),
+                                 result("g4", 79, "✓ Created PR #5 for feat/e\n✓ Created PR #6 for feat/f"), asst([text("Done.")], 78)])
+        with mock.patch.object(cc.subprocess, "run", side_effect=git):
+            self.assertEqual(cc.with_stack_prs(cc.parse_transcript(PROJ / "s-both.jsonl"))["prs"], [])
+        for cmd, dirs in (("gh stack submit", ["/w/a"]), ("cd /w/b && gh stack submit", ["/w/b"]), ("cd sub && gh stack push", ["/w/a/sub"]),
+                          ("cd /w/a && gh stack submit; cd /w/b && gh stack submit", ["/w/a", "/w/b"]), ("cd - && gh stack submit", [None])):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(cc.gh_stack_dirs(cmd, "/w/a"), dirs)
         self.assertEqual(other["prs"], [])  # only gh stack's own output counts
         # Claude Code's pr-link entries name the session's PRs with links
         write_session("s-linked", [user("ship", 80), asst([text("Opened it.")], 79),
