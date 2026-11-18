@@ -628,8 +628,12 @@ def shell_tokens(cmd):
             word.append(cmd[i + 1:end])
             quoted, i = True, end + 1
         elif ch == "\\" and i + 1 < len(cmd):
-            word.append(cmd[i + 1])
+            if cmd[i + 1] != "\n":  # a backslash-newline joins two lines: both go
+                word.append(cmd[i + 1])
             i += 2
+        elif ch == "#" and not word and not quoted:  # a comment, to the end of the line
+            nl = cmd.find("\n", i)
+            i = len(cmd) if nl == -1 else nl
         elif ch in " \t":
             flush()
             i += 1
@@ -666,6 +670,12 @@ def gh_stack_dirs(cmd, cwd):
         if start and w == "gh" and nxt == (False, "stack"):
             out.append(here)
         elif start and w == "cd":
+            j = i + 1  # skip options (-P, -L, -e, -@) and --: the folder comes after them
+            while j < len(tokens) and not tokens[j][0] and tokens[j][1].startswith("-") and tokens[j][1] != "-":
+                j += 1
+                if tokens[j - 1][1] == "--":
+                    break
+            nxt = tokens[j] if j < len(tokens) else (True, "")
             arg = os.path.expanduser(nxt[1] if not nxt[0] else "~")
             here = None if arg == "-" or not (here or os.path.isabs(arg)) else os.path.normpath(os.path.join(here or "/", arg))
         elif start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w, re.S):

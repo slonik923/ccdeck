@@ -514,7 +514,10 @@ class ClassifyTest(unittest.TestCase):
                           ("(cd /w/b && make)\ngh stack submit", ["/w/a"]), ("(cd /w/b && gh stack submit)", ["/w/b"]),
                           ("echo '('; cd /w/b; echo ')'; gh stack submit", ["/w/b"]),  # quoted parentheses are text
                           ("(cd /w/b && gh stack submit); gh stack submit", ["/w/b", "/w/a"]),  # `);` is two operators
-                          ('cd "/w/my dir" && gh stack submit', ["/w/my dir"]), ("echo 'unclosed", [])):
+                          ('cd "/w/my dir" && gh stack submit', ["/w/my dir"]), ("echo 'unclosed", []),
+                          ("gh stack submit # don't wait", ["/w/a"]), ("echo a#b && gh stack push", ["/w/a"]),  # comments
+                          ("gh \\\n  stack submit", ["/w/a"]),  # a backslash-newline joins the lines
+                          ("cd -P /w/b && gh stack submit", ["/w/b"]), ("cd -- /w/b && gh stack submit", ["/w/b"])):
             with self.subTest(cmd=cmd):
                 self.assertEqual(cc.gh_stack_dirs(cmd, "/w/a"), dirs)
         self.assertEqual(other["prs"], [])  # only gh stack's own output counts
