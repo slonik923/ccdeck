@@ -138,10 +138,11 @@ def dim(t):
 
 
 def load_json(path, default):
-    if path.parent == DATA_DIR and path.exists():
+    if path.parent == DATA_DIR:
         try:  # tighten files older versions wrote; a read-only mount mustn't make the file unreadable
-            path.parent.chmod(0o700)
-            path.chmod(0o600)
+            if path.exists():  # can raise too (a link into a directory you can't enter)
+                path.parent.chmod(0o700)
+                path.chmod(0o600)
         except OSError:
             pass
     try:
@@ -974,7 +975,7 @@ def review_requests(sessions, items=None, viewer=None):
     cache = load_json(REVIEWS_FILE, {}) or {}
     if items is None and cache.get("scope", "all") != review_scope():
         return []
-    if items is None and viewer and cache.get("viewer") and cache["viewer"] != viewer:
+    if items is None and viewer and cache.get("viewer") != viewer:  # another account's, or nobody knows whose
         return []
     items = (cache.get("items") or []) if items is None else items
     return [r for r in items if r.get("url") not in own]
@@ -1011,6 +1012,8 @@ def fetch_pr_plan():
         return None
     try:
         data = json.loads(r.stdout)["data"]
+        # one budget for every extra page: past it, PRs keep hasNextPage, read as "maybe more", never Merge
+        deadline = time.monotonic() + 45
         for node in (data.get("mine") or {}).get("nodes") or []:
             if not isinstance(node, dict):
                 continue
@@ -1018,7 +1021,8 @@ def fetch_pr_plan():
             seen = set()
             while (threads.get("pageInfo") or {}).get("hasNextPage"):
                 cursor = (threads.get("pageInfo") or {}).get("endCursor")
-                if not cursor or cursor in seen:
+                left = deadline - time.monotonic()
+                if not cursor or cursor in seen or left < 1:
                     break
                 seen.add(cursor)
                 query = """query($url: URI!, $cursor: String!) {
@@ -1032,7 +1036,7 @@ def fetch_pr_plan():
                 try:
                     page = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query,
                                            "-f", "url=" + node["url"], "-f", "cursor=" + cursor],
-                                          capture_output=True, text=True, timeout=30)
+                                          capture_output=True, text=True, timeout=min(30, left))
                 except (OSError, subprocess.SubprocessError):
                     break  # retain the authored rows with an explicitly unknown review status
                 try:
@@ -1124,12 +1128,18 @@ def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
-def pr_step(p, stacked_on=None, session=None, now=None):
+def pr_step(p, stacked_on=None, session=None, now=None, working=False):
     """(step, texts, who) for one of your open PRs. Steps: 1 merge, 2 fix, 4 waiting, 5 clean up
     (3, review, is for review requests). stacked_on: the open PR whose branch this one targets.
-    session: name of a running session that owns the PR; it gets the fixes. who None: nobody."""
+    session: name of a running session that owns the PR; it gets the fixes. working: that session is busy
+    right now (not waiting for you). who: "you", "session" (the owning session) or None (nobody yet)."""
+    days = int(((now or time.time()) - p["updated"]) // 86400)
+    stale = [f"No activity for {days} days: close or pick up"] if days * 86400 >= STALE_AFTER else None
     if p["draft"]:
-        return (4, ["Draft: the session is still on it"], None) if session else (5, ["Draft: finish or close"], "you")
+        # a draft is yours to look over, unless its session is still writing it
+        if session and working:
+            return 4, ["Draft: the session is working on it"], None
+        return (5, ["Draft. " + stale[0]], "you") if stale and not session else (2, ["Draft: look it over, then mark it ready"], "you")
     fix = []
     if p["checks"] == "failing":
         fix.append("CI failing")
@@ -1139,11 +1149,9 @@ def pr_step(p, stacked_on=None, session=None, now=None):
         fix.append("Changes requested")
     if p["threads"]:  # known work stays work even when a later page of threads couldn't be read
         fix.append(plural(p["threads"], "review comment") + " to answer" + (", maybe more" if p.get("threads_more") else ""))
-    days = int(((now or time.time()) - p["updated"]) // 86400)
-    stale = [f"No activity for {days} days: close or pick up"] if days * 86400 >= STALE_AFTER else None
     if fix:
         # untouched for weeks and no session on it: decide its fate before fixing it
-        return (5, stale + fix, "you") if stale and not session else (2, fix, session or "you")
+        return (5, stale + fix, "you") if stale and not session else (2, fix, "session" if session else "you")
     if p.get("threads_more"):
         return 4, ["Review status unknown: check GitHub"], None
     if p["merge"] == "blocked" and p["threads_yours"]:
@@ -1164,6 +1172,11 @@ def pr_step(p, stacked_on=None, session=None, now=None):
     return (5, stale, "you") if stale else (4, [wait], None)
 
 
+def pr_key(url):
+    """A PR's identity for joins: GitHub owner and repo names are case-insensitive."""
+    return str(url).lower().rstrip("/")
+
+
 def pr_plan(sessions, saved=None, reviews=None):
     """Your saved PRs with their step, who acts and the owning session (`own` in pr_details), plus
     review requests as step 3."""
@@ -1175,28 +1188,30 @@ def pr_plan(sessions, saved=None, reviews=None):
     prs = [p for p in (cached_prs if isinstance(cached_prs, list) else []) if isinstance(p, dict) and required <= p.keys()
            and all(isinstance(p[k], str) for k in ("url", "repo", "head", "base", "default_base", "checks", "merge", "review"))
            and all(isinstance(p[k], (int, float)) for k in ("threads", "threads_yours", "updated"))]
-    by_url = {p["url"]: p for p in prs}
-    owner = {}
+    by_key = {pr_key(p["url"]): p for p in prs}
+    owner = {}  # GitHub names are case-insensitive: a transcript's Acme/App/pull/7 is the plan's acme/app/pull/7
     for session in sessions:
         for detail in session.get("pr_details") or []:
-            url = detail["url"]
-            row = by_url.get(url) or {}
+            key = pr_key(detail["url"])
+            row = by_key.get(key) or {}
             owns = detail.get("own") or detail.get("source") == "created" or bool(row.get("head") and row["head"] == session.get("branch"))
-            if owns and (url not in owner or session.get("alive")):
-                owner[url] = session
+            if owns and (key not in owner or session.get("alive")):
+                owner[key] = session
     heads = {(p.get("head_repo"), p["head"]): p["number"] for p in prs if p.get("head_repo")}
     rows = []
     for p in prs:
-        s = owner.get(p["url"])
+        s = owner.get(pr_key(p["url"]))
         name = (s.get("peer_name") or s["id"][:8]) if s else None
         stacked = heads.get((p["repo"], p["base"])) if p["base"] != p["default_base"] else None
-        step, texts, who = pr_step(p, stacked, name if s and s.get("alive") else None)
-        rows.append(dict(p, step=step, texts=texts, who=who, stacked_on=stacked, author=saved.get("viewer") or "",
+        live = bool(s and s.get("alive"))
+        step, texts, actor = pr_step(p, stacked, name if live else None, working=live and s.get("state") == "working")
+        # actor: who acts, "you", "session" or None; who: what to call them (a session may be named "you")
+        rows.append(dict(p, step=step, texts=texts, actor=actor, who=name if actor == "session" else actor, stacked_on=stacked, author=saved.get("viewer") or "",
                          session={"id": s["id"], "name": name, "alive": bool(s.get("alive"))} if s else None))
-    mine = {p["url"] for p in prs}
+    mine = {pr_key(p["url"]) for p in prs}
     for r in review_requests([], reviews, saved.get("viewer")):
-        if r["url"] not in mine:  # your own PR can be asked of a team you're in; it's already listed
-            rows.append(dict(r, step=3, texts=["Review it"], who="you", session=None))
+        if pr_key(r["url"]) not in mine:  # your own PR can be asked of a team you're in; it's already listed
+            rows.append(dict(r, step=3, texts=["Review it"], actor="you", who="you", session=None))
     rows.sort(key=lambda r: (r["step"], r.get("updated") or 0))
     return {"fetched": saved.get("fetched"), "viewer": saved.get("viewer"), "rows": rows,
             "disabled": disabled, "truncated": saved.get("truncated", False), "state": "disabled" if disabled else _plan_state}
@@ -2274,9 +2289,12 @@ class Dashboard:
             if time.time() - last_reviews > 300 or cached.get("scope", "all") != scope:
                 last_reviews = time.time()
                 try:
+                    # whose requests: asked before and after the search, kept only if both agree (an account
+                    # switch in between leaves it unknown, and pr_plan doesn't pair unknown rows with its PRs)
+                    before = gh_viewer() if scope != "off" else None
                     items = fetch_review_requests(scope)
                     if items is not None or scope == "off":
-                        viewer = gh_viewer() if items else None  # whose requests: pr_plan pairs them only with that account's PRs
+                        viewer = before if items and before and gh_viewer() == before else None
                         save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or [], "viewer": viewer})
                         if items != cached.get("items") or scope != cached.get("scope", "all"):
                             self.wake.set()
@@ -2328,9 +2346,11 @@ class Dashboard:
         elif action == "focus":
             # the name chip: go to the open tab, never start Claude (the snapshot it saw may be stale)
             peer = peer_sessions().get(sid)
-            if not peer:
+            pids = [p for p in (peer.get("pids") or [peer["pid"]]) if not pid_is_headless(p)] if peer else []
+            if not pids:
                 return 409, {"error": f"@{s.get('peer_name') or sid[:8]} isn't open any more; use Resume to start it"}
-            result["focused"] = focus_terminal(peer["pid"])
+            # the same order as ccdeck resume: the first tab that can be switched to
+            result["focused"] = next((label for pid in pids if (label := focus_terminal(pid))), None)
             if not result["focused"]:
                 return 409, {"error": f"Already open (@{peer.get('name') or sid[:8]}) in a terminal ccdeck can't switch to"}
         elif action == "resume" and (peer := peer_sessions().get(sid)):
@@ -2714,7 +2734,10 @@ def cmd_resume(args):
     s = resolve(args.id)
     peers = peer_sessions()
     peer = peers.get(s["id"])
-    pids = (peer.get("pids") or [peer["pid"]]) if peer else []
+    # a `claude -p` run on it doesn't make it open: only interactive processes are tabs to go to
+    pids = [p for p in (peer.get("pids") or [peer["pid"]]) if not pid_is_headless(p)] if peer else []
+    if not pids:
+        peer = None
     if not peer and not args.extra:
         registered = {pid for entry in peers.values() for pid in entry.get("pids", [entry["pid"]])}
         pids = [p[0] for p in running_claude_processes() if p[0] not in registered and s["id"] in resumed_ids([p])]

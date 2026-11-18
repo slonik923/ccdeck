@@ -535,6 +535,8 @@ function focusPanel(items) {
 
 // ---- header pieces ----
 function renderLive() {
+  // an unchanged snapshot (304) redraws nothing: keep the PR view's "From GitHub, … ago" moving
+  for (const el of document.querySelectorAll("[data-ago-from]")) el.textContent = agoText(Math.round(Date.now() / 1000 - Number(el.dataset.agoFrom)));
   const off = offline() || (!data && failures > 0);
   $("live").dataset.on = off ? "off" : "on";
   $("liveText").textContent = off ? "Offline" : data ? "Live" : "Connecting";
@@ -787,7 +789,7 @@ const STEPS = [
 const planRows = () => ((data.plan && data.plan.rows) || []).filter((r) => ui.scope === "all" || r.session || r.step === 3);
 function viewSwitch(nSessions) {
   const rows = planRows();
-  const yours = rows.filter((r) => r.who === "you").length;
+  const yours = rows.filter((r) => r.actor === "you").length;
   const pick = (v) => { ui.view = v; ls.set("view", v); render(); };
   return h("nav", { class: "filters viewsw", "aria-label": "View" },
     h("button", { class: "fchip", "aria-pressed": ui.view !== "prs" ? "true" : "false", "data-key": "v:sessions", onclick: () => pick("sessions") },
@@ -816,7 +818,10 @@ function planView(q) {
   if (!p.fetched) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, "No PR data yet"),
     h("p", {}, p.disabled ? "PR plan fetching is disabled (CCDECK_PR_PLAN=0). Review requests remain available." : p.state === "auth_required" ? "GitHub authentication required: run gh auth login." : p.state === "failed" ? "GitHub request failed. Check your connection and run gh auth login if authentication is required." : data.gh ? "ccdeck asks GitHub every 5 minutes; the first answer is on its way." : "This view needs the GitHub CLI: install gh and run gh auth login.")));
   if ((p.fetched || rows.length) && !rows.some((r) => !ui.step || r.step === ui.step)) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, q ? "No PRs match “" + q + "”" : "No open PRs"),
-    h("p", {}, ui.scope === "all" ? "Nothing open that you authored or are asked to review." : "Your sessions own no open PRs. Try “All mine”."), ui.step ? h("button", { class: "btn", onclick: () => { ui.step = 0; render(); } }, "Clear step selection") : null));
+    h("p", {}, ui.scope === "all" ? "Nothing open that you authored or are asked to review." : "Your sessions own no open PRs. Try “All mine”."), ui.step ? h("button", { class: "btn", onclick: () => {
+      const k = "st:" + ui.step; ui.step = 0; render();
+      const chip = document.querySelector('[data-key="' + k + '"]'); if (chip) chip.focus();  // this button is gone: back to the step chip
+    } }, "Clear step selection") : null));
   for (const st of STEPS) {
     if (ui.step && ui.step !== st.s) continue;
     const part = rows.filter((r) => r.step === st.s);
@@ -828,14 +833,15 @@ function planView(q) {
       h("ul", { class: "rrlist plan", "data-g": st.g }, part.map((r) => planRow(r, st)))));
   }
   out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"),
-    p.disabled ? "PR plan fetching is disabled" : p.fetched ? (p.state === "failed" || p.state === "auth_required" ? "Refresh failed; cached data from GitHub, " : "From GitHub, ") + agoText(Math.round(Date.now() / 1000 - p.fetched)) + " · refreshes every 5 min · no AI, statuses only" : "Waiting for GitHub")));
+    p.disabled ? "PR plan fetching is disabled" : p.fetched ? [(p.state === "failed" || p.state === "auth_required" ? "Refresh failed; cached data from GitHub, " : "From GitHub, "),
+      h("span", { "data-ago-from": String(p.fetched) }, agoText(Math.round(Date.now() / 1000 - p.fetched))), " · refreshes every 5 min · no AI, statuses only"] : "Waiting for GitHub")));
   return out;
 }
 function planRow(r, st) {
   const s = r.session;
   const validUrl = /^https?:\/\//i.test(r.url || "");
   const link = validUrl ? { href: r.url, target: "_blank", rel: "noopener noreferrer" } : {};
-  const msg = st.s === 2 && s && s.alive && r.who && r.who !== "you" ? r.repo + "#" + r.number + " needs work: " + r.texts.join("; ") + ". Please fix what's worth fixing and reply on the review threads; I resolve them. " + r.url : "";
+  const msg = st.s === 2 && s && s.alive && r.actor === "session" ? r.repo + "#" + r.number + " needs work: " + r.texts.join("; ") + ". Please fix what's worth fixing and reply on the review threads; I resolve them. " + r.url : "";
   return h("li", { "data-key": "pr:" + r.url },
     h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l, "data-key": "prn:" + r.url }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
     h("div", { class: "plan-main" },
@@ -844,7 +850,7 @@ function planRow(r, st) {
     h("span", { class: "rr-repo mono" }, r.repo),
     s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }), "n:" + s.id + ":" + r.url)
       : h("span", { class: "rr-by" }, st.s === 3 ? "by " + r.author : "no session"),
-    h("span", { class: "plan-who", "data-who": r.who ? (r.who === "you" ? "you" : "session") : "none" }, r.who ? (r.who === "you" ? "You" : "Session") : "—"),
+    h("span", { class: "plan-who", "data-who": r.actor || "none" }, r.actor === "you" ? "You" : r.actor === "session" ? "Session" : "—"),
     msg ? h("button", { class: "btn btn-sm", "data-key": "prm:" + r.url, title: "Copy a message for @" + s.name, onclick: () => copy(msg, "Message for @" + s.name) }, ic("copy", "i-sm"), "Message")
       : h("span", {}),
     h("span", { class: "ago" }, agoShort(r.updated)));

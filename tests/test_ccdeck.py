@@ -254,7 +254,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(p8["checks"], "none")
         self.assertTrue(p9["threads_more"])
         cc.save_json(cc.PR_PLAN_FILE, dict(plan, fetched=time.time()))
-        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests()})
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests(), "viewer": plan["viewer"]})
         sess = [{"id": "abcdef123456", "peer_name": "app-1", "alive": True, "pr_details": [{"url": p8["url"], "own": True}]}]
         rows = {r["number"]: r for r in cc.pr_plan(sess)["rows"]}
         self.assertEqual((rows[7]["step"], rows[7]["texts"]), (2, ["1 review comment to answer"]))
@@ -267,14 +267,34 @@ class ClassifyTest(unittest.TestCase):
         self.assertNotIn(6, {r["number"] for r in cc.pr_plan(sess)["rows"]})
         cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests(), "viewer": plan["viewer"]})
         self.assertIn(6, {r["number"] for r in cc.pr_plan(sess)["rows"]})
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests()})  # whose is unknown
+        self.assertNotIn(6, {r["number"] for r in cc.pr_plan(sess)["rows"]})
+        # a draft owned by a session: yours to look at while it waits for you, waiting while it works
+        drafts = dict(plan, prs=[dict(p8, draft=True)])
+        for state, step in (("idle", 2), ("question", 2), ("working", 4)):
+            with self.subTest(state=state):
+                self.assertEqual(cc.pr_plan([dict(sess[0], state=state)], drafts, [])["rows"][0]["step"], step)
+        # who acts is a kind; a session can be named "you" and still be the session
+        failing = dict(plan, prs=[dict(p8, checks="failing")])
+        row = cc.pr_plan([dict(sess[0], peer_name="you")], failing, [])["rows"][0]
+        self.assertEqual((row["actor"], row["who"]), ("session", "you"))
+        # the join ignores case: GitHub names are case-insensitive
+        shouty = [dict(sess[0], pr_details=[{"url": p8["url"].replace("github.com/me/app", "github.com/Me/App"), "own": True}])]
+        row = next(r for r in cc.pr_plan(shouty, plan, [])["rows"] if r["number"] == 8)
+        self.assertEqual(row["session"]["id"], "abcdef123456")
 
     @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "0"})
     def test_plan_disabled(self):
         self.assertIsNone(cc.fetch_pr_plan())
         review = {"url": "https://github.com/me/app/pull/44", "number": 44}
-        result = cc.pr_plan([], saved={"prs": [{}]}, reviews=[review])
+        authored = {"url": "https://github.com/me/app/pull/9", "repo": "me/app", "head": "feat/x", "base": "main", "default_base": "main",
+                    "number": 9, "title": "Mine", "draft": False, "checks": "passing", "merge": "clean", "review": "",
+                    "threads": 0, "threads_yours": 0, "updated": time.time()}
+        result = cc.pr_plan([], saved={"prs": [authored]}, reviews=[review])
         self.assertTrue(result["disabled"])
-        self.assertEqual([r["number"] for r in result["rows"]], [44])
+        self.assertEqual([r["number"] for r in result["rows"]], [44])  # a valid authored row is held back too
+        with mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"}):
+            self.assertEqual(sorted(r["number"] for r in cc.pr_plan([], saved={"prs": [authored]}, reviews=[review])["rows"]), [9, 44])
 
     @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"})
     def test_plan_ownership_reviews_and_forks(self):
@@ -319,6 +339,7 @@ class ClassifyTest(unittest.TestCase):
         session = {"id": "exact", "cwd": "", "mark": {}}
         with mock.patch.object(cc, "resolve", return_value=session), \
              mock.patch.object(cc, "peer_sessions", return_value={"exact": {"pid": 11, "pids": [11, 12]}}), \
+             mock.patch.object(cc, "pid_is_headless", return_value=False), \
              mock.patch.object(cc, "focus_terminal", side_effect=[None, "tmux"]) as focus, \
              mock.patch.object(cc.os, "execv") as execv:
             cc.cmd_resume(Namespace(id="exact", extra=[]))
@@ -336,6 +357,22 @@ class ClassifyTest(unittest.TestCase):
                 cc.cmd_resume(Namespace(id="exact", extra=[]))
             focus.assert_called_once_with(21)
             execv.assert_not_called()
+        # only a `claude -p` run has it in the registry: it isn't open, so resume starts it
+        with mock.patch.object(cc, "resolve", return_value=session), \
+             mock.patch.object(cc, "peer_sessions", return_value={"exact": {"pid": 31, "pids": [31]}}), \
+             mock.patch.object(cc, "pid_is_headless", lambda p: p == 31), \
+             mock.patch.object(cc, "running_claude_processes", return_value=[]), \
+             mock.patch.object(cc, "focus_terminal") as focus, \
+             mock.patch.object(cc.shutil, "which", return_value="/fake/claude"), \
+             mock.patch.object(cc.os, "execv") as execv:
+            cc.cmd_resume(Namespace(id="exact", extra=[]))
+            focus.assert_not_called()
+            execv.assert_called_once_with("/fake/claude", ["/fake/claude", "--resume", "exact"])
+
+    def test_a_config_behind_an_unreadable_link_reads_as_missing(self):
+        target = cc.DATA_DIR / "odd.json"
+        with mock.patch.object(Path, "exists", side_effect=PermissionError("denied")):
+            self.assertEqual(cc.load_json(target, {"fallback": 1}), {"fallback": 1})
 
     def test_private_cache(self):
         target = TMP / "private-cache" / "plan.json"
@@ -350,7 +387,7 @@ class ClassifyTest(unittest.TestCase):
         cases = [  # (changes, stacked_on, session, expected)
             ({}, None, None, (1, ["Merge it"], "you")),
             ({"threads_yours": 2, "merge": "behind"}, None, None, (1, ["Resolve 2 threads", "Update the branch", "Merge it"], "you")),
-            ({"checks": "failing", "threads": 1}, None, "s1", (2, ["CI failing", "1 review comment to answer"], "s1")),
+            ({"checks": "failing", "threads": 1}, None, "s1", (2, ["CI failing", "1 review comment to answer"], "session")),
             ({"merge": "dirty", "review": "changes_requested"}, None, None, (2, ["Conflicts with main", "Changes requested"], "you")),
             ({"threads_more": True}, None, None, (4, ["Review status unknown: check GitHub"], None)),  # never Merge past one page
             ({"threads_more": True, "threads": 1}, None, None, (2, ["1 review comment to answer, maybe more"], "you")),
@@ -360,25 +397,32 @@ class ClassifyTest(unittest.TestCase):
             ({"merge": "blocked", "threads_yours": 1}, None, None, (2, ["Resolve 1 thread", "Waiting for a review or a required check"], "you")),
             ({"merge": "blocked"}, None, None, (4, ["Waiting for a review or a required check"], None)),
             ({"merge": "unknown"}, None, None, (4, ["GitHub is still checking whether it can merge"], None)),
-            ({"draft": True, "checks": "failing"}, None, "s1", (4, ["Draft: the session is still on it"], None)),
-            ({"draft": True}, None, None, (5, ["Draft: finish or close"], "you")),
+            ({"draft": True}, None, "s1", (2, ["Draft: look it over, then mark it ready"], "you")),  # its session waits for you
+            ({"draft": True}, None, None, (2, ["Draft: look it over, then mark it ready"], "you")),
+            ({"draft": True, "updated": old}, None, None, (5, ["Draft. No activity for 20 days: close or pick up"], "you")),
+            ({"draft": True, "updated": old}, None, "s1", (2, ["Draft: look it over, then mark it ready"], "you")),
             ({"merge": "blocked", "updated": old}, None, None, (5, ["No activity for 20 days: close or pick up"], "you")),
             ({"merge": "dirty", "updated": old}, None, None, (5, ["No activity for 20 days: close or pick up", "Conflicts with main"], "you")),
-            ({"merge": "dirty", "updated": old}, None, "s1", (2, ["Conflicts with main"], "s1")),
+            ({"merge": "dirty", "updated": old}, None, "s1", (2, ["Conflicts with main"], "session")),
         ]
         for changes, stacked, session, expected in cases:
             with self.subTest(changes=changes, stacked=stacked, session=session):
                 self.assertEqual(cc.pr_step(dict(base, **changes), stacked, session, now), expected)
+        # only a session that is working right now keeps its draft off your list
+        self.assertEqual(cc.pr_step(dict(base, draft=True, checks="failing"), None, "s1", now, working=True),
+                         (4, ["Draft: the session is working on it"], None))
+        self.assertEqual(cc.pr_step(dict(base, draft=True), None, None, now, working=True)[0], 2)
         # every combination lands in a step with text, and only Merge, Fix and Clean up ask someone to act
         import itertools
-        for draft, checks, merge, review, threads, yours, more, upd, stacked, session in itertools.product(
+        for draft, checks, merge, review, threads, yours, more, upd, stacked, session, working in itertools.product(
                 (False, True), ("passing", "failing", "pending", "none"),
                 ("clean", "blocked", "behind", "dirty", "unstable", "unknown", "has_hooks", "draft"),
                 ("", "approved", "changes_requested", "review_required"), (0, 2), (0, 1), (False, True),
-                (now, old), (None, 9), (None, "s1")):
+                (now, old), (None, 9), (None, "s1"), (False, True)):
             p = dict(base, draft=draft, checks=checks, merge=merge, review=review, threads=threads,
                      threads_yours=yours, threads_more=more, updated=upd)
-            step, texts, who = cc.pr_step(p, stacked, session, now)
+            step, texts, who = cc.pr_step(p, stacked, session, now, working)
+            self.assertIn(who, ("you", "session", None))
             self.assertIn(step, (1, 2, 4, 5))
             self.assertTrue(texts and all(texts))
             self.assertEqual(who is None, step == 4)
@@ -544,6 +588,29 @@ class PrCommandTest(unittest.TestCase):
                     cc.cmd_resume(Namespace(id=session["id"], extra=[]))
                     focus.assert_not_called()
                     execv.assert_called_once()
+
+    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"})
+    def test_thread_pages_share_one_time_budget(self):
+        """Slow extra pages stop at the budget: the PRs not read stay "maybe more", never Merge."""
+        node = lambda n: {"url": f"https://github.com/me/app/pull/{n}", "number": n, "mergeStateStatus": "CLEAN",
+                          "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "c"}}}
+        first = {"data": {"viewer": {"login": "me"}, "mine": {"nodes": [node(n) for n in range(5)]}}}
+        clock = [0.0]
+        timeouts = []
+        def run(argv, **kw):
+            if "-f" in argv and any(a.startswith("cursor=") for a in argv):
+                timeouts.append(kw["timeout"])
+                clock[0] += 30  # each page times out after its full wait
+                raise cc.subprocess.TimeoutExpired(argv, kw["timeout"])
+            return type("R", (), {"returncode": 0, "stdout": json.dumps(first), "stderr": ""})
+        with mock.patch.object(cc.shutil, "which", return_value="/fake/gh"), \
+             mock.patch.object(cc.subprocess, "run", side_effect=run), \
+             mock.patch.object(cc.time, "monotonic", lambda: clock[0]):
+            plan = cc.fetch_pr_plan()
+        self.assertEqual(timeouts, [30, 15])  # 45 s in all, not 30 s per PR
+        self.assertEqual(len(plan["prs"]), 5)  # every row is still listed
+        self.assertTrue(all(p["threads_more"] for p in plan["prs"]))
+        self.assertTrue(all(cc.pr_step(p, now=1)[0] != 1 for p in plan["prs"]))
 
     def test_refresh_is_ready_only_once_saved(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1490,7 +1557,11 @@ class ServerTest(unittest.TestCase):
             code, body = self.req("/api/action", data={"id": "s-closed", "action": "resume"})
             self.assertEqual(code, 409)
             self.assertIn("@work-2d", json.loads(body)["error"])
-            # the name chip's focus: switches when open, never starts Claude when the tab is gone
+            # the name chip's focus: tries every tab in turn, never starts Claude when the tab is gone
+            cc.peer_sessions = lambda: {"s-closed": {"name": "work-2d", "pid": 1, "pids": [1, 2]}}
+            cc.focus_terminal = lambda pid: "tmux" if pid == 2 else None
+            code, body = self.req("/api/action", data={"id": "s-closed", "action": "focus"})
+            self.assertEqual((code, json.loads(body)["focused"]), (200, "tmux"))
             cc.focus_terminal = lambda pid: "gnome-terminal"
             code, body = self.req("/api/action", data={"id": "s-closed", "action": "focus"})
             self.assertEqual((code, json.loads(body)["focused"]), (200, "gnome-terminal"))

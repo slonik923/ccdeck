@@ -90,6 +90,8 @@ if sys.argv[1:3] == ["pr", "view"]:
     if not d:
         print("not found", file=sys.stderr); sys.exit(1)
     print(json.dumps(d)); sys.exit(0)
+if sys.argv[1:3] == ["api", "user"]:  # who is signed in: review requests are paired with that account's PRs
+    print("you"); sys.exit(0)
 if sys.argv[1:3] == ["auth", "status"]:
     sys.exit(0)
 sys.exit(1)
