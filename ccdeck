@@ -226,7 +226,7 @@ def ps_table():
                              text=True, timeout=_ps_cache["timeout"], env=dict(os.environ, LC_ALL="C")).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
-    _ps_cache.update(t=now, rows=parse_ps(out))
+    _ps_cache.update(t=time.time(), rows=parse_ps(out))  # stamped after: a timed-out call isn't repeated at once
     return _ps_cache["rows"]
 
 
@@ -2807,7 +2807,8 @@ def input_hash(tool_name, tool_input):
 
 
 def pid_is_headless(pid):
-    return is_print_argv((_process_argv(pid) or proc_cmdline(pid)) if pid else [])
+    # exact arguments only: ps words split a quoted prompt, so its `--` could hide a real -p. Unreadable: interactive
+    return is_print_argv(_process_argv(pid) if pid else [])
 
 
 def claude_is_headless():

@@ -624,8 +624,9 @@ class HookTest(unittest.TestCase):
         build_fixtures()
         sid = "s-closed"
         self.addCleanup((cc.STATE_DIR / f"{sid}.json").unlink, missing_ok=True)
-        self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
-        with mock.patch.object(cc, "find_claude_ancestor", side_effect=AssertionError("looked up")):
+        cc.save_json(cc.STATE_DIR / f"{sid}.json", {"session_id": sid, "event": "Stop", "status": "stopped", "ts": 1000.0})
+        with mock.patch.object(cc.time, "time", return_value=1000.5), \
+                mock.patch.object(cc, "find_claude_ancestor", side_effect=AssertionError("looked up")):
             self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
 
     def test_resumed_session_isnt_held_back_by_the_ended_hook(self):
@@ -1490,6 +1491,22 @@ class ResumedIdsTest(unittest.TestCase):
         self.assertFalse(cc.is_print_argv(["claude", "--", "-p"]))
         self.assertTrue(cc.is_print_argv(["claude", "-p", "--", "-x"]))
         self.assertEqual([p[0] for p in cc.interactive_processes([(1, "/w", ["claude", "--", "-p"])])], [1])
+
+    def test_ps_words_dont_say_headless(self):
+        with mock.patch.object(cc, "_process_argv", return_value=[]), \
+                mock.patch.object(cc, "proc_cmdline", return_value=["claude", "-p", "q"]):
+            self.assertFalse(cc.pid_is_headless(1))
+
+    def test_a_timed_out_ps_is_reused_for_a_second(self):
+        calls = []
+        def run(*a, **kw):
+            calls.append(1)
+            raise cc.subprocess.TimeoutExpired("ps", 2)
+        clock = iter([100.0, 102.0, 102.5])  # the call starts at 100 and times out at 102
+        with mock.patch.object(cc.subprocess, "run", run), mock.patch.object(cc.time, "time", lambda: next(clock)), \
+                mock.patch.dict(cc._ps_cache, {"t": 0.0, "rows": {}}):
+            cc.ps_table(); cc.ps_table()
+        self.assertEqual(len(calls), 1)
 
     def test_headless_pid(self):
         with mock.patch.object(cc, "_process_argv", lambda p: {1: ["claude", "-pc", "q"], 2: ["claude", "-c"]}.get(p, [])):
