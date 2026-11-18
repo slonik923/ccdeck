@@ -35,7 +35,7 @@ query($q: String!, $after: String) {
   }
 }
 fragment F on PullRequest {
-  url number title isDraft createdAt updatedAt headRefName headRefOid
+  url number title isDraft createdAt updatedAt headRefName headRefOid baseRefName
   repository { nameWithOwner } author { login }
   reviewDecision mergeable
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
