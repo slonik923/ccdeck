@@ -675,7 +675,8 @@ def gh_stack_dirs(cmd, cwd):
                 if tokens[j][1] == "--":
                     j += 1
                     break
-                physical = "P" in tokens[j][1] or (physical and "L" not in tokens[j][1])  # the last of -P / -L wins
+                for flag in tokens[j][1][1:]:  # in order, as cd reads them: in -PL the L comes last and wins
+                    physical = True if flag == "P" else False if flag == "L" else physical
                 j += 1
             nxt = tokens[j] if j < len(tokens) else (True, "")
             arg = os.path.expanduser(nxt[1] if not nxt[0] else "~")

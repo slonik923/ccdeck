@@ -509,6 +509,8 @@ class ClassifyTest(unittest.TestCase):
             self.assertEqual(cc.gh_stack_dirs(f"cd -P {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/repos/app"])
             self.assertEqual(cc.gh_stack_dirs(f"cd {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/work"])
             self.assertEqual(cc.gh_stack_dirs(f"cd -P -L {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/work"])
+            self.assertEqual(cc.gh_stack_dirs(f"cd -PL {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/work"])
+            self.assertEqual(cc.gh_stack_dirs(f"cd -LP {root}/work/link/.. && gh stack submit", "/x"), [f"{root}/repos/app"])
         # two spellings of one folder (a symlink) are one folder
         with tempfile.TemporaryDirectory() as root:
             real = Path(root) / "repo"
