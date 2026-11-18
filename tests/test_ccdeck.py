@@ -11,6 +11,7 @@ import shlex
 import shutil
 import stat
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -500,6 +501,27 @@ class ClassifyTest(unittest.TestCase):
                                    {"type": "pr-link", "prUrl": "javascript:alert(1)"}, {"type": "pr-link", "prUrl": 7}])
         linked = cc.parse_transcript(PROJ / "s-linked.jsonl")
         self.assertEqual((linked["prs"], linked["pr_sources"]), ([PR.format(5)], {PR.format(5): "created"}))
+        # only gh stack itself running counts: quoted text that names it prints something else
+        for cmd, runs in (("gh stack submit --auto", True), ("cd /w && gh stack push", True), ("git status\ngh stack view", True),
+                          ("printf '%s\\n' 'gh stack submit' 'https://github.com/other/repo/pull/12'", False),
+                          ("echo gh stack submit", False), ("echo 'unbalanced", False), ("gh pr view 12", False)):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(cc.runs_gh_stack(cmd), runs)
+        quoted = "printf '%s\\n' 'gh stack submit' 'https://github.com/other/repo/pull/12'"
+        write_session("s-quoted", [user("print it", 80), asst([tool("q1", "Bash", {"command": quoted})], 79),
+                                   result("q1", 79, "gh stack submit\nhttps://github.com/other/repo/pull/12"), asst([text("Done.")], 78)])
+        self.assertEqual(cc.parse_transcript(PROJ / "s-quoted.jsonl")["pr_sources"], {})
+        # an inherited GIT_DIR doesn't make one folder answer with another repo's remote
+        with tempfile.TemporaryDirectory() as root:
+            for name in ("a", "b"):
+                d = Path(root) / name
+                d.mkdir()
+                subprocess.run(["git", "init", "-q", str(d)], check=True)
+                subprocess.run(["git", "-C", str(d), "remote", "add", "origin", f"git@github.com:acme/{name}.git"], check=True)
+            cc._repo_cache.clear()
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(Path(root) / "b" / ".git")}):
+                self.assertEqual(cc.github_repo(str(Path(root) / "a")), "acme/a")
+            cc._repo_cache.clear()
         for remote, repo in (("https://github.com/acme/app.git", "acme/app"), ("https://github.com/acme/my.app", "acme/my.app"),
                              ("ssh://git@github.com/acme/app.git", "acme/app"), ("https://token@github.com/acme/app", "acme/app"),
                              ("https://notgithub.com/acme/app.git", None), ("git@notgithub.com:acme/app.git", None),

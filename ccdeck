@@ -462,7 +462,7 @@ def json_objects(text):
         elif isinstance(x, list):
             stack.extend(x)
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-CREATING_TOOL_HINTS = ("create", "publish", "Artifact", "save_", "push", "Bash:create")
+CREATING_TOOL_HINTS = ("create", "publish", "Artifact", "save_", "push", "Bash:create", "Bash:stack")
 DECISION_RE = re.compile(
     r"\b(should I|shall I|do you want|would you like|want me to|which (?:one|option|approach)"
     r"|your call|please (?:confirm|decide|choose|pick)|let me know (?:which|whether|if you want))\b",
@@ -600,6 +600,32 @@ def is_headless(info):
     return str(info.get("entrypoint") or "").startswith("sdk")
 
 
+GIT_LOCATION_VARS = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+
+
+def runs_gh_stack(cmd):
+    """Whether a shell command runs `gh stack` (first word, or after && || ; | or a newline). Quoted text,
+    as in `echo 'gh stack submit'`, doesn't: its output isn't gh stack's."""
+    if "gh" not in cmd or "stack" not in cmd:
+        return False
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace = " \t"  # newlines separate commands
+        words = list(lex)
+    except ValueError:
+        return False
+    start = True
+    for i, w in enumerate(words):
+        if w in ("&&", "||", ";", "|", "\n", "(", ")", "&"):
+            start = True
+            continue
+        if start and w == "gh" and i + 1 < len(words) and words[i + 1] == "stack":
+            return True
+        start = False
+    return False
+
+
 _repo_cache = {}  # folder -> (owner/name or None, when): an answer is kept, a failure is asked again after a minute
 
 
@@ -610,8 +636,11 @@ def github_repo(cwd):
     hit = _repo_cache.get(cwd)
     if hit and (hit[0] or time.time() - hit[1] < 60):
         return hit[0]
+    # an inherited GIT_DIR (a hook run inside another repo) would beat -C and answer for that repo
+    env = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION_VARS}
     try:
-        out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=3).stdout
+        out = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True,
+                             timeout=3, env=env).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
     m = GITHUB_REMOTE_RE.fullmatch(out.strip())
@@ -749,7 +778,7 @@ def parse_transcript(path):
                             if creating or "linear" in name.lower():
                                 src = "created" if creating else "tool"
                                 add_refs(body, src, with_prs=creating)
-                                if name == "Bash:create":
+                                if name == "Bash:stack":
                                     for x, y in STACK_PR_RE.findall(body):
                                         stack_prs[(e.get("cwd") or info["cwd"], int(x or y))] = None
                                 add_json_titles(body, src)
@@ -818,7 +847,9 @@ def parse_transcript(path):
                             files[fp] = None
                     elif name == "Bash":
                         cmd = str(inp.get("command", ""))
-                        if "gh pr create" in cmd or "git push" in cmd or "gh stack" in cmd:
+                        if runs_gh_stack(cmd):
+                            tool_names[b.get("id")] = "Bash:stack"
+                        elif "gh pr create" in cmd or "git push" in cmd:
                             tool_names[b.get("id")] = "Bash:create"
     info["pending_tool"] = list(pending.values())[-1] if pending else None
     info["pending_input"] = pending_inputs.get(list(pending)[-1]) if pending else None
