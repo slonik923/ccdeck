@@ -227,6 +227,7 @@ async function act(id, action, extra) {
     if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
     const msgs = {
       resume: j.focused ? "Switched to its " + j.focused + " tab" : "Opening a terminal" + (j.terminal ? " (" + j.terminal + ")" : "") + "…", done: "Marked done",
+      focus: "Switched to its " + (j.focused || "terminal") + " tab",
       undone: "Reopened", park: "Parked", unpark: "Unparked", note: "Note saved",
       open_folder: "Opening the folder…", refresh_prs: "PR states refreshed",
       dismiss: "Dismissed", dismiss_all: "Notifications cleared",
@@ -435,11 +436,12 @@ const loc = (s) => h("div", { class: "loc" }, ic("folder"), h("span", { class: "
   h("span", { class: "sep" }, "·"), h("span", { class: "mono", title: s.id }, s.sid));
 let lastById = {};
 // A session's messaging name. Open in a terminal: a click goes to its tab, like a clicked notification. Otherwise: its details.
-function nameChip(s) {
+function nameChip(s, key) {
   if (!s.name) return null;
-  return h("button", { class: "lchip namechip", "data-on": s.run ? "on" : "off", "data-key": "n:" + s.id,
+  key = key || "n:" + s.id;  // a session can own several PRs: each row's chip needs its own focus key
+  return h("button", { class: "lchip namechip", "data-on": s.run ? "on" : "off", "data-key": key,
     title: (s.peerOpen ? "Go to its terminal tab" : (s.run ? "Running" : "Not running") + " · open the details") + "\nOther sessions message it as @" + s.name,
-    onclick: (e) => { e.stopPropagation(); if (s.peerOpen) act(s.id, "resume"); else openDrawer(s.id, "n:" + s.id); } },
+    onclick: (e) => { e.stopPropagation(); if (s.peerOpen) act(s.id, "focus"); else openDrawer(s.id, key); } },
     h("span", { class: "run-dot" }), "@" + s.name);
 }
 const nmark = (s) => s.notif ? h("span", { class: "nmark", title: "Notification: " + s.notif.title }, ic("bell", "i-xs"), h("span", { class: "sr" }, "Notification waiting")) : null;
@@ -833,17 +835,17 @@ function planRow(r, st) {
   const s = r.session;
   const validUrl = /^https?:\/\//i.test(r.url || "");
   const link = validUrl ? { href: r.url, target: "_blank", rel: "noopener noreferrer" } : {};
-  const msg = st.s === 2 && s && s.alive ? r.repo + "#" + r.number + " needs work: " + r.texts.join("; ") + ". Please fix what's worth fixing and reply on the review threads; I resolve them. " + r.url : "";
+  const msg = st.s === 2 && s && s.alive && r.who && r.who !== "you" ? r.repo + "#" + r.number + " needs work: " + r.texts.join("; ") + ". Please fix what's worth fixing and reply on the review threads; I resolve them. " + r.url : "";
   return h("li", { "data-key": "pr:" + r.url },
-    h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
+    h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l, "data-key": "prn:" + r.url }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
     h("div", { class: "plan-main" },
-      h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title }, link), r.title),
+      h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title, "data-key": "prt:" + r.url }, link), r.title),
       h("span", { class: "plan-next" }, r.texts.join(" · "))),
     h("span", { class: "rr-repo mono" }, r.repo),
-    s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }))
+    s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }), "n:" + s.id + ":" + r.url)
       : h("span", { class: "rr-by" }, st.s === 3 ? "by " + r.author : "no session"),
     h("span", { class: "plan-who", "data-who": r.who ? (r.who === "you" ? "you" : "session") : "none" }, r.who ? (r.who === "you" ? "You" : "Session") : "—"),
-    msg ? h("button", { class: "btn btn-sm", title: "Copy a message for @" + s.name, onclick: () => copy(msg, "Message for @" + s.name) }, ic("copy", "i-sm"), "Message")
+    msg ? h("button", { class: "btn btn-sm", "data-key": "prm:" + r.url, title: "Copy a message for @" + s.name, onclick: () => copy(msg, "Message for @" + s.name) }, ic("copy", "i-sm"), "Message")
       : h("span", {}),
     h("span", { class: "ago" }, agoShort(r.updated)));
 }

@@ -138,10 +138,13 @@ def dim(t):
 
 
 def load_json(path, default):
-    try:
-        if path.parent == DATA_DIR and path.exists():
+    if path.parent == DATA_DIR and path.exists():
+        try:  # tighten files older versions wrote; a read-only mount mustn't make the file unreadable
             path.parent.chmod(0o700)
             path.chmod(0o600)
+        except OSError:
+            pass
+    try:
         with open(path, encoding="utf-8") as f:
             val = json.load(f)
     except (OSError, ValueError):
@@ -954,12 +957,24 @@ def fetch_review_requests(scope=None):
     return out
 
 
-def review_requests(sessions, items=None):
+def gh_viewer():
+    """The GitHub login gh is signed in as, or None."""
+    try:
+        r = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
+def review_requests(sessions, items=None, viewer=None):
     """Cached review requests, less PRs that one of your sessions made. Nothing while the cache
-    was fetched for another setting (the PR loop fetches again within seconds)."""
+    was fetched for another setting (the PR loop fetches again within seconds), or, given a viewer,
+    for another GitHub account: one account's requests never sit next to another's PRs."""
     own = {p["url"] for s in sessions for p in s.get("pr_details") or [] if p.get("own")}
     cache = load_json(REVIEWS_FILE, {}) or {}
     if items is None and cache.get("scope", "all") != review_scope():
+        return []
+    if items is None and viewer and cache.get("viewer") and cache["viewer"] != viewer:
         return []
     items = (cache.get("items") or []) if items is None else items
     return [r for r in items if r.get("url") not in own]
@@ -1057,14 +1072,19 @@ def refresh_pr_plan():
     try:
         _plan_state = "pending"
         plan = fetch_pr_plan()
-        _plan_state = "ready" if plan is not None else ("auth_required" if _plan_state == "auth_required" else "failed")
-        if plan is not None:
-            plan = dict(plan, fetched=time.time())
-            if lock:
-                try:
-                    save_json(PR_PLAN_FILE, plan)
-                except OSError as e:
-                    print(f"Warning: could not save PR plan: {e}", file=sys.stderr)
+        if plan is None:
+            _plan_state = "auth_required" if _plan_state == "auth_required" else "failed"
+            return None
+        plan = dict(plan, fetched=time.time())
+        saved = False
+        if lock:
+            try:
+                save_json(PR_PLAN_FILE, plan)
+                saved = True
+            except OSError as e:
+                print(f"Warning: could not save PR plan: {e}", file=sys.stderr)
+        # the dashboard reads the file: it's only "ready" once the fresh plan is in it
+        _plan_state = "ready" if saved else "failed"
         return plan
     finally:
         if lock:
@@ -1117,8 +1137,8 @@ def pr_step(p, stacked_on=None, session=None, now=None):
         fix.append(f"Conflicts with {p['base']}")
     if p["review"] == "changes_requested":
         fix.append("Changes requested")
-    if p["threads"] and not p.get("threads_more"):
-        fix.append(plural(p["threads"], "review comment") + " to answer")
+    if p["threads"]:  # known work stays work even when a later page of threads couldn't be read
+        fix.append(plural(p["threads"], "review comment") + " to answer" + (", maybe more" if p.get("threads_more") else ""))
     days = int(((now or time.time()) - p["updated"]) // 86400)
     stale = [f"No activity for {days} days: close or pick up"] if days * 86400 >= STALE_AFTER else None
     if fix:
@@ -1174,7 +1194,7 @@ def pr_plan(sessions, saved=None, reviews=None):
         rows.append(dict(p, step=step, texts=texts, who=who, stacked_on=stacked, author=saved.get("viewer") or "",
                          session={"id": s["id"], "name": name, "alive": bool(s.get("alive"))} if s else None))
     mine = {p["url"] for p in prs}
-    for r in review_requests([], reviews):
+    for r in review_requests([], reviews, saved.get("viewer")):
         if r["url"] not in mine:  # your own PR can be asked of a team you're in; it's already listed
             rows.append(dict(r, step=3, texts=["Review it"], who="you", session=None))
     rows.sort(key=lambda r: (r["step"], r.get("updated") or 0))
@@ -1344,6 +1364,8 @@ def resumed_ids(procs):
     out = set()
     for _, _, argv in interactive_processes(procs):
         for i, a in enumerate(argv):
+            if a == "--":  # the rest is prompt text, not options
+                break
             if a in ("--resume", "-r") and i + 1 < len(argv):
                 out.add(argv[i + 1])
             elif a.startswith("--resume="):
@@ -2254,7 +2276,8 @@ class Dashboard:
                 try:
                     items = fetch_review_requests(scope)
                     if items is not None or scope == "off":
-                        save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or []})
+                        viewer = gh_viewer() if items else None  # whose requests: pr_plan pairs them only with that account's PRs
+                        save_json(REVIEWS_FILE, {"fetched": time.time(), "scope": scope, "items": items or [], "viewer": viewer})
                         if items != cached.get("items") or scope != cached.get("scope", "all"):
                             self.wake.set()
                 except Exception as e:
@@ -2302,6 +2325,14 @@ class Dashboard:
         if action in ("done", "undone", "park", "unpark", "note"):
             text = body.get("text")
             apply_action(sid, action, text if isinstance(text, str) else None)
+        elif action == "focus":
+            # the name chip: go to the open tab, never start Claude (the snapshot it saw may be stale)
+            peer = peer_sessions().get(sid)
+            if not peer:
+                return 409, {"error": f"@{s.get('peer_name') or sid[:8]} isn't open any more; use Resume to start it"}
+            result["focused"] = focus_terminal(peer["pid"])
+            if not result["focused"]:
+                return 409, {"error": f"Already open (@{peer.get('name') or sid[:8]}) in a terminal ccdeck can't switch to"}
         elif action == "resume" and (peer := peer_sessions().get(sid)):
             # already open: a second `claude --resume` would fork the session, so go to its tab instead
             result["focused"] = focus_terminal(peer["pid"])
@@ -2560,6 +2591,7 @@ def cmd_prs(args):
     scope = review_scope()
     items = fetch_review_requests(scope)
     if items is None and scope != "off":
+        unavailable = True  # an empty list would claim nobody asked for your review
         print("Review requests unavailable; check gh auth login.", file=sys.stderr)
     assembled = pr_plan(collect(include_all=True, days=10 ** 6),
                         saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])

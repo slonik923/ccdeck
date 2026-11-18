@@ -244,7 +244,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual([r["number"] for r in cc.review_requests([])], [6, 7])
         cc.REVIEWS_FILE.unlink()
 
-    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"})
+    @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1", "CCDECK_REVIEW_REQUESTS": "1"})
     def test_pr_plan_parse_stack_and_owner(self):
         self.addCleanup(lambda: cc.PR_PLAN_FILE.unlink(missing_ok=True))
         self.addCleanup(lambda: cc.REVIEWS_FILE.unlink(missing_ok=True))
@@ -262,6 +262,11 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(rows[8]["session"], {"id": "abcdef123456", "name": "app-1", "alive": True})
         self.assertEqual((rows[9]["step"], rows[9]["texts"]), (4, ["Review status unknown: check GitHub"]))
         self.assertEqual((rows[6]["step"], rows[6]["texts"]), (3, ["Review it"]))  # a review request, not yours
+        # review requests fetched as another GitHub account aren't listed next to this account's PRs
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests(), "viewer": "someone-else"})
+        self.assertNotIn(6, {r["number"] for r in cc.pr_plan(sess)["rows"]})
+        cc.save_json(cc.REVIEWS_FILE, {"scope": "all", "items": cc.fetch_review_requests(), "viewer": plan["viewer"]})
+        self.assertIn(6, {r["number"] for r in cc.pr_plan(sess)["rows"]})
 
     @mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "0"})
     def test_plan_disabled(self):
@@ -348,6 +353,7 @@ class ClassifyTest(unittest.TestCase):
             ({"checks": "failing", "threads": 1}, None, "s1", (2, ["CI failing", "1 review comment to answer"], "s1")),
             ({"merge": "dirty", "review": "changes_requested"}, None, None, (2, ["Conflicts with main", "Changes requested"], "you")),
             ({"threads_more": True}, None, None, (4, ["Review status unknown: check GitHub"], None)),  # never Merge past one page
+            ({"threads_more": True, "threads": 1}, None, None, (2, ["1 review comment to answer, maybe more"], "you")),
             ({"checks": "failing"}, 9, None, (2, ["CI failing"], "you")),  # a fix comes before waiting for the base PR
             ({}, 9, None, (4, ["After #9 merges"], None)),
             ({"checks": "pending"}, None, None, (4, ["CI running"], None)),
@@ -539,6 +545,19 @@ class PrCommandTest(unittest.TestCase):
                     focus.assert_not_called()
                     execv.assert_called_once()
 
+    def test_refresh_is_ready_only_once_saved(self):
+        with tempfile.TemporaryDirectory() as root:
+            data = Path(root)
+            with mock.patch.object(cc, "DATA_DIR", data), \
+                 mock.patch.object(cc, "PR_PLAN_FILE", data / "pr-plan.json"), \
+                 mock.patch.object(cc, "fetch_pr_plan", return_value={"prs": [], "viewer": "me"}), \
+                 mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"}):
+                with mock.patch.object(cc, "save_json", side_effect=OSError("read-only")):
+                    self.assertIsNotNone(cc.refresh_pr_plan())  # the CLI still gets the fresh plan
+                    self.assertEqual(cc._plan_state, "failed")  # the dashboard, reading the file, doesn't
+                cc.refresh_pr_plan()
+                self.assertEqual(cc._plan_state, "ready")
+
     def test_refresh_serializes_observations(self):
         with tempfile.TemporaryDirectory() as root:
             data = Path(root)
@@ -550,9 +569,15 @@ class PrCommandTest(unittest.TestCase):
                     entered.set()
                     release.wait(5)
                 return {"prs": [], "viewer": "me"}
+            real_flock, tried = cc.fcntl.flock, threading.Event()
+            def flock(f, op):  # notes the second refresh reaching the lock, then really locks
+                if threading.current_thread() is second:
+                    tried.set()
+                return real_flock(f, op)
             with mock.patch.object(cc, "DATA_DIR", data), \
                  mock.patch.object(cc, "PR_PLAN_FILE", data / "pr-plan.json"), \
                  mock.patch.object(cc, "fetch_pr_plan", side_effect=fetch), \
+                 mock.patch.object(cc.fcntl, "flock", flock), \
                  mock.patch.dict(os.environ, {"CCDECK_PR_PLAN": "1"}):
                 first = threading.Thread(target=cc.refresh_pr_plan)
                 second = threading.Thread(target=cc.refresh_pr_plan)
@@ -560,6 +585,8 @@ class PrCommandTest(unittest.TestCase):
                 self.assertTrue(entered.wait(5))
                 second.start()
                 try:
+                    self.assertTrue(tried.wait(5))  # it got to the lock while the first fetch is blocked...
+                    time.sleep(0.2)  # ...and without the lock it would be fetching by now
                     self.assertEqual(len(calls), 1)
                 finally:
                     release.set()
@@ -1463,6 +1490,14 @@ class ServerTest(unittest.TestCase):
             code, body = self.req("/api/action", data={"id": "s-closed", "action": "resume"})
             self.assertEqual(code, 409)
             self.assertIn("@work-2d", json.loads(body)["error"])
+            # the name chip's focus: switches when open, never starts Claude when the tab is gone
+            cc.focus_terminal = lambda pid: "gnome-terminal"
+            code, body = self.req("/api/action", data={"id": "s-closed", "action": "focus"})
+            self.assertEqual((code, json.loads(body)["focused"]), (200, "gnome-terminal"))
+            cc.peer_sessions = lambda: {}
+            code, body = self.req("/api/action", data={"id": "s-closed", "action": "focus"})
+            self.assertEqual(code, 409)
+            self.assertIn("isn't open any more", json.loads(body)["error"])
             self.assertEqual(opened, [])
         finally:
             cc.peer_sessions, cc.focus_terminal, cc.open_terminal = saved
@@ -1767,8 +1802,10 @@ class ResumedIdsTest(unittest.TestCase):
                  (3, "/w", ["claude", "--resume=c"]), (4, "/w", ["claude", "-p", "look at session d and --resume"]),
                  (5, "/w", ["claude", "summarize", "e"]), (6, "/w", ["claude", "--resume"]),
                  (7, "/w", ["claude", "-p", "--resume", "d"]),
-                 (8, "/w", ["claude", "--print", "--resume=e"])]
-        self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c"})
+                 (8, "/w", ["claude", "--print", "--resume=e"]),
+                 (9, "/w", ["claude", "--", "--resume=f"]), (10, "/w", ["claude", "--", "-r", "g"]),
+                 (11, "/w", ["claude", "--resume=h", "--", "--resume=i"])]
+        self.assertEqual(cc.resumed_ids(procs), {"a", "b", "c", "h"})  # after -- comes the prompt
 
     def test_after_double_dash_comes_the_prompt(self):
         self.assertTrue(cc.is_print_argv(["claude", "-c", "-p", "q"]))

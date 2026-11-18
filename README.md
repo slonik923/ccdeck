@@ -203,6 +203,8 @@ ccdeck review-requests mine   list only PRs where you were asked to review by na
 ccdeck preview 16      try PR #16 next to your dashboard (ccdeck preview stop)
 ```
 
+**`ccdeck resume`.** A closed session starts again: ccdeck goes to its folder and runs `claude --resume`. An open one is never started a second time: ccdeck switches to its terminal tab, and if it can't (a terminal it doesn't know), it says so and stops. Extra arguments (`ccdeck resume 3 --model opus`) skip the tab and go to `claude`, so they start it again.
+
 `3` is the row number from the last list. A prefix of the session id also works.
 
 ## How it works
