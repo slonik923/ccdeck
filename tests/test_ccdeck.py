@@ -503,6 +503,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual((linked["prs"], linked["pr_sources"]), ([PR.format(5)], {PR.format(5): "created"}))
         # only gh stack itself running counts: quoted text that names it prints something else
         for cmd, runs in (("gh stack submit --auto", True), ("cd /w && gh stack push", True), ("git status\ngh stack view", True),
+                          ("CI=1 GH_HOST=github.com gh stack submit --auto", True), ("echo X=1 gh stack submit", False),
                           ("printf '%s\\n' 'gh stack submit' 'https://github.com/other/repo/pull/12'", False),
                           ("echo gh stack submit", False), ("echo 'unbalanced", False), ("gh pr view 12", False)):
             with self.subTest(cmd=cmd):
@@ -513,11 +514,12 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(cc.parse_transcript(PROJ / "s-quoted.jsonl")["pr_sources"], {})
         # an inherited GIT_DIR doesn't make one folder answer with another repo's remote
         with tempfile.TemporaryDirectory() as root:
+            clean = {k: v for k, v in os.environ.items() if k not in cc.GIT_LOCATION_VARS}  # set up a and b, not the caller's repo
             for name in ("a", "b"):
                 d = Path(root) / name
                 d.mkdir()
-                subprocess.run(["git", "init", "-q", str(d)], check=True)
-                subprocess.run(["git", "-C", str(d), "remote", "add", "origin", f"git@github.com:acme/{name}.git"], check=True)
+                subprocess.run(["git", "init", "-q", str(d)], check=True, env=clean)
+                subprocess.run(["git", "-C", str(d), "remote", "add", "origin", f"git@github.com:acme/{name}.git"], check=True, env=clean)
             cc._repo_cache.clear()
             with mock.patch.dict(os.environ, {"GIT_DIR": str(Path(root) / "b" / ".git")}):
                 self.assertEqual(cc.github_repo(str(Path(root) / "a")), "acme/a")

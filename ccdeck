@@ -622,6 +622,8 @@ def runs_gh_stack(cmd):
             continue
         if start and w == "gh" and i + 1 < len(words) and words[i + 1] == "stack":
             return True
+        if start and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w, re.S):
+            continue  # `CI=1 gh stack submit`: assignments before the command keep its first word to come
         start = False
     return False
 
