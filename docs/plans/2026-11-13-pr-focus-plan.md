@@ -24,47 +24,61 @@ Cloud sessions that open PRs as the Claude GitHub app aren't "authored by you" o
 
 ## Getting the data: one GraphQL search per scope
 
-`gh search prs` can't return CI, review or conflict state (it has no `statusCheckRollup`, `reviewDecision` or `mergeable` field). Calling `gh pr view` for each PR works, but takes one call per PR. A GraphQL `search` returns everything in one call per query. I checked it on 2026-11-13: 15 open PRs, cost 2 points.
+`gh search prs` can't return CI, review or conflict state (it has no `statusCheckRollup`, `reviewDecision` or `mergeable` field). Calling `gh pr view` for each PR works, but takes one call per PR. A GraphQL `search` returns everything in one call per query. I checked it on 2026-11-13: 15 open PRs, cost 2 points. With the full fragment below, on 2026-11-18: 20 open PRs, cost 3 points.
 
 ```
 gh api graphql -f q='is:pr is:open author:@me archived:false' -f query='
 query($q: String!, $after: String) {
   search(type: ISSUE, query: $q, first: 100, after: $after) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest {
-      url number title isDraft createdAt updatedAt headRefName
-      repository { nameWithOwner } author { login }
-      reviewDecision mergeable
-      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-      reviewThreads(first: 100) { nodes { isResolved } }
-    } }
+    nodes { ...F }
   }
+}
+fragment F on PullRequest {
+  url number title isDraft createdAt updatedAt headRefName headRefOid
+  repository { nameWithOwner } author { login }
+  reviewDecision mergeable
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } }
+  reviewRequests(first: 10) { nodes { requestedReviewer {
+    ... on User { login } ... on Team { slug } ... on Bot { login } } } }
+  viewerLatestReview { state commit { oid } }
 }'
 ```
 
-- **Queries.** Each scope needs at most three: `author:@me`, `review-requested:@me` and `reviewed-by:@me`. The last two drop PRs you authored.
+The `F` fragment holds every field the step rules use, so a PR has the same inputs however it was fetched:
+
+- `reviewRequests` names who an authored PR is waiting on ("Waiting for review from …").
+- `viewerLatestReview.commit.oid` against `headRefOid` tells whether you reviewed the current head, or there have been pushes since.
+
+- **Queries.** Each scope needs at most three: `author:@me`, a review-request query and `reviewed-by:@me`. The last two drop PRs you authored. The review-request query is the one `review_scope()` already picks (`REVIEW_SCOPES`: `review-requested:@me` for "all", `user-review-requested:@me` for "mine"). With the "off" setting or `CCDECK_REVIEW_REQUESTS=0` it isn't run, as today.
 - **Paging.** Follow `pageInfo.endCursor` until `hasNextPage` is false. Stop after 5 pages, and show that the list was cut off.
 - **Unknown merge state.** `mergeable` is `UNKNOWN` while GitHub is still computing it. Treat that as unknown, not as a conflict, and fetch again on the next cycle.
 - **No CI.** No `statusCheckRollup` means the repo has no checks, which is shown as "no CI". It doesn't block a merge.
-- **Unresolved review comments.** These are the number of `reviewThreads` with `isResolved: false`. Bot reviews (CodeRabbit, Gemini) count too, because they are often what is still left to do.
-- **Refresh and failure.** The daemon fetches every 3 minutes, and at once when you press "Refresh". It only fetches when `gh` is installed, and not with `CCDECK_PR_PLAN=0`. It saves the result to `~/.claude/ccdeck/pr-plan.json`, as `reviews.json` is saved today. This replaces `fetch_review_requests()`, which then reads its list from the same file. If `gh` fails, the last result stays on screen with its age.
-- **Session PRs.** The PRs that sessions already track (the `pr-cache.json` entries) are matched to search results by URL. In the "From sessions" scope a session's PR may not be authored by you. Those PRs keep using `fetch_pr()`.
+- **Unresolved review comments.** These are the number of `reviewThreads` with `isResolved: false`. Bot reviews (CodeRabbit, Gemini) count too, because they are often what is still left to do. A PR with more than 100 threads (`reviewThreads.pageInfo.hasNextPage`) isn't paged: its count is shown as "100+" and treated as unknown, so the PR can't go to Merge. It goes to Fix with "Check review comments on GitHub".
+- **Refresh and failure.** The daemon fetches every 3 minutes, and at once when you press "Refresh". It only fetches when `gh` is installed, and not with `CCDECK_PR_PLAN=0`. It saves the result to `~/.claude/ccdeck/pr-plan.json`. If `gh` fails, the last result stays on screen with its age.
+- **Review requests stay as they are.** `fetch_review_requests()`, `reviews.json` and the review-request list in the session view don't change. `CCDECK_PR_PLAN=0` turns off only the PR view and its fetch, never the review-request list. `CCDECK_REVIEW_REQUESTS=0` still turns review requests off in both places. Review-requested PRs show up in the PR view only in the "Mine and reviews" scope. The other two scopes show only your own PRs, and review requests stay in the session view. Folding the two fetches into one is a possible follow-up, not part of this.
+- **Session PRs.** The PRs that sessions already track (the `pr-cache.json` entries) are matched to search results by URL. In the "From sessions" scope a session's PR may not be authored by you, so the search doesn't return it. Those PRs are fetched by URL in one extra GraphQL call, with the same `F` fragment and one alias per PR (`p0: repository(owner: …, name: …) { pullRequest(number: …) { ...F } }`). They then have review threads, timestamps and review requests like every other row. `fetch_pr()` and `pr-cache.json` stay as they are for the session view.
 
 ## The steps
 
 Each PR goes into the first step whose rule it matches. Each step lists its PRs oldest first, by `updatedAt`, so work that has been sitting longest comes up first.
 
+The rules first ask whose PR it is. A PR is **yours** if you authored it or a session owns it (the `own` flag). Every other PR is **someone else's**: it is in the list only because it asks for your review or you have reviewed it. Merge, Fix and Clean up are only for your PRs. Someone else's PR only ever goes to Review or Waiting, so an approved PR that asks for your review is never "Merge it", and you are never told to fix someone else's CI.
+
 | Step | Rule | Next step text | Who |
 |---|---|---|---|
-| **1. Merge** | Not a draft, CI passing or no CI, merge state `MERGEABLE`, review `APPROVED` or none required, no unresolved threads | "Merge it" | You |
-| **2. Fix** | CI failing, merge conflict, `CHANGES_REQUESTED`, or unresolved threads | One line per problem: "CI failing", "Rebase: conflicts with main", "3 unresolved review comments" | The owning session if it is running (`@name`), otherwise you |
-| **3. Review** | Someone else's PR that requests your review and that you haven't reviewed since its last push | "Review it" | You |
-| **4. Waiting** | CI pending, or waiting for a review from someone else | "CI running" / "Waiting for review from …" | Nobody (shown smaller) |
-| **5. Clean up** | A draft, or no activity for 14 days | "Draft: finish or close" / "Stale for 23 days: close or pick up" | You |
+| **1. Merge** | Yours, not a draft, CI passing or no CI, merge state `MERGEABLE`, review `APPROVED` or none required, a known count of zero unresolved threads | "Merge it" | You |
+| **2. Fix** | Yours, and CI failing, merge conflict, `CHANGES_REQUESTED`, unresolved threads, or more than 100 threads | One line per problem: "CI failing", "Rebase: conflicts with main", "3 unresolved review comments" | The owning session if it is running (`@name`), otherwise you |
+| **3. Review** | Someone else's, not a draft, and it asks for your review, or you reviewed an older commit (`viewerLatestReview.commit.oid` ≠ `headRefOid`) | "Review it" / "Review again: new commits" | You |
+| **4. Waiting** | Yours and not a draft, with CI pending, merge state `UNKNOWN`, or waiting for a review from someone else. Or someone else's PR that didn't match Review. | "CI running" / "Computing merge state" / "Waiting for review from …" / "Waiting for the author" | Nobody (shown smaller) |
+| **5. Clean up** | Yours, and a draft or no activity for 14 days | "Draft: finish or close" / "Stale for 23 days: close or pick up" | You |
+
+A PR that matches no rule goes to Waiting with "Waiting", so no PR drops out of the list. The `pr_step()` test checks that every combination of inputs lands in some step.
 
 Step 1 comes first because those are quick wins, and merging often unblocks other PRs. Step 2 comes before reviews because a PR that you and your sessions own and that is stuck blocks your own work.
 
-A PR you have already reviewed, with no new commits since, goes to step 4 and waits for the author.
+A PR you have already reviewed, with no new commits since (`viewerLatestReview.commit.oid` = `headRefOid`), goes to step 4 and waits for the author. Waiting leaves drafts out, so a draft that isn't broken goes to Clean up instead of waiting for a review nobody was asked for.
 
 ## What a row shows
 
@@ -80,8 +94,9 @@ The rule function is a small pure function, `pr_step(pr, session) -> (step, text
 
 ## Tests
 
-- A table test for `pr_step()`, with one case per rule and the order between rules. Examples: failing CI and approved goes to Fix, a draft with failing CI goes to Fix, `UNKNOWN` merge state doesn't go to Fix.
-- Parsing of a saved GraphQL response: paging, a missing `statusCheckRollup`, and PRs you authored being dropped from the review queries.
+- A table test for `pr_step()`, with one case per rule and the order between rules. Examples: failing CI and approved goes to Fix, a draft with failing CI goes to Fix, `UNKNOWN` merge state goes to Waiting and not to Fix, an approved and mergeable PR by someone else that asks for your review goes to Review and not to Merge, someone else's PR with failing CI never goes to Fix, a PR with 100+ threads never goes to Merge, and a PR you reviewed before its last push goes to Review.
+- Parsing of a saved GraphQL response: paging, a missing `statusCheckRollup`, a missing `viewerLatestReview`, team and user review requests, and PRs you authored being dropped from the review queries.
+- Settings: `CCDECK_PR_PLAN=0` still writes `reviews.json`, and `CCDECK_REVIEW_REQUESTS=0` skips the review-request query in the plan fetch.
 - The scope filter: "From sessions" only includes `own` PRs; "Mine and reviews" doesn't include the same PR twice.
 
 ## Not in the first version
