@@ -859,6 +859,10 @@ class ReportTest(unittest.TestCase):
         self.assertRegex(r["todos"][0]["id"], "^[0-9a-f]{8}$")  # a file without ids gets stable ones
         self.assertEqual(r["todos"], cc.sanitize_report({"todos": r["todos"]})["todos"])
         self.assertEqual(cc.sanitize_report({"updated": float("nan")})["updated"], 0)  # NaN would break the API's JSON
+        self.assertEqual(cc.sanitize_report({"updated": 10 ** 400})["updated"], 0)  # too large for a float
+        odd = cc.sanitize_report({"todos": [{"text": "Check \ud800", "id": "0000aaaa"}, {"text": "Other", "id": "0000aaaa"}]})
+        self.assertEqual(odd["todos"][0]["text"], "Check ?")  # an unpaired surrogate
+        self.assertEqual(len({x["id"] for x in odd["todos"]}), 2)  # a repeated id is made unique
         cc.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         (cc.REPORTS_DIR / "not.a-session.json").write_text('{"next": "x"}')
         (cc.REPORTS_DIR / (self.A + ".json")).write_text("not json")

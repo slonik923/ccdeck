@@ -1769,7 +1769,8 @@ def _http(u):
 
 
 def _text(v, n):
-    return " ".join(v.split())[:n] if isinstance(v, str) else ""
+    # an unpaired surrogate (valid in JSON, not in UTF-8) would break printing and hashing: replace it
+    return " ".join(v.encode("utf-8", "replace").decode().split())[:n] if isinstance(v, str) else ""
 
 
 def sanitize_report(d):
@@ -1782,18 +1783,27 @@ def sanitize_report(d):
     out["priority"] = d.get("priority") if d.get("priority") in REPORT_PRIORITY else "normal"
     after = d.get("after") if isinstance(d.get("after"), list) else []
     out["after"] = [u for u in after if _http(u)][:REPORT_AFTER]
-    todos = []
+    todos, seen = [], set()
     for i, t in enumerate(d.get("todos") if isinstance(d.get("todos"), list) else []):
-        if isinstance(t, dict) and _text(t.get("text"), REPORT_TEXT):
-            tid = t.get("id") if isinstance(t.get("id"), str) and re.fullmatch(r"[0-9a-f]{8}", t["id"]) else \
-                hashlib.sha1(f"{i}:{t.get('text')}:{t.get('url')}".encode()).hexdigest()[:8]  # a file without ids
-            todos.append({"id": tid, "text": _text(t.get("text"), REPORT_TEXT),
+        text = _text(t.get("text"), REPORT_TEXT) if isinstance(t, dict) else ""
+        if text:
+            tid = t.get("id") if isinstance(t.get("id"), str) and re.fullmatch(r"[0-9a-f]{8}", t["id"]) else ""
+            if not tid or tid in seen:  # missing or repeated: one derived from its place and text, unique in the list
+                tid = hashlib.sha1(f"{i}:{text}".encode()).hexdigest()[:8]
+                while tid in seen:
+                    tid = hashlib.sha1(tid.encode()).hexdigest()[:8]
+            seen.add(tid)
+            todos.append({"id": tid, "text": text,
                           "kind": t.get("kind") if t.get("kind") in TODO_KINDS else "",
                           "size": t.get("size") if t.get("size") in TODO_SIZES else "",
                           "url": t.get("url") if _http(t.get("url")) else ""})
     out["todos"] = todos[:REPORT_TODOS]
     up = d.get("updated")
-    out["updated"] = up if isinstance(up, (int, float)) and not isinstance(up, bool) and math.isfinite(up) else 0  # NaN isn't JSON
+    try:
+        finite = isinstance(up, (int, float)) and not isinstance(up, bool) and math.isfinite(up)
+    except OverflowError:  # an int too large for a float
+        finite = False
+    out["updated"] = up if finite else 0  # NaN isn't JSON
     return out
 
 
@@ -1809,7 +1819,10 @@ def report_file(sid):
 def load_reports():
     out = {}
     for f in REPORTS_DIR.glob("*.json") if REPORTS_DIR.is_dir() else []:
-        r = sanitize_report(load_json(f, None))
+        try:  # sessions write these files: one that's odd in a way not checked for is skipped, not fatal
+            r = sanitize_report(load_json(f, None))
+        except Exception:
+            continue
         if r and REPORT_ID_RE.fullmatch(f.stem):
             out[f.stem] = r
     return out
