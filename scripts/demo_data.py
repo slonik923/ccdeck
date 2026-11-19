@@ -216,14 +216,16 @@ def build(home, pid):
     for sid, rep in {
         "d-deploy": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "you",
                      "next": "Deploy to staging, then replay the last 50 Stripe events",
-                     "todos": [{"text": "Rotate the Stripe test key in the staging vault", "kind": "hands-on", "size": "small"}]},
+                     "todos": [{"text": "Rotate the Stripe test key in the staging vault", "kind": "hands-on", "size": "small"},
+                               {"text": "Approve the staging deploy window", "kind": "decide", "size": "small", "done_at": now - 40 * 60}]},
         "d-rate": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "session",
                    "next": "Add the per-key override the review asked for", "after": [REPO.format("billing-api", 90)]},
         "d-cache": {"goal": "Launch Stripe billing", "waiting": "review", "next": "Waiting for the payments team's review",
                     "todos": [{"text": "Decide the exchange-rate cache TTL (1 h or 24 h)", "kind": "decide", "size": "small"}]},
         "d-dark": {"goal": "Settings refresh", "waiting": "you", "next": "Mark the PR ready once the preview looks right",
                    "todos": [{"text": "Check the dark theme on the preview", "kind": "validate", "size": "small",
-                              "url": "https://preview.example.com/settings"}]},
+                              "url": "https://preview.example.com/settings"},
+                             {"text": "Review the new settings copy", "kind": "review", "size": "small", "done_at": now - 3 * 3600}]},
         "d-node": {"goal": "Settings refresh", "priority": "low", "waiting": "ci", "next": "Merge when CI passes"},
         "d-csv": {"goal": "Reports v2", "waiting": "session", "next": "Make ReportRow.total required, then fix the e2e timeout"},
     }.items():

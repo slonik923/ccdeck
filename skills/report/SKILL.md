@@ -21,6 +21,6 @@ Run it as `python3 "${CLAUDE_PLUGIN_ROOT}/ccdeck" report …` (quoted: the path 
    ```bash
    ccdeck report --todo "Run cleanup.http on prod after the 0.7.4 release" --kind hands-on --size small --url https://…
    ```
-   `--kind` is `review`, `validate`, `decide` or `hands-on`; `--size` is `small`, `medium` or `large`. Remove a to-do that's no longer needed with `--done N` (the number in the printed list). The user ticks off finished ones in the dashboard.
+   `--kind` is `review`, `validate`, `decide` or `hands-on`; `--size` is `small`, `medium` or `large`. Remove a to-do that's no longer needed with `--done N` (the number in the printed list). The user marks finished ones done in the dashboard; they're listed as "done by the user", and don't count toward the 10 open to-dos a session can have.
 
 Report briefly and only when something changed. Don't mention the report to the user unless they ask.

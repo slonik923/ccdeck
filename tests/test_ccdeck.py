@@ -3,8 +3,11 @@
 Each test class gets a throwaway HOME with synthetic Claude Code transcripts and a
 fake `gh` on PATH, so nothing touches your real ~/.claude.
 """
+import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -855,7 +858,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((r["waiting"], r["priority"], r["goal"], r["updated"]), ("", "normal", "", 0))
         self.assertEqual(r["after"], ["https://github.com/a/b/pull/1"] * 5)
         self.assertEqual(len(r["todos"]), cc.REPORT_TODOS)
-        self.assertEqual(dict(r["todos"][0], id=None), {"id": None, "text": "t0", "kind": "", "size": "", "url": ""})
+        self.assertEqual(dict(r["todos"][0], id=None), {"id": None, "text": "t10", "kind": "", "size": "", "url": "", "done_at": 0})  # the newest
         self.assertRegex(r["todos"][0]["id"], "^[0-9a-f]{8}$")  # a file without ids gets stable ones
         self.assertEqual(r["todos"], cc.sanitize_report({"todos": r["todos"]})["todos"])
         self.assertEqual(cc.sanitize_report({"updated": float("nan")})["updated"], 0)  # NaN would break the API's JSON
@@ -863,6 +866,10 @@ class ReportTest(unittest.TestCase):
         odd = cc.sanitize_report({"todos": [{"text": "Check \ud800", "id": "0000aaaa"}, {"text": "Other", "id": "0000aaaa"}]})
         self.assertEqual(odd["todos"][0]["text"], "Check ?")  # an unpaired surrogate
         self.assertEqual(len({x["id"] for x in odd["todos"]}), 2)  # a repeated id is made unique
+        ticked = cc.sanitize_report({"todos": [{"text": "d%d" % i, "done_at": 1000 + i} for i in range(30)]
+                                     + [{"text": "o", "done_at": x} for x in (True, float("inf"), -5, "1")]})
+        self.assertEqual([t["text"] for t in ticked["todos"] if t["done_at"]], ["d%d" % i for i in range(10, 30)])  # the latest ticks
+        self.assertEqual(len(cc.open_todos(ticked)), 4)  # a done_at that isn't a time is open
         cc.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         (cc.REPORTS_DIR / "not.a-session.json").write_text('{"next": "x"}')
         (cc.REPORTS_DIR / (self.A + ".json")).write_text("not json")
@@ -873,16 +880,58 @@ class ReportTest(unittest.TestCase):
             cc.update_report(self.A, {}, {"text": "Check it", "kind": "", "size": "", "url": url})
         first, second = cc.load_reports()[self.A]["todos"]
         self.assertNotEqual(first["id"], second["id"])
-        cc.remove_todo(self.A, first["id"])
+        cc.tick_todo(self.A, first["id"])
+        cc.tick_todo(self.A, first["id"])  # a repeated click keeps it ticked, and the other one open
+        ticked, still = cc.load_reports()[self.A]["todos"]
+        self.assertEqual((ticked["id"], still), (first["id"], second))
+        self.assertGreater(ticked["done_at"], 0)
         with self.assertRaises(ValueError):
-            cc.remove_todo(self.A, first["id"])  # a repeated click doesn't take the other one
-        self.assertEqual(cc.load_reports()[self.A]["todos"], [second])
+            cc.tick_todo(self.A, "0000ffff")
+        cc.tick_todo(self.A, first["id"], done=False)
+        self.assertEqual(cc.load_reports()[self.A]["todos"], [first, second])
+
+    def test_ticked_todos_dont_count(self):
+        add = lambda text: cc.update_report(self.A, {}, {"text": text, "kind": "", "size": "", "url": ""})
+        add("first")
+        cc.tick_todo(self.A, cc.load_reports()[self.A]["todos"][0]["id"])
+        for i in range(cc.REPORT_TODOS):
+            rep, notes = add("t%d" % i)
+        self.assertEqual((len(rep["todos"]), notes), (cc.REPORT_TODOS + 1, []))  # ten open and the ticked one
+        with self.assertRaises(ValueError):  # unticking would make eleven open
+            cc.tick_todo(self.A, rep["todos"][0]["id"], done=False)
+        self.assertIn("1: t0", cc.format_report(rep))  # --done N counts open to-dos
+        self.assertIn("done by the user: first", cc.format_report(rep))
+        rep, _ = cc.update_report(self.A, {}, done_todo=1)
+        self.assertEqual([t["text"] for t in rep["todos"]][:2], ["first", "t1"])  # the session's --done removes; your tick stays
+        rep, notes = add("t10")
+        rep, notes = add("t11")
+        self.assertIn("oldest was dropped", notes[0])
+        self.assertEqual([t["text"] for t in rep["todos"]][:2], ["first", "t2"])
+
+    def test_goals_command(self):
+        cc.update_report(self.A, {"goal": "Ship 1.2", "next": "Waiting for the review"},
+                         {"text": "Check the preview", "kind": "validate", "size": "small", "url": ""})
+        cc.update_report(self.A, {}, {"text": "Tag the release", "kind": "", "size": "", "url": ""})
+        cc.tick_todo(self.A, cc.load_reports()[self.A]["todos"][1]["id"])
+        sessions = [{"id": self.A, "alive": True, "title": "Release 1.2", "report": cc.load_reports()[self.A]}]
+        out = io.StringIO()
+        with mock.patch.object(cc, "collect", lambda **kw: sessions), mock.patch.object(cc, "pr_plan", lambda s: {"rows": []}), \
+                contextlib.redirect_stdout(out):
+            cc.cmd_goals(argparse.Namespace(all=False, done=False))
+            cc.cmd_goals(argparse.Namespace(all=False, done=True))
+        first, second = out.getvalue().split("Ship 1.2")[1:]
+        self.assertIn("next: Waiting for the review", first)
+        self.assertIn("[ ] Check the preview", first)
+        self.assertNotIn("Tag the release", first)
+        self.assertIn("1 done to-do hidden (--done)", first)
+        self.assertIn("[x] Tag the release", second)
 
     def test_goal_board(self):
         now = time.time()
         rep = lambda **kw: cc.sanitize_report(dict({"updated": now - 100}, **kw))
         sessions = [
-            {"id": "s1", "alive": True, "report": rep(goal="Ship 1.2", priority="low", todos=[{"text": "Submit to the stores"}])},
+            {"id": "s1", "alive": True, "report": rep(goal="Ship 1.2", priority="low", todos=[
+                {"text": "Submit to the stores"}, {"text": "Tag it", "done_at": now - 9}, {"text": "Bump it", "done_at": now - 5}])},
             {"id": "s2", "alive": False, "report": rep(goal="ship 1.2", priority="high")},
             {"id": "s3", "alive": False, "report": rep(goal="Billing", todos=[{"text": "old"}]), "mark": {"done": True}},
             {"id": "s4", "alive": True, "report": rep()},
@@ -899,6 +948,7 @@ class ReportTest(unittest.TestCase):
                          ("high", ["s1", "s2"], [PR.format(1), PR.format(2)]))
         self.assertEqual(ship["summary"], "2 PRs: 1 to merge, 1 waiting, 1 to-do for you")
         self.assertEqual([(x["text"], x["sid"]) for x in ship["todos"]], [("Submit to the stores", "s1")])
+        self.assertEqual([x["text"] for x in ship["todos_done"]], ["Bump it", "Tag it"])  # the latest tick first
         self.assertEqual((board[3]["open"], board[3]["todos"], board[3]["summary"]), (False, [], "Done"))  # a done session's to-dos are over
         self.assertTrue(board[2]["other"])
         self.assertEqual(board[3]["since"], now - 100)  # a done goal: its last report, so snapshots don't change by themselves
@@ -926,7 +976,11 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": "0000ffff"})[0], 409)
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": 0})[0], 409)
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": tid})[0], 200)
-        self.assertEqual(cc.load_reports()[self.A]["todos"], [])
+        self.assertEqual(cc.open_todos(cc.load_reports()[self.A]), [])
+        dash.refresh()
+        self.assertEqual([t["id"] for t in dash.snapshot["goals"][0]["todos_done"]], [tid])
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_undone", "todo": tid})[0], 200)
+        self.assertEqual(cc.open_todos(cc.load_reports()[self.A])[0]["id"], tid)
         cc.REPORTS_DIR.joinpath(self.A + ".json").write_text(json.dumps(dict(cc.load_reports()[self.A], updated=time.time() - 30 * 3600)))
         dash.refresh()
         self.assertTrue(next(x for x in dash.snapshot["sessions"] if x["id"] == self.A)["report_stale"])

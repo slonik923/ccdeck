@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.7"
+VERSION = "0.9.8"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1761,6 +1761,7 @@ REPORT_PRIORITY = ("high", "normal", "low")
 TODO_KINDS = ("review", "validate", "decide", "hands-on")
 TODO_SIZES = ("small", "medium", "large")
 REPORT_TEXT, REPORT_GOAL, REPORT_TODOS, REPORT_AFTER = 200, 80, 10, 10
+REPORT_TODOS_DONE = 20  # ticked to-dos kept so you can see and untick them; the oldest go first
 REPORT_STALE = 3 * 3600  # a report this much older than the session's last activity may no longer hold
 
 
@@ -1771,6 +1772,21 @@ def _http(u):
 def _text(v, n):
     # an unpaired surrogate (valid in JSON, not in UTF-8) would break printing and hashing: replace it
     return " ".join(v.encode("utf-8", "replace").decode().split())[:n] if isinstance(v, str) else ""
+
+
+def _finite(v):
+    """A timestamp as JSON can hold it: a finite number, not a bool."""
+    try:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def trim_todos(todos):
+    """The newest REPORT_TODOS open to-dos and the REPORT_TODOS_DONE most recently ticked, in list order."""
+    keep = {id(t) for t in [t for t in todos if not t["done_at"]][-REPORT_TODOS:]}
+    keep |= {id(t) for t in sorted((t for t in todos if t["done_at"]), key=lambda t: -t["done_at"])[:REPORT_TODOS_DONE]}
+    return [t for t in todos if id(t) in keep]
 
 
 def sanitize_report(d):
@@ -1796,14 +1812,11 @@ def sanitize_report(d):
             todos.append({"id": tid, "text": text,
                           "kind": t.get("kind") if t.get("kind") in TODO_KINDS else "",
                           "size": t.get("size") if t.get("size") in TODO_SIZES else "",
-                          "url": t.get("url") if _http(t.get("url")) else ""})
-    out["todos"] = todos[:REPORT_TODOS]
+                          "url": t.get("url") if _http(t.get("url")) else "",
+                          "done_at": t["done_at"] if _finite(t.get("done_at")) and t["done_at"] > 0 else 0})
+    out["todos"] = trim_todos(todos)
     up = d.get("updated")
-    try:
-        finite = isinstance(up, (int, float)) and not isinstance(up, bool) and math.isfinite(up)
-    except OverflowError:  # an int too large for a float
-        finite = False
-    out["updated"] = up if finite else 0  # NaN isn't JSON
+    out["updated"] = up if _finite(up) else 0  # NaN isn't JSON
     return out
 
 
@@ -1890,14 +1903,14 @@ def _update_report(sid, path, changes, add_todo, done_todo):
             notes.append(f'Did you mean "{other}"? If it\'s the same goal: ccdeck report --goal "{other}"')
     cur.update(changes)
     if add_todo:
-        cur["todos"].append(dict(add_todo, id=secrets.token_hex(4)))
-        if len(cur["todos"]) > REPORT_TODOS:
-            notes.append(f"Only {REPORT_TODOS} to-dos are kept; the oldest was dropped.")
-            cur["todos"] = cur["todos"][-REPORT_TODOS:]
-    if done_todo is not None:
-        if not 1 <= done_todo <= len(cur["todos"]):
-            raise ValueError(f"no to-do {done_todo}; there are {len(cur['todos'])}")
-        cur["todos"].pop(done_todo - 1)
+        cur["todos"].append(dict(add_todo, id=secrets.token_hex(4), done_at=0))
+        if len(open_todos(cur)) > REPORT_TODOS:
+            notes.append(f"Only {REPORT_TODOS} open to-dos are kept; the oldest was dropped.")
+    if done_todo is not None:  # the session takes back a to-do it gave: gone, not ticked (ticks are yours)
+        todos = open_todos(cur)
+        if not 1 <= done_todo <= len(todos):
+            raise ValueError(f"no to-do {done_todo}; there are {len(todos)}")
+        cur["todos"].remove(todos[done_todo - 1])
     cur["updated"] = time.time()
     report = sanitize_report(cur)
     save_json(path, report)
@@ -1908,16 +1921,22 @@ def done_session_ids():
     return {sid for sid, m in load_json(MARKS_FILE, {}).items() if isinstance(m, dict) and m.get("done")}
 
 
-def remove_todo(sid, tid):
-    """The dashboard's tick: drop the to-do with this id, if it's still there."""
+def open_todos(report):
+    return [t for t in report["todos"] if not t["done_at"]]
+
+
+def tick_todo(sid, tid, done=True):
+    """The dashboard's tick and untick. A ticked to-do stays in the report, with when, so it can be unticked."""
     path = report_file(sid)
     with reports_lock():
         r = load_reports().get(sid)
-        todos = (r or {}).get("todos") or []
-        if not any(t["id"] == tid for t in todos):
+        t = next((t for t in (r or {}).get("todos") or [] if t["id"] == tid), None)
+        if t is None:
             raise ValueError("that to-do changed; reload and try again")
-        r["todos"] = [t for t in todos if t["id"] != tid]
-        save_json(path, r)  # `updated` stays: that's when the session last reported
+        if not done and t["done_at"] and len(open_todos(r)) >= REPORT_TODOS:
+            raise ValueError(f"the session already has {REPORT_TODOS} open to-dos")
+        t["done_at"] = (t["done_at"] or time.time()) if done else 0
+        save_json(path, sanitize_report(r))  # `updated` stays: that's when the session last reported
 
 
 PRIORITY_RANK = {p: i for i, p in enumerate(REPORT_PRIORITY)}
@@ -1938,20 +1957,22 @@ def goal_board(sessions, plan_rows, now=None):
             continue
         key = goal_key(rep["goal"])
         g = goals.setdefault(key, {"key": key, "goal": rep["goal"] or "Other", "other": not key, "sessions": [], "prs": [],
-                                   "todos": [], "priority": "low", "since": None, "last": 0, "open": False})
+                                   "todos": [], "todos_done": [], "priority": "low", "since": None, "last": 0, "open": False})
         g["last"] = max(g["last"], rep["updated"])
         done = (s.get("mark") or {}).get("done") or s.get("group") == "done"
         g["sessions"].append({"id": s["id"], "done": bool(done)})
         prs = by_owner.get(s["id"], [])
         g["prs"] += [{"url": p["url"], "step": p["step"]} for p in prs]
-        todos = [] if done else [dict(t, sid=s["id"]) for t in rep["todos"]]
+        todos = [] if done else [dict(t, sid=s["id"]) for t in rep["todos"] if not t["done_at"]]
         g["todos"] += todos
+        g["todos_done"] += [] if done else [dict(t, sid=s["id"]) for t in rep["todos"] if t["done_at"]]
         if not done:
             if PRIORITY_RANK[rep["priority"]] < PRIORITY_RANK[g["priority"]]:
                 g["priority"] = rep["priority"]
             g["since"] = min([x for x in (g["since"], rep["updated"] or now) if x is not None] + [p["updated"] for p in prs])
         g["open"] = g["open"] or bool(prs or todos or (not done and s.get("alive")))
     for g in goals.values():
+        g["todos_done"].sort(key=lambda t: -t["done_at"])  # the latest tick first
         if g["since"] is None:  # only done sessions: their last report, not the clock (it would change every snapshot)
             g["since"] = g["last"]
         del g["last"]
@@ -1981,7 +2002,8 @@ def format_report(r):
              f"goal: {r['goal'] or '—'}"]
     lines += [f"after: {u}" for u in r["after"]]
     lines += [f"to-do {i}: {t['text']}" + "".join(f"  [{x}]" for x in (t["kind"], t["size"], t["url"]) if x)
-              for i, t in enumerate(r["todos"], 1)]
+              for i, t in enumerate(open_todos(r), 1)]
+    lines += [f"done by the user: {t['text']}" for t in r["todos"] if t["done_at"]]
     return "\n".join(lines)
 
 
@@ -2784,11 +2806,11 @@ class Dashboard:
         if action in ("done", "undone", "park", "unpark", "note"):
             text = body.get("text")
             apply_action(sid, action, text if isinstance(text, str) else None)
-        elif action == "todo_done":
+        elif action in ("todo_done", "todo_undone"):
             try:
                 if not isinstance(body.get("todo"), str):
-                    raise ValueError("todo_done takes the to-do's id")
-                remove_todo(sid, body["todo"])
+                    raise ValueError(f"{action} takes the to-do's id")
+                tick_todo(sid, body["todo"], done=action == "todo_done")
             except ValueError as e:
                 return 409, {"error": str(e)}
         elif action == "focus":
@@ -3064,8 +3086,6 @@ def cmd_prs(args):
     sessions = collect(include_all=True, days=10 ** 6)
     assembled = pr_plan(sessions, saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])
     rows = assembled["rows"]
-    names = {s["id"]: "@" + s["peer_name"] if s.get("peer_name") else s["id"][:8] for s in sessions}
-    todos = [(g["goal"], t) for g in goal_board(sessions, rows) for t in g["todos"]]
     if assembled["truncated"]:
         print("Warning: authored PRs limited to the first 100 results; stack targets may be missing.", file=sys.stderr)
     if args.sessions:
@@ -3073,11 +3093,6 @@ def cmd_prs(args):
     width = shutil.get_terminal_size((120, 20)).columns
     if not rows:
         print("No available PR data." if unavailable else "No open PRs.")
-    if todos:
-        print("\n" + bold("To do for you") + dim(f"  {len(todos)}"))
-        for goal, td in todos:
-            print(f"  {one_line(td['text'], max(20, width - 30))}")
-            print(dim("      " + " · ".join(x for x in (goal, td["kind"], td["size"], names.get(td["sid"], td["sid"][:8]), td["url"]) if x)))
     for step, label in PR_STEPS.items():
         part = [r for r in rows if r["step"] == step]
         if not part:
@@ -3088,6 +3103,37 @@ def cmd_prs(args):
             print(f"  {r['repo']}#{r['number']}  {one_line(r['title'], max(20, width - 70))}")
             print(dim("      " + " · ".join(r["texts"]) + (f"  → {who}" if who else "")
                       + (f"  [@{s['name']}]" if s and s["name"] != who else "")))
+
+
+def cmd_goals(args):
+    """Goals as the dashboard's Goals view has them: summary, sessions and their next steps, your to-dos.
+    PR steps come from the dashboard's last GitHub fetch: no network here."""
+    sessions = collect(include_all=True, days=10 ** 6)
+    by_id = {s["id"]: s for s in sessions}
+    name = lambda sid: "@" + by_id[sid]["peer_name"] if by_id.get(sid, {}).get("peer_name") else sid[:8]
+    board = [g for g in goal_board(sessions, pr_plan(sessions)["rows"]) if g["open"] or args.all]
+    width = shutil.get_terminal_size((120, 20)).columns
+    if not board:
+        print("No open goals." if not args.all else "No goals yet.")
+        print(dim('Sessions report what they work toward with ccdeck report --goal "Ship 1.2".'))
+    for g in board:
+        prio = f"  {g['priority']}" if g["open"] and g["priority"] != "normal" else ""
+        print("\n" + bold(g["goal"]) + dim(prio + "  " + g["summary"]))
+        for x in g["sessions"]:
+            s, rep = by_id.get(x["id"]) or {}, (by_id.get(x["id"]) or {}).get("report") or {}
+            if x["done"] and not args.all:
+                continue
+            print(f"  {name(x['id']):<10} {one_line(title_of(s) if s else '', max(20, width - 16))}")
+            if rep.get("next"):
+                print(dim(f"             next: {one_line(rep['next'], max(20, width - 20))}"))
+        todos = g["todos"] + (g["todos_done"] if args.done else [])
+        if todos:
+            print("  " + bold("To do for you"))
+        for td in todos:
+            print(f"    [{'x' if td['done_at'] else ' '}] {one_line(td['text'], max(20, width - 10))}")
+            print(dim("        " + " · ".join(x for x in (td["kind"], td["size"], name(td["sid"]), td["url"]) if x)))
+        if g["todos_done"] and not args.done:
+            print(dim(f"    {plural(len(g['todos_done']), 'done to-do')} hidden (--done)"))
 
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -4174,6 +4220,9 @@ def main():
     s.add_argument("text", nargs="*")
     s = sub.add_parser("prs", help="your open PRs in steps: merge, fix, review, wait, clean up")
     s.add_argument("--sessions", action="store_true", help="only PRs one of your sessions owns, plus review requests")
+    s = sub.add_parser("goals", help="what sessions work toward: each goal's sessions, next steps and to-dos for you")
+    s.add_argument("--all", action="store_true", help="also done goals and done sessions")
+    s.add_argument("--done", action="store_true", help="also the to-dos you marked done")
     s = sub.add_parser("report", help="run by a session: its next step, what it waits on, its goal and to-dos for you")
     s.add_argument("--next", help="the next step, one line")
     s.add_argument("--waiting", help="who it waits on: you, ci, review, session (it's working), or a URL")
@@ -4225,7 +4274,7 @@ def main():
     args = p.parse_args()
 
     handlers = {
-        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "report": cmd_report, "show": cmd_show, "resume": cmd_resume,
+        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "goals": cmd_goals, "report": cmd_report, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
         "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,

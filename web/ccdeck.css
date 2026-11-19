@@ -841,3 +841,13 @@ a.ref-title:hover { text-decoration: underline; }
   .ccd .plan .rr-repo, .ccd .plan .rr-by, .ccd .plan .plan-who { display: none; }
   .ccd .plan .namechip { grid-column: 2; justify-self: start; }
 }
+/* to-dos: the tick is a labelled toggle; ticked ones stay listed (dimmed, struck through) until hidden, and untick on click */
+.ccd .todo-tick { min-width: 104px; color: var(--text-2); }
+.ccd .todo-tick .i { color: var(--text-3); }
+.ccd .todo-tick:hover { border-color: var(--primary); color: var(--text); }
+.ccd .todo-tick:hover .i { color: var(--primary); }
+.ccd .todo-tick[aria-pressed="true"] { background: var(--done-tint); border-color: var(--done-line); color: var(--done-fg); }
+.ccd .todo-tick[aria-pressed="true"] .i { color: var(--done-fg); }
+.ccd .todos li[data-done="true"] .rr-title { text-decoration: line-through; color: var(--text-3); font-weight: 500; }
+.ccd .todos li[data-done="true"] .plan-next, .ccd .todos li[data-done="true"] .lchip { opacity: .7; }
+.ccd .todo-more { margin-top: var(--s-3); }
