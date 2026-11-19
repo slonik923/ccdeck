@@ -828,7 +828,7 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .prio { margin-left: 8px; padding: 1px 6px; border-radius: var(--r-sm); font-size: var(--t-12); font-weight: 500; background: var(--surface-2); color: var(--text-2); vertical-align: middle; }
 .ccd .prio[data-p="high"] { background: var(--need-tint, var(--surface-2)); color: var(--need-fg, var(--text)); }
 .ccd .goal-body { display: flex; flex-direction: column; gap: 8px; }
-.ccd .goal-body .rrlist:not(.plan):not(.todos) li { grid-template-columns: auto minmax(0, 1fr) auto auto 76px; }
+.ccd .goal-body .rrlist:not(.plan):not(.todos):not(.planitems) li { grid-template-columns: auto minmax(0, 1fr) auto auto 76px; }
 .ccd .goal-acts { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
 .ccd .rrlist .title-btn.rr-title { text-align: left; background: none; border: 0; padding: 0; cursor: pointer; font: inherit; font-weight: 600; }
 .ccd .namechip[data-on="off"] { opacity: .65; }
@@ -851,3 +851,15 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .todos li[data-done="true"] .rr-title { text-decoration: line-through; color: var(--text-3); font-weight: 500; }
 .ccd .todos li[data-done="true"] .plan-next, .ccd .todos li[data-done="true"] .lchip { opacity: .7; }
 .ccd .todo-more { margin-top: var(--s-3); }
+/* a goal's plan: items in order, with their state; done ones dimmed when Show done is on */
+.ccd .planitems { margin-bottom: var(--s-4); }
+.ccd .rrlist.planitems li { grid-template-columns: 32px minmax(0, 1fr) 176px 88px 232px; }
+.ccd .pi-id { color: var(--text-3); font-size: var(--t-12); font-weight: 600; }
+.ccd .pi-size { color: var(--text-3); font-weight: 500; }
+.ccd .pi-links { display: inline-flex; gap: 6px; justify-content: flex-end; }
+.ccd .pi-acts { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.ccd .pi-gap { width: 32px; }
+.ccd .pi-acts .i.up { transform: rotate(180deg); }
+.ccd .planitems .pill { height: 20px; font-size: 11px; margin-right: 4px; }
+.ccd .planitems li[data-done="true"] .rr-title { text-decoration: line-through; color: var(--text-3); font-weight: 500; }
+@media (max-width: 640px) { .ccd .rrlist.planitems li { grid-template-columns: 32px minmax(0, 1fr) auto; } .ccd .pi-links, .ccd .planitems .rr-by { display: none; } }

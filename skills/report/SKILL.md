@@ -23,4 +23,15 @@ Run it as `python3 "${CLAUDE_PLUGIN_ROOT}/ccdeck" report …` (quoted: the path 
    ```
    `--kind` is `review`, `validate`, `decide` or `hands-on`; `--size` is `small`, `medium` or `large`. Remove a to-do that's no longer needed with `--done N` (the number in the printed list). The user marks finished ones done in the dashboard; they're listed as "done by the user", and don't count toward the 10 open to-dos a session can have.
 
+4. **Plans.** A goal can hold a plan: its work items in priority order (tickets, issues, or a title alone). The plan belongs to the goal, not to you, so it stays when this session ends.
+   - When the user gives you a list of work for a goal, put it in the plan, not in to-dos:
+     ```bash
+     ccdeck plan --goal "Ship 0.7.4" add "Fix rounding in exports" --url https://linear.app/… --size small [--after P1] [--owner Sam]
+     ```
+     Then reorder with `ccdeck plan move P5 --to 1` as the user ranks them. Don't reorder on your own.
+   - When you work an item, say so first: `ccdeck report --goal "Ship 0.7.4" --item P3`. ccdeck then shows the item's state from this session and its PRs. One session works one item; for the next item, the user starts a new session (the dashboard's Start copies the command).
+   - ccdeck links a PR to an item when the PR's title or branch has the item's ticket key, or when this session works the item. When neither holds, link it: `ccdeck plan set P3 --pr URL`.
+   - An item with a PR is done when the PR merges; don't mark it. Mark `ccdeck plan done P3` only for work without a PR. Use `plan set P3 --blocked "why"` (and `--unblock`) when it can't move, `plan drop P3` when it's no longer wanted, `plan set P4 --owner Sam` when someone else took it.
+   - `ccdeck plan` (with this session's goal) prints the items with their states.
+
 Report briefly and only when something changed. Don't mention the report to the user unless they ask.
