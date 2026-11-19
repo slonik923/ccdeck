@@ -973,7 +973,7 @@ function planList(g) {
   const items = (g.plan || []).filter((t) => ui.showDone || (t.state !== "done" && t.state !== "dropped"));
   if (!items.length) return null;
   const open = (g.plan || []).filter((t) => t.state !== "done" && t.state !== "dropped");
-  const move = (t, op) => act("", "plan_item", { goal: g.goal, item: t.id, op });
+  const move = (t, op, target) => act("", "plan_item", { goal: g.goal, item: t.id, op, target: target && target.id });
   return h("ol", { class: "rrlist planitems", "aria-label": "Plan for " + g.goal }, items.map((t) => {
     const st = (data.item_states || {})[t.state] || { label: t.state, g: "closed" };
     const s = t.sessions.map((id) => lastById[id]).find(Boolean);
@@ -990,8 +990,8 @@ function planList(g) {
         /^https?:\/\//i.test(t.url || "") ? h("a", { class: "lchip", href: t.url, target: "_blank", rel: "noopener noreferrer", title: t.url }, ic("doc", "i-xs"), ((k) => k ? k.toUpperCase() : shortUrl(t.url))((t.url.match(/\/([A-Za-z][A-Za-z0-9]{0,9}-\d{1,7})(?:[/?#]|$)/) || [])[1])) : null),
       s ? nameChip(s, "n:pi:" + g.key + t.id) || h("span", { class: "rr-by mono" }, s.sid) : h("span", { class: "rr-by" }, t.owner || ""),
       h("span", { class: "pi-acts" },
-        !finished && at > 0 ? h("button", { class: "ibtn ibtn-sm", "aria-label": "Move " + t.id + " up", title: "Move up", onclick: () => move(t, "up") }, ic("chevron", "i-sm up")) : h("span", { class: "pi-gap" }),
-        !finished && at < open.length - 1 ? h("button", { class: "ibtn ibtn-sm", "aria-label": "Move " + t.id + " down", title: "Move down", onclick: () => move(t, "down") }, ic("chevron", "i-sm")) : h("span", { class: "pi-gap" }),
+        !finished && at > 0 ? h("button", { class: "ibtn ibtn-sm", "aria-label": "Move " + t.id + " up", title: "Move up", onclick: () => move(t, "up", open[at - 1]) }, ic("chevron", "i-sm up")) : h("span", { class: "pi-gap" }),
+        !finished && at < open.length - 1 ? h("button", { class: "ibtn ibtn-sm", "aria-label": "Move " + t.id + " down", title: "Move down", onclick: () => move(t, "down", open[at + 1]) }, ic("chevron", "i-sm")) : h("span", { class: "pi-gap" }),
         !finished && !s && !t.owner ? h("button", { class: "btn btn-sm", title: "Copy a command that starts a Claude session on this item:\n" + t.start, onclick: () => copy(t.start, "Start command for " + t.id) }, ic("copy", "i-sm"), "Start") : null,
         h("button", { class: "btn btn-sm todo-tick", "aria-pressed": String(t.state === "done"), title: finished ? "Reopen it" : "Mark it done by hand (one with a PR is done when the PR merges)",
           onclick: () => move(t, finished ? "reopen" : "done") }, ic("check", "i-sm"), finished ? (t.state === "dropped" ? "Dropped" : "Done") : "Done")));

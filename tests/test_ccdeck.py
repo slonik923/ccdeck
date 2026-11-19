@@ -953,7 +953,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(plan["items"][2]["status"], "dropped")
         for bad, msg in ((["move", "P9", "--to", "1"], "no item P9"), (["set", "P2", "--after", "P2"], "after itself"),
                          (["add", "x", "--after", "P7"], "no item P7"), (["add", "x", "--url", "ftp://x"], "--url must"),
-                         (["set", "P2", "--pr", "nope"], "--pr takes")):
+                         (["set", "P2", "--pr", "nope"], "--pr takes"), (["set", "P2", "--title", " "], "needs a title")):
             with self.subTest(bad=bad):
                 r = self.run_plan(*G, *bad)
                 self.assertNotEqual(r.returncode, 0)
@@ -980,6 +980,9 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(cc.load_plans()["ship 2.0"]["items"][0]["sessions"], [self.A])  # once
         self.assertIn("item: P1", cc.format_report(rep))
         self.assertEqual(cc.update_report(self.A, {"item": ""})[0]["item"], "")
+        cc.update_report(self.A, {"item": "P1"})
+        self.assertEqual(cc.update_report(self.A, {"goal": "ship  2.0"})[0]["item"], "P1")  # the same goal, spelled differently
+        self.assertEqual(cc.update_report(self.A, {"goal": "Billing"})[0]["item"], "")  # P1 was the old goal's
         self.assertEqual(cc.sanitize_report({"item": "../x"})["item"], "")
 
     def test_item_state(self):
@@ -1013,6 +1016,27 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(cc.item_state(item(), [], [], ["P1", "P2"])[1], "After P1, P2")
         self.assertEqual(cc.item_state(item(owner="Sam"), [], [], [])[1:], ("", "Sam"))
         self.assertEqual(cc.item_state(item(), [pr("open", 2, "CI failing", "Conflicts")], [], [])[1], "CI failing; Conflicts")
+
+    def test_plan_place_and_dependencies(self):
+        plan = cc.sanitize_plan({"goal": "G", "items": [{"id": "P1", "title": "a"}, {"id": "P2", "title": "b", "status": "done"},
+                                                        {"id": "P3", "title": "c", "after": ["P1"]}]})
+        cc.plan_place(plan, "P1", "P3", after=True)  # the page shows P1, P3: down puts P1 after P3, past the hidden P2
+        self.assertEqual([t["id"] for t in plan["items"]], ["P2", "P3", "P1"])
+        cc.plan_place(plan, "P1", "P3", after=False)
+        self.assertEqual([t["id"] for t in plan["items"]], ["P2", "P1", "P3"])
+        plan["items"][1]["prs"] = [PR.format(1)]
+        state = lambda cache: {t["id"]: t for t in cc.plan_view(plan, [], [], cache)}["P3"]
+        self.assertEqual(state({PR.format(1): {"data": {"state": "open"}}})["waiting_on"], ["P1"])
+        p3 = state({PR.format(1): {"data": {"state": "merged"}}})
+        self.assertEqual((p3["waiting_on"], p3["state"]), ([], "queued"))  # P1's PR merged: P1 is done, P3 can start
+
+    def test_pr_given_by_hand_wins(self):
+        plan = cc.sanitize_plan({"goal": "G", "items": [{"id": "P2", "title": "a", "url": "https://linear.app/acme/issue/ENG-2/a"},
+                                                        {"id": "P3", "title": "b", "prs": [PR.format(4)]}]})
+        sessions = [{"id": self.A, "alive": False, "group": "later", "report": None,
+                     "pr_details": [{"url": PR.format(4), "own": True, "state": "open", "title": "ENG-2 and more", "head": "x"}]}]
+        by = {t["id"]: t for t in cc.plan_view(plan, sessions, [], {})}
+        self.assertEqual(([p["url"] for p in by["P2"]["prs"]], [p["url"] for p in by["P3"]["prs"]]), ([], [PR.format(4)]))
 
     def test_sanitize_plan(self):
         self.assertIsNone(cc.sanitize_plan({"items": []}))  # no goal
@@ -1048,7 +1072,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual([p["url"] for p in by["P2"]["prs"]], [PR.format(2), PR.format(3)])
         self.assertEqual([(p["url"], p["state"]) for p in by["P3"]["prs"]], [(PR.format(9), "closed")])  # given by hand: from the cache
         self.assertEqual((by["P1"]["sessions"], by["P2"]["sessions"]), ([], [self.A]))  # the session works P2 now
-        self.assertEqual((by["P2"]["next"], by["P2"]["waiting_on"], by["P2"]["rank"]), ("Fix the review", ["P1"], 2))
+        self.assertEqual((by["P2"]["next"], by["P2"]["waiting_on"], by["P2"]["rank"]), ("Fix the review", [], 2))  # P1: its only PR merged
         p2 = next(x for x in seen if x[0] == "P2")
         self.assertEqual(p2[1][0]["step"], 2)  # an open PR in the PR plan has its step
         self.assertEqual(p2[2], [{"alive": True, "group": "waiting"}])
@@ -1114,12 +1138,13 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_undone", "todo": tid})[0], 200)
         self.assertEqual(cc.open_todos(cc.load_reports()[self.A])[0]["id"], tid)
         cc.change_plan("Ship 1.2", lambda p: [cc.plan_add(p, "One"), cc.plan_add(p, "Two")], create=True)
-        for op, order in (("down", ["P2", "P1"]), ("up", ["P1", "P2"]), ("done", ["P1", "P2"])):
-            self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": op})[0], 200)
+        for op, target, order in (("down", "P2", ["P2", "P1"]), ("up", "P2", ["P1", "P2"]), ("done", None, ["P1", "P2"])):
+            self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": op, "target": target})[0], 200)
             self.assertEqual([t["id"] for t in cc.load_plans()["ship 1.2"]["items"]], order)
         self.assertEqual(cc.load_plans()["ship 1.2"]["items"][0]["status"], "done")
         self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P9", "op": "done"})[0], 409)
         self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": "rm"})[0], 400)
+        self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": "up", "target": "P1"})[0], 409)
         self.assertEqual([t["id"] for t in dash.snapshot["goals"][0]["plan"]], ["P1", "P2"])
         self.assertIn("queued", dash.snapshot["item_states"])
         cc.REPORTS_DIR.joinpath(self.A + ".json").write_text(json.dumps(dict(cc.load_reports()[self.A], updated=time.time() - 30 * 3600)))

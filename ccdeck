@@ -1906,7 +1906,10 @@ def _update_report(sid, path, changes, add_todo, done_todo):
         elif (other := similar_goal(changes["goal"], used)):
             notes.append(f'Did you mean "{other}"? If it\'s the same goal: ccdeck report --goal "{other}"')
     item = changes.pop("item", None)
+    before = goal_key(cur["goal"])
     cur.update(changes)
+    if item is None and goal_key(cur["goal"]) != before:
+        cur["item"] = ""  # the item belonged to the old goal's plan
     if item:  # this session works a plan item: the item learns the session, so the link outlives the session's report
         if not cur["goal"]:
             raise ValueError("--item needs the session's goal: add --goal")
@@ -2065,6 +2068,16 @@ def plan_move(plan, iid, to):
     return item
 
 
+def plan_place(plan, iid, target, after):
+    """Move an item just before or after another one."""
+    item, other = find_item(plan, iid), find_item(plan, target)
+    if item is other:
+        raise ValueError("an item can't move next to itself")
+    plan["items"].remove(item)
+    plan["items"].insert(plan["items"].index(other) + after, item)
+    return item
+
+
 ISSUE_IN_URL_RE = re.compile(r"/([A-Za-z][A-Za-z0-9]{0,9}-\d{1,7})(?:[/?#]|$)")
 
 
@@ -2156,15 +2169,16 @@ def plan_view(plan, sessions, plan_rows, cache=None):
                 known.setdefault(k, {"url": d["url"], "number": d.get("number"), "title": d.get("title") or "", "head": d.get("head") or "",
                                      "state": d.get("state") or "open", "step": None, "texts": []})
                 owner.setdefault(k, s["id"])
-    by_key_match = {k: next((iid for iid, key in keys.items() if mentions_key(p["title"] + " " + p["head"], key)), None) for k, p in known.items()}
-    done_ids = {t["id"] for t in plan["items"] if t["status"] in ("done", "dropped")}
-    out = []
-    for rank, t in enumerate(plan["items"], 1):
+    by_hand = {pr_key(u) for t in plan["items"] for u in t["prs"]}  # a PR given to an item with --pr is that item's only
+    by_key_match = {k: None if k in by_hand else next((iid for iid, key in keys.items() if mentions_key(p["title"] + " " + p["head"], key)), None)
+                    for k, p in known.items()}
+    found = []
+    for t in plan["items"]:
         linked = [by_sid[x] for x in reversed(t["sessions"]) if x in by_sid
                   and goal_key(((by_sid[x].get("report") or {}).get("goal")) or "") == gk and (by_sid[x].get("report") or {}).get("item") == t["id"]]
         mine = {pr_key(u) for u in t["prs"]}
         mine |= {k for k, iid in by_key_match.items() if iid == t["id"]}
-        mine |= {k for k, sid in owner.items() if by_key_match[k] is None and any(s["id"] == sid for s in linked)}
+        mine |= {k for k, sid in owner.items() if by_key_match[k] is None and k not in by_hand and any(s["id"] == sid for s in linked)}
         prs = []
         for k in sorted(mine):
             p = known.get(k)
@@ -2173,6 +2187,12 @@ def plan_view(plan, sessions, plan_rows, cache=None):
                 p = {"url": info["url"], "number": info.get("number"), "title": info.get("title") or "", "head": info.get("head") or "",
                      "state": info.get("state") or "open", "step": None, "texts": []}
             prs.append(p)
+        found.append((t, linked, prs))
+    # done as item_state sees it: marked, or every PR merged; an item after it waits until then
+    done_ids = {t["id"] for t, _, prs in found if t["status"] in ("done", "dropped")
+                or (any(p["state"] == "merged" for p in prs) and not any(p["state"] == "open" for p in prs))}
+    out = []
+    for rank, (t, linked, prs) in enumerate(found, 1):
         waiting_on = [a for a in t["after"] if a not in done_ids]
         state, text, who = item_state(t, prs, [{"alive": bool(s.get("alive")), "group": s.get("group")} for s in linked], waiting_on)
         if state not in ITEM_STATES:
@@ -3067,8 +3087,9 @@ class Dashboard:
             return 200, {"ok": True, "settings": settings_view()}
         if action == "plan_item":  # the Goals view: move, done or reopen an item of a goal's plan
             goal, iid, op = body.get("goal"), body.get("item"), body.get("op")
-            ops = {"up": lambda p: plan_move(p, iid, p["items"].index(find_item(p, iid))),
-                   "down": lambda p: plan_move(p, iid, p["items"].index(find_item(p, iid)) + 2),
+            target = body.get("target")  # the item next to it on the page: done ones in between may be hidden
+            ops = {"up": lambda p: plan_place(p, iid, target, after=False),
+                   "down": lambda p: plan_place(p, iid, target, after=True),
                    "done": lambda p: find_item(p, iid).update(status="done"),
                    "reopen": lambda p: find_item(p, iid).update(status="")}
             if not (isinstance(goal, str) and isinstance(iid, str) and op in ops):
@@ -3448,6 +3469,10 @@ def cmd_plan(args):
                     if a.upper() == t["id"]:
                         raise ValueError("an item can't come after itself")
                     find_item(p, a)
+                if args.title is not None and not _text(args.title, REPORT_TEXT):
+                    raise ValueError("an item needs a title")
+                if args.url and not _http(args.url):
+                    raise ValueError("--url must be an http(s) URL")
                 for k in ("title", "url", "size", "owner", "note"):
                     if getattr(args, k) is not None:
                         t[k] = getattr(args, k)
