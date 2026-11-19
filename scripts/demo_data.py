@@ -211,6 +211,23 @@ def build(home, pid):
         nid = f"{int((now - ago * 60) * 1000)}-demo{i}"
         (data / "inbox" / f"{nid}.json").write_text(json.dumps(
             {"id": nid, "sid": sid, "state": state, "title": title, "body": body, "ts": now - ago * 60}))
+    # what sessions said about their own work (`ccdeck report`): goals, next steps and to-dos for you
+    (data / "reports").mkdir(exist_ok=True)
+    for sid, rep in {
+        "d-deploy": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "you",
+                     "next": "Deploy to staging, then replay the last 50 Stripe events",
+                     "todos": [{"text": "Rotate the Stripe test key in the staging vault", "kind": "hands-on", "size": "small"}]},
+        "d-rate": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "session",
+                   "next": "Add the per-key override the review asked for", "after": [REPO.format("billing-api", 90)]},
+        "d-cache": {"goal": "Launch Stripe billing", "waiting": "review", "next": "Waiting for the payments team's review",
+                    "todos": [{"text": "Decide the exchange-rate cache TTL (1 h or 24 h)", "kind": "decide", "size": "small"}]},
+        "d-dark": {"goal": "Settings refresh", "waiting": "you", "next": "Mark the PR ready once the preview looks right",
+                   "todos": [{"text": "Check the dark theme on the preview", "kind": "validate", "size": "small",
+                              "url": "https://preview.example.com/settings"}]},
+        "d-node": {"goal": "Settings refresh", "priority": "low", "waiting": "ci", "next": "Merge when CI passes"},
+        "d-csv": {"goal": "Reports v2", "waiting": "session", "next": "Make ReportRow.total required, then fix the e2e timeout"},
+    }.items():
+        (data / "reports" / f"{sid}.json").write_text(json.dumps(dict(rep, updated=now - 60)))
     (data / "marks.json").write_text(json.dumps({
         "d-bun": {"parked": True, "note": "after Q4 freeze"},
         "d-node": {"note": "waiting on QA"},

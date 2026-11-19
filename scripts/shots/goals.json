@@ -1,0 +1,19 @@
+{
+  "shots": [
+    { "name": "goals", "width": 1440, "height": 1000, "full": true, "scale": 1,
+      "steps": [ { "click": "[data-key='v:goals']", "wait": 400 } ],
+      "highlight": [
+        { "sel": "[data-key='v:goals']", "label": "New: Goals view" },
+        { "sel": "#h-goal-launch-stripe-billing", "label": "A goal: its sessions, PRs and your to-dos" }
+      ] },
+    { "name": "by-goal", "width": 1440, "height": 1000, "full": true, "scale": 1,
+      "steps": [ { "click": "[data-key='v:sessions']", "wait": 400 }, { "click": "[data-key='gb:goal']", "wait": 400 } ],
+      "highlight": [ { "sel": "[data-key='gb:goal']", "label": "New: sessions grouped by goal" } ] },
+    { "name": "prs", "width": 1440, "height": 1000, "full": true, "scale": 1,
+      "steps": [ { "click": "[data-key='v:prs']", "wait": 400 }, { "click": "[data-key='sc:all']", "wait": 400 } ],
+      "highlight": [
+        { "sel": "#h-todos", "label": "New: to-dos sessions handed you" },
+        { "sel": "[data-key='pr:https://github.com/acme/billing-api/pull/88'] .plan-main", "label": "Goal, the session's next step, After #90" }
+      ] }
+  ]
+}

@@ -794,6 +794,144 @@ class PrCommandTest(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE((data / "pr-plan.json").stat().st_mode), 0o600)
 
 
+class ReportTest(unittest.TestCase):
+    """`ccdeck report`: a session's own account of its work, and the goals built from it."""
+    A, B, C = ("aaaaaaaa-0000-4000-8000-00000000000" + x for x in "abc")
+
+    def setUp(self):
+        shutil.rmtree(cc.REPORTS_DIR, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, cc.REPORTS_DIR, True)
+        marks = mock.patch.object(cc, "done_session_ids", lambda: set())
+        marks.start()
+        self.addCleanup(marks.stop)
+
+    def run_report(self, *args, sid=None):
+        env = dict(os.environ, CLAUDE_CODE_SESSION_ID=sid or self.A)
+        return subprocess.run([sys.executable, str(ROOT / "ccdeck"), "report", *args], capture_output=True, text=True, env=env, timeout=30)
+
+    def test_command_merges_and_validates(self):
+        r = self.run_report("--next", "Waiting for review", "--waiting", "review", "--priority", "high", "--goal", "Ship 1.2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_report("--todo", "Delete the old docs on prod", "--kind", "hands-on", "--size", "small")
+        self.assertIn("to-do 1: Delete the old docs on prod  [hands-on]  [small]", r.stdout)
+        self.assertIn("goal: Ship 1.2", r.stdout)  # merged, not replaced
+        for bad, msg in ((["--waiting", "someone"], "--waiting is"), (["--after", "not-a-url"], "--after takes"),
+                         (["--kind", "review"], "describe a --todo"), (["--done", "3"], "no to-do 3"),
+                         (["--todo", "x", "--url", "javascript:alert(1)"], "--url must")):
+            with self.subTest(bad=bad):
+                r = self.run_report(*bad)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(msg, r.stderr)
+        r = self.run_report("--next", "x", sid="../../etc/passwd")
+        self.assertIn("not a session id", r.stderr)
+        self.assertEqual([f.name for f in cc.REPORTS_DIR.glob("*.json")], [self.A + ".json"])
+        self.assertIn("to-do 1:", self.run_report().stdout)  # no options: prints the report
+        self.assertNotIn("to-do", self.run_report("--done", "1").stdout)
+        self.assertIn("cleared", self.run_report("--clear").stdout)
+        self.assertFalse((cc.REPORTS_DIR / (self.A + ".json")).exists())
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
+        r = subprocess.run([sys.executable, str(ROOT / "ccdeck"), "report", "--next", "x"], capture_output=True, text=True, env=env, timeout=30)
+        self.assertIn("runs inside a Claude Code session", r.stderr)  # the test runner has no Claude process above it
+
+    def test_goals_are_reused(self):
+        cc.update_report(self.A, {"goal": "Ship 1.2"})
+        rep, notes = cc.update_report(self.B, {"goal": "ship   1.2"})
+        self.assertEqual((rep["goal"], notes), ("Ship 1.2", []))  # the existing spelling
+        rep, notes = cc.update_report(self.C, {"goal": "1.2 Ship"})
+        self.assertEqual(rep["goal"], "1.2 Ship")  # saved as given, with a hint
+        self.assertIn('Did you mean "Ship 1.2"?', notes[0])
+        self.assertIsNone(cc.similar_goal("Billing export", cc.goals_in_use(cc.load_reports())))
+        out = self.run_report("--goals").stdout
+        self.assertEqual(out.splitlines()[0], "Ship 1.2  (2 sessions)")
+        self.assertEqual(list(cc.goals_in_use(cc.load_reports(), done={self.A, self.B})), ["1.2 ship"])  # done sessions' goals are over
+
+    def test_sanitize(self):
+        self.assertIsNone(cc.sanitize_report([1]))
+        r = cc.sanitize_report({"next": "a\n  b" + "x" * 500, "waiting": "<b>", "priority": "urgent", "goal": 5, "updated": True,
+                                "after": ["https://github.com/a/b/pull/1", "javascript:x", 3] * 5,
+                                "todos": [{"text": "t%d" % i, "kind": "nap", "url": "file:///etc"} for i in range(20)] + ["x", {"text": " "}]})
+        self.assertEqual(len(r["next"]), cc.REPORT_TEXT)
+        self.assertTrue(r["next"].startswith("a b"))
+        self.assertEqual((r["waiting"], r["priority"], r["goal"], r["updated"]), ("", "normal", "", 0))
+        self.assertEqual(r["after"], ["https://github.com/a/b/pull/1"] * 5)
+        self.assertEqual(len(r["todos"]), cc.REPORT_TODOS)
+        self.assertEqual(dict(r["todos"][0], id=None), {"id": None, "text": "t0", "kind": "", "size": "", "url": ""})
+        self.assertRegex(r["todos"][0]["id"], "^[0-9a-f]{8}$")  # a file without ids gets stable ones
+        self.assertEqual(r["todos"], cc.sanitize_report({"todos": r["todos"]})["todos"])
+        self.assertEqual(cc.sanitize_report({"updated": float("nan")})["updated"], 0)  # NaN would break the API's JSON
+        self.assertEqual(cc.sanitize_report({"updated": 10 ** 400})["updated"], 0)  # too large for a float
+        odd = cc.sanitize_report({"todos": [{"text": "Check \ud800", "id": "0000aaaa"}, {"text": "Other", "id": "0000aaaa"}]})
+        self.assertEqual(odd["todos"][0]["text"], "Check ?")  # an unpaired surrogate
+        self.assertEqual(len({x["id"] for x in odd["todos"]}), 2)  # a repeated id is made unique
+        cc.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        (cc.REPORTS_DIR / "not.a-session.json").write_text('{"next": "x"}')
+        (cc.REPORTS_DIR / (self.A + ".json")).write_text("not json")
+        self.assertEqual(cc.load_reports(), {})
+
+    def test_todo_done_by_id(self):
+        for url in ("https://a.example/1", "https://a.example/2"):  # same text, different to-dos
+            cc.update_report(self.A, {}, {"text": "Check it", "kind": "", "size": "", "url": url})
+        first, second = cc.load_reports()[self.A]["todos"]
+        self.assertNotEqual(first["id"], second["id"])
+        cc.remove_todo(self.A, first["id"])
+        with self.assertRaises(ValueError):
+            cc.remove_todo(self.A, first["id"])  # a repeated click doesn't take the other one
+        self.assertEqual(cc.load_reports()[self.A]["todos"], [second])
+
+    def test_goal_board(self):
+        now = time.time()
+        rep = lambda **kw: cc.sanitize_report(dict({"updated": now - 100}, **kw))
+        sessions = [
+            {"id": "s1", "alive": True, "report": rep(goal="Ship 1.2", priority="low", todos=[{"text": "Submit to the stores"}])},
+            {"id": "s2", "alive": False, "report": rep(goal="ship 1.2", priority="high")},
+            {"id": "s3", "alive": False, "report": rep(goal="Billing", todos=[{"text": "old"}]), "mark": {"done": True}},
+            {"id": "s4", "alive": True, "report": rep()},
+            {"id": "s5", "alive": True, "report": None},
+            {"id": "s6", "alive": True, "report": rep(goal="Docs", priority="high")},
+        ]
+        rows = [{"url": PR.format(1), "step": 1, "updated": now - 900, "session": {"id": "s2"}},
+                {"url": PR.format(2), "step": 4, "updated": now - 50, "session": {"id": "s2"}},
+                {"url": PR.format(3), "step": 3, "updated": now, "session": None}]
+        board = cc.goal_board(sessions, rows, now=now)
+        self.assertEqual([g["goal"] for g in board], ["Ship 1.2", "Docs", "Other", "Billing"])  # same priority: oldest first
+        ship = board[0]
+        self.assertEqual((ship["priority"], [s["id"] for s in ship["sessions"]], [p["url"] for p in ship["prs"]]),
+                         ("high", ["s1", "s2"], [PR.format(1), PR.format(2)]))
+        self.assertEqual(ship["summary"], "2 PRs: 1 to merge, 1 waiting, 1 to-do for you")
+        self.assertEqual([(x["text"], x["sid"]) for x in ship["todos"]], [("Submit to the stores", "s1")])
+        self.assertEqual((board[3]["open"], board[3]["todos"], board[3]["summary"]), (False, [], "Done"))  # a done session's to-dos are over
+        self.assertTrue(board[2]["other"])
+        self.assertEqual(board[3]["since"], now - 100)  # a done goal: its last report, so snapshots don't change by themselves
+        self.assertEqual(cc.goal_board(sessions, rows, now=now + 60)[3]["since"], now - 100)
+
+    def test_dashboard_and_server(self):
+        write_session(self.A, [user("ship it", 20), asst([tool("r1", "Bash", {"command": "gh pr create"})], 19),
+                               result("r1", 19, PR.format(70)), asst([text("Opened it.")], 18)])
+        self.addCleanup(lambda: (PROJ / (self.A + ".jsonl")).unlink())
+        cc.update_report(self.A, {"goal": "Ship 1.2", "next": "Waiting for the review", "after": [PR.format(8)]},
+                         {"text": "Check the preview", "kind": "validate", "size": "small", "url": ""})
+        plan = {"fetched": time.time(), "viewer": "me", "prs": [dict(url=PR.format(70), repo="me/app", head="report-b", base="main", default_base="main",
+                number=70, title="PR 70", draft=False, checks="passing", merge="clean", review="", threads=0, threads_yours=0, updated=time.time())]}
+        with mock.patch.object(cc, "load_json", lambda path, d, orig=cc.load_json: plan if path == cc.PR_PLAN_FILE else orig(path, d)):
+            dash = cc.Dashboard(0)
+            dash.refresh()
+        snap = dash.snapshot
+        s = next(x for x in snap["sessions"] if x["id"] == self.A)
+        self.assertEqual((s["report"]["goal"], s["report_stale"]), ("Ship 1.2", False))
+        row = next(r for r in snap["plan"]["rows"] if r["number"] == 70)
+        self.assertEqual((row["goal"], row["session_next"], row["after"]), ("Ship 1.2", "Waiting for the review", [PR.format(8)]))
+        goal = snap["goals"][0]
+        self.assertEqual((goal["goal"], goal["summary"]), ("Ship 1.2", "1 PR: 1 to merge, 1 to-do for you"))
+        tid = goal["todos"][0]["id"]
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": "0000ffff"})[0], 409)
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": 0})[0], 409)
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": tid})[0], 200)
+        self.assertEqual(cc.load_reports()[self.A]["todos"], [])
+        cc.REPORTS_DIR.joinpath(self.A + ".json").write_text(json.dumps(dict(cc.load_reports()[self.A], updated=time.time() - 30 * 3600)))
+        dash.refresh()
+        self.assertTrue(next(x for x in dash.snapshot["sessions"] if x["id"] == self.A)["report_stale"])
+
+
 class UsageTest(unittest.TestCase):
     def test_tokens_counted_once_and_context(self):
         build_usage_fixture()

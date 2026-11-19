@@ -196,6 +196,7 @@ const ui = {
   filter: "all", showDone: ls.get("showDone", false), showOld: ls.get("showOld", false), q: "",
   menu: "", drawer: "", settings: false, focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false), notifOpen: "",
   view: ls.get("view", "sessions"), scope: ls.get("prScope", "sessions"), step: 0,
+  groupBy: ls.get("groupBy", "state"), showDoneGoals: false,
 };
 const offline = () => !!data && failures > 0 && Date.now() - lastOk > 6000;
 
@@ -230,7 +231,7 @@ async function act(id, action, extra) {
       focus: "Switched to its " + (j.focused || "terminal") + " tab",
       undone: "Reopened", park: "Parked", unpark: "Unparked", note: "Note saved",
       open_folder: "Opening the folder…", refresh_prs: "PR states refreshed",
-      dismiss: "Dismissed", dismiss_all: "Notifications cleared",
+      dismiss: "Dismissed", dismiss_all: "Notifications cleared", todo_done: "To-do done",
     };
     toast(msgs[action] || "Done");
     etag = ""; load();
@@ -374,6 +375,7 @@ function deco(s) {
     prompts: s.prompts || 0, ts: s.last_ts || 0, ago: agoShort(s.last_ts), run: !!s.alive,
     reason, code, msg, prs, links, issues, main, related, relatedN, long, cut: !!s.last_text_cut, files: (s.files || []).length, fileList: s.files || [],
     note: m.note || "", parked: !!m.parked, marked: !!m.done,
+    report: s.report || null, goal: (s.report && s.report.goal) || "", reportStale: !!s.report_stale,
     used, max, pct, lvl: pct >= 85 ? "high" : pct >= 60 ? "warn" : "ok", inTok, outTok, u, sub,
     ctxLabel: tok(used) + " / " + tok(max),
     ctxTitle: "Context " + tok(used) + " of " + tok(max) + " (" + pct + "%) · input " + tok(inTok) + " · output " + tok(outTok) + (s.model ? " · " + s.model : ""),
@@ -398,7 +400,7 @@ function prView(p) {
 }
 function matches(s, q) {
   if (!q) return true;
-  const hay = [s.title, s.name, s.project, s.branch, s.note, s.id, ...s.issues.map((i) => i.key + " " + i.title),
+  const hay = [s.title, s.name, s.project, s.branch, s.note, s.goal, s.id, ...s.issues.map((i) => i.key + " " + i.title),
     ...s.links.map((l) => l.full)].join(" ").toLowerCase();
   return q.toLowerCase().split(/\s+/).every((w) => hay.includes(w));
 }
@@ -430,6 +432,10 @@ function chipRow(s, max, withTitle) {
 }
 const linkChip = (l, full) => h("a", { class: "lchip", href: l.url, target: "_blank", rel: "noopener noreferrer", title: l.url }, ic(l.icon), full ? l.full : l.label);
 const noteEl = (s) => s.note ? h("span", { class: "note" }, ic("note"), s.note) : null;
+const goalKey = (g) => String(g || "").toLowerCase().split(/\s+/).filter(Boolean).join(" ");
+// The goal a session reported (`ccdeck report --goal`): a click shows only that goal's sessions or PRs
+const goalChip = (goal, key) => goal ? h("button", { class: "lchip goalchip", "data-key": key || "g:" + goal, title: "Goal: " + goal + "\nShow only this goal",
+  onclick: (e) => { e.stopPropagation(); $("q").value = goal; ui.q = goal; render(); } }, ic("plan", "i-xs"), oneLine(goal, 32)) : null;
 const loc = (s) => h("div", { class: "loc" }, ic("folder"), h("span", { class: "mono", title: s.cwd }, s.project),
   nameChip(s), ic("branch"),
   h("span", { class: "mono" }, s.branch), h("span", { class: "sep" }, "·"), h("span", {}, s.prompts + (s.prompts === 1 ? " prompt" : " prompts")),
@@ -493,7 +499,7 @@ function card(s) {
     h("div", { class: "card-top" }, pill(s), run(s), h("span", { class: "grow" }), h("span", { class: "ago" }, s.ago)),
     h("div", { style: "display: flex; flex-direction: column; gap: 3px; min-width: 0" }, h("h3", { class: "card-title" }, titleBtn(s)), loc(s)),
     h("div", { class: "ask" }, h("p", {}, s.reason), s.code ? h("code", {}, s.code) : null, moreBtn(s)),
-    h("div", { class: "card-meta" }, chipRow(s, 4), noteEl(s), h("span", { class: "grow" }),
+    h("div", { class: "card-meta" }, ui.groupBy === "goal" ? null : goalChip(s.goal, "g:" + s.id), chipRow(s, 4), noteEl(s), h("span", { class: "grow" }),
       s.files ? h("span", { class: "metaitem", title: "Files written" }, ic("file", "i-xs"), s.files) : null, ctx(s)),
     h("div", { class: "card-actions" }, resumeBtn(s, "btn btn-primary", null, "i-sm"), copyBtn(s),
       h("button", { class: "ibtn ibtn-sm hide-xs", "aria-label": "Open folder", title: "Open folder", onclick: () => act(s.id, "open_folder") }, ic("folder", "i-sm")),
@@ -504,7 +510,7 @@ function row(s) {
     pill(s),
     h("div", { class: "row-main" }, titleBtn(s), h("span", { class: "row-reason", title: s.reason }, s.reason)),
     h("span", { class: "row-loc", title: s.cwd }, s.project, " ", h("span", {}, "/"), " ", s.branch),
-    h("span", { class: "row-prs" }, nameChip(s), chipRow(s, 2), noteEl(s)),
+    h("span", { class: "row-prs" }, nameChip(s), ui.groupBy === "goal" ? null : goalChip(s.goal, "g:" + s.id), chipRow(s, 2), noteEl(s)),
     ctx(s), h("span", { class: "ago" }, s.ago),
     h("span", { class: "row-acts" }, resumeBtn(s, "btn btn-sm resume", null, "i-sm"), menuBtn(s, false, "More actions for " + s.title)));
 }
@@ -662,20 +668,22 @@ function render() {
   renderHint(); renderLegend(); renderContours(all, isOff);
 
   const visibleGroup = (k) => isOff ? k === "need" : ui.filter === "all" ? (k !== "done" || ui.showDone) : ui.filter === k;
-  const groups = GR.filter((g) => visibleGroup(g.k)).map((g) => {
+  let groups = GR.filter((g) => visibleGroup(g.k)).map((g) => {
     let items = all.filter((s) => s.g === g.k && matches(s, q));
     if (g.k === "closed" && !ui.showOld) items = items.filter((s) => !isOld(s));
     items.sort((a, b) => g.k === "need" ? a.ts - b.ts : b.ts - a.ts);
     return Object.assign({}, g, { items });
   }).filter((g) => g.items.length);
+  const byGoal = ui.groupBy === "goal" && !isOff;
+  if (byGoal) groups = goalGroups(groups.flatMap((g) => g.items));
   const listed = groups.reduce((a, g) => a + g.items.length, 0);
 
   const out = [];
   renderInbox();
   if (!isOff && data.plan) out.push(viewSwitch(all.length - doneN));
-  if (!isOff && ui.view === "prs" && data.plan) {
+  if (!isOff && (ui.view === "prs" && data.plan || ui.view === "goals")) {
     lastById = Object.fromEntries(all.map((s) => [s.id, s]));
-    out.push(...planView(q));
+    out.push(...(ui.view === "goals" ? goalsView(q) : planView(q)));
     $("main").replaceChildren(...out);
     renderDrawer(all);
     if (keep) focusKey(keep);
@@ -694,7 +702,10 @@ function render() {
           "data-hidden": c.k === "done" && !ui.showDone ? "true" : "false", "aria-pressed": ui.filter === c.k ? "true" : "false", "data-key": "f:" + c.k,
           onclick: () => { ui.filter = ui.filter === c.k ? "all" : c.k; if (c.k === "done") { ui.showDone = true; ls.set("showDone", true); } render(); } },
           alarm ? ic("bell", "i-sm") : c.k !== "all" ? h("span", { class: "dot" }) : null, c.l + " ", h("b", {}, c.n));
-      })));
+      }), (data.goals || []).length || byGoal ? [h("span", { class: "viewsw-gap" }), ...[["state", "By state"], ["goal", "By goal"]].map(([v, l]) =>
+        h("button", { class: "fchip", "aria-pressed": ui.groupBy === v ? "true" : "false", "data-key": "gb:" + v,
+          title: v === "goal" ? "One section per goal the sessions reported (ccdeck report --goal)" : "Sections by what each session needs",
+          onclick: () => { ui.groupBy = v; ls.set("groupBy", v); render(); } }, l))] : null));
   }
 
   if (!all.length && !isOff) {
@@ -808,14 +819,16 @@ function viewSwitch(nSessions) {
   const yours = rows.filter((r) => r.actor === "you").length;
   const pick = (v) => { ui.view = v; ls.set("view", v); render(); };
   return h("nav", { class: "filters viewsw", "aria-label": "View" },
-    h("button", { class: "fchip", "aria-pressed": ui.view !== "prs" ? "true" : "false", "data-key": "v:sessions", onclick: () => pick("sessions") },
+    h("button", { class: "fchip", "aria-pressed": ui.view !== "prs" && ui.view !== "goals" ? "true" : "false", "data-key": "v:sessions", onclick: () => pick("sessions") },
       ic("deck", "i-sm"), "Sessions ", h("b", {}, nSessions)),
+    h("button", { class: "fchip", "aria-pressed": ui.view === "goals" ? "true" : "false", "data-key": "v:goals", onclick: () => pick("goals"),
+      title: "What your sessions work toward, from their reports (ccdeck report)" }, ic("plan", "i-sm"), "Goals ", h("b", {}, (data.goals || []).filter((g) => g.open && !g.other).length)),
     h("button", { class: "fchip", "aria-pressed": ui.view === "prs" ? "true" : "false", "data-key": "v:prs", onclick: () => pick("prs"),
       title: yours + " of " + rows.length + " open PRs wait on you" }, ic("pr", "i-sm"), "PRs ", h("b", {}, rows.length)));
 }
 function planView(q) {
   let rows = planRows();
-  if (q) rows = rows.filter((r) => [r.repo, r.title, r.head, "#" + r.number, r.session ? "@" + r.session.name : ""].join(" ").toLowerCase().includes(q.toLowerCase()));
+  if (q) rows = rows.filter((r) => [r.repo, r.title, r.head, "#" + r.number, r.session ? "@" + r.session.name : "", r.goal || "", r.session_next || ""].join(" ").toLowerCase().includes(q.toLowerCase()));
   const setScope = (v) => { ui.scope = v; ls.set("prScope", v); render(); };
   const out = [h("nav", { class: "filters", "aria-label": "Which PRs and which step" },
     h("button", { class: "fchip", "aria-pressed": ui.scope !== "all" ? "true" : "false", "data-key": "sc:sessions", onclick: () => setScope("sessions"),
@@ -838,6 +851,8 @@ function planView(q) {
       const k = "st:" + ui.step; ui.step = 0; render();
       const chip = document.querySelector('[data-key="' + k + '"]'); if (chip) chip.focus();  // this button is gone: back to the step chip
     } }, "Clear step selection") : null));
+  const todos = allTodos().filter((t) => !q || (t.text + " " + t.goal).toLowerCase().includes(q.toLowerCase()));
+  if (todos.length && !ui.step) out.push(todoSection(todos));
   for (const st of STEPS) {
     if (ui.step && ui.step !== st.s) continue;
     const part = rows.filter((r) => r.step === st.s);
@@ -853,7 +868,7 @@ function planView(q) {
       h("span", { "data-ago-from": String(p.fetched) }, agoText(Math.round(Date.now() / 1000 - p.fetched))), " · refreshes every 5 min · no AI, statuses only"] : "Waiting for GitHub")));
   return out;
 }
-function planRow(r, st) {
+function planRow(r, st, inGoal) {
   const s = r.session;
   const validUrl = /^https?:\/\//i.test(r.url || "");
   const link = validUrl ? { href: r.url, target: "_blank", rel: "noopener noreferrer" } : {};
@@ -862,7 +877,8 @@ function planRow(r, st) {
     h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l, "data-key": "prn:" + r.url }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
     h("div", { class: "plan-main" },
       h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title, "data-key": "prt:" + r.url }, link), r.title),
-      h("span", { class: "plan-next" }, r.texts.join(" · "))),
+      h("span", { class: "plan-next" }, r.texts.join(" · "), ...afterLinks(r.after)),
+      !inGoal && (r.session_next || r.goal) ? h("span", { class: "plan-say" }, goalChip(r.goal, "g:" + r.url), r.session_next ? h("span", { title: "What the session reported" }, r.session_next) : null) : null),
     h("span", { class: "rr-repo mono" }, r.repo),
     s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }), "n:" + s.id + ":" + r.url)
       : h("span", { class: "rr-by" }, st.s === 3 ? "by " + r.author : "no session"),
@@ -870,6 +886,91 @@ function planRow(r, st) {
     msg ? h("button", { class: "btn btn-sm", "data-key": "prm:" + r.url, title: "Copy a message for @" + s.name, onclick: () => copy(msg, "Message for @" + s.name) }, ic("copy", "i-sm"), "Message")
       : h("span", {}),
     h("span", { class: "ago" }, agoShort(r.updated)));
+}
+// "After #N": PRs or issues a session said must land first (cross-repo too)
+const afterLinks = (urls) => (urls || []).map((u) => {
+  const m = /\/(?:pull|issues)\/(\d+)/.exec(u);
+  return /^https?:\/\//i.test(u) ? [" · After ", h("a", { href: u, target: "_blank", rel: "noopener noreferrer", title: u }, m ? "#" + m[1] : shortUrl(u))] : null;
+}).flat().filter(Boolean);
+const allTodos = () => (data.goals || []).flatMap((g) => g.todos.map((t) => Object.assign({ goal: g.other ? "" : g.goal }, t)));
+function todoSection(todos) {
+  return h("section", { class: "section", "data-g": "need", "aria-labelledby": "h-todos" },
+    h("div", { class: "ghdr ghdr-strong" }, h("h2", { id: "h-todos" }, h("span", { class: "gicon" }, ic("check-circle")), "To do for you ", h("span", { class: "gcount" }, todos.length)),
+      h("span", { class: "rule" }), h("span", { class: "ghint" }, "Things sessions handed you; tick them off when done")),
+    h("ul", { class: "rrlist todos" }, todos.map((t) => todoRow(t, true))));
+}
+function todoRow(t, withGoal) {
+  const s = lastById[t.sid];
+  const key = t.sid + ":" + t.id;
+  return h("li", { "data-key": "td:" + key },
+    h("button", { class: "ibtn ibtn-sm", "data-key": "tdd:" + key, "aria-label": "Done: " + t.text, title: "Done: remove it from the session's report",
+      onclick: () => act(t.sid, "todo_done", { todo: t.id }) }, ic("check", "i-sm")),
+    h("div", { class: "plan-main" }, h("span", { class: "rr-title", title: t.text }, t.text),
+      h("span", { class: "plan-next" }, [t.kind, t.size].filter(Boolean).join(" · ") || "To do"),
+      withGoal && t.goal ? h("span", { class: "plan-say" }, goalChip(t.goal, "g:td:" + key)) : null),
+    /^https?:\/\//i.test(t.url || "") ? h("a", { class: "lchip", href: t.url, target: "_blank", rel: "noopener noreferrer", title: t.url }, ic("doc", "i-xs"), shortUrl(t.url)) : h("span", {}),
+    (s && nameChip(s, "n:td:" + key)) || h("span", { class: "rr-by mono" }, s ? s.sid : t.sid.slice(0, 8)),
+    h("span", {}));
+}
+const PRIO = { high: "High priority", low: "Low priority" };
+function goalsView(q) {
+  const plan = Object.fromEntries(((data.plan && data.plan.rows) || []).map((r) => [r.url, r]));
+  const lq = q.toLowerCase();
+  const hit = (g) => !q || [g.goal, ...g.sessions.map((x) => (lastById[x.id] || {}).title || ""), ...g.prs.map((p) => (plan[p.url] || {}).title || "")]
+    .join(" ").toLowerCase().includes(lq);
+  const goals = (data.goals || []).filter(hit);
+  const open = goals.filter((g) => g.open), done = goals.filter((g) => !g.open);
+  const out = [];
+  if (!goals.length) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, q ? "No goals match “" + q + "”" : "No goals yet"),
+    h("p", {}, "Sessions report what they work toward with ", h("span", { class: "mono" }, "ccdeck report --goal \"Ship 1.2\""),
+      ". The plugin's report skill tells them when: after opening a PR, when they wait on you, and when they hand you a to-do.")));
+  for (const g of open.concat(ui.showDoneGoals ? done : [])) {
+    const sessions = g.sessions.map((x) => lastById[x.id]).filter(Boolean);
+    const prs = g.prs.map((p) => plan[p.url]).filter(Boolean);
+    const id = "h-goal-" + goalKey(g.goal).replace(/[^a-z0-9]+/g, "-");
+    out.push(h("section", { class: "section goal", "data-g": g.open ? (g.todos.length ? "need" : "work") : "done", "aria-labelledby": id },
+      h("div", { class: "ghdr" }, h("h2", { id }, h("span", { class: "gicon" }, ic(g.other ? "deck" : "plan")), g.goal + " ",
+        PRIO[g.priority] && g.open ? h("span", { class: "prio", "data-p": g.priority }, PRIO[g.priority]) : null),
+        h("span", { class: "rule" }), h("span", { class: "ghint" }, g.summary)),
+      h("div", { class: "goal-body" },
+        sessions.length ? h("ul", { class: "rrlist" }, sessions.map(goalSession)) : null,
+        prs.length ? h("ul", { class: "rrlist plan" }, prs.map((r) => planRow(r, STEPS.find((st) => st.s === r.step), true))) : null,
+        g.todos.length ? h("ul", { class: "rrlist todos" }, g.todos.map((t) => todoRow(t, false))) : null)));
+  }
+  if (done.length) out.push(h("div", { class: "more-line", style: "margin-top: 32px" }, ic("check-circle", "i-sm"),
+    h("span", {}, plural(done.length, "done goal") + (ui.showDoneGoals ? "" : " hidden")),
+    h("button", { class: "linkbtn", onclick: () => { ui.showDoneGoals = !ui.showDoneGoals; render(); } }, ui.showDoneGoals ? "Hide" : "Show"), h("span", { class: "rule" })));
+  out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"), "From the sessions' own reports (ccdeck report) and GitHub statuses · no AI")));
+  return out;
+}
+const WAITING = { you: "Waits on you", ci: "Waits on CI", review: "Waits on a review", session: "Working" };
+function goalSession(s) {
+  const r = s.report || {};
+  const w = WAITING[r.waiting] || (r.waiting ? "Waits on " + shortUrl(r.waiting) : "");
+  return h("li", { "data-sid": s.id },
+    pill(s),
+    h("div", { class: "plan-main" }, titleBtn(s, "rr-title title-btn"),
+      h("span", { class: "plan-next", title: r.next || "" }, r.next || s.reason, ...afterLinks(r.after)),
+      s.reportStale ? h("span", { class: "plan-say stale-note" }, ic("clock", "i-xs"), "Reported " + agoShort(r.updated) + " ago; the session has moved on since") : null),
+    h("span", { class: "rr-by" }, w),
+    nameChip(s, "n:g:" + s.id) || h("span", { class: "rr-by mono" }, s.sid),
+    h("span", { class: "goal-acts" }, h("span", { class: "ago" }, s.ago), menuBtn(s, false, "More actions for " + s.title)));
+}
+const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
+// The sessions view grouped by goal: the goals' order from the server (open first, by priority), then "No goal".
+// Within a goal, sessions keep the state order, so one that needs you still comes first.
+function goalGroups(items) {
+  const meta = Object.fromEntries((data.goals || []).map((g) => [g.key, g]));
+  const byKey = new Map();
+  for (const s of items) { const k = goalKey(s.goal); if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(s); }
+  const order = (data.goals || []).map((g) => g.key).filter((k) => k && byKey.has(k));
+  const keys = [...order, ...[...byKey.keys()].filter((k) => k && !order.includes(k)), ...(byKey.has("") ? [""] : [])];
+  const rank = Object.fromEntries(GR.map((g, i) => [g.k, i]));
+  return keys.map((k, i) => {
+    const list = byKey.get(k).sort((a, b) => rank[a.g] - rank[b.g] || b.ts - a.ts);
+    return { k: "goal" + i, l: k ? list[0].goal : "No goal", i: k ? "plan" : "deck", layout: "rows", items: list,
+      hint: k ? (meta[k] ? meta[k].summary : "") : "Sessions that reported no goal, or no report yet" };
+  });
 }
 function staleMore(all) {
   const parts = GR.filter((g) => g.k !== "need" && g.k !== "done").map((g) => [all.filter((s) => s.g === g.k).length, g.l.toLowerCase()]).filter((x) => x[0]);
