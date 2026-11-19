@@ -31,7 +31,7 @@ Run it as `python3 "${CLAUDE_PLUGIN_ROOT}/ccdeck" report …` (quoted: the path 
      Then reorder with `ccdeck plan --goal "Ship 0.7.4" move P5 --to 1` as the user ranks them. Don't reorder on your own.
    - When you work an item, say so first: `ccdeck report --goal "Ship 0.7.4" --item P3`. ccdeck then shows the item's state from this session and its PRs. One session works one item; for the next item, the user starts a new session (the dashboard's Start copies the command).
    - ccdeck links a PR to an item when the PR's title or branch has the item's ticket key, or when this session works the item and the PR has no other item's key. Otherwise link it yourself, which overrides both: `ccdeck plan --goal "Ship 0.7.4" set P3 --pr URL`.
-   - An item with PRs is done when they've all merged; don't mark it. Mark `ccdeck plan --goal "Ship 0.7.4" done P3` only for work without a PR. Use `set P3 --blocked "why"` (and `--unblock`) when it can't move, `drop P3` when it's no longer wanted, `set P4 --owner Sam` when someone else took it, each with `--goal`.
+   - An item with PRs is done when they've all merged; don't mark it while a PR is open. Mark it yourself (`ccdeck plan --goal "Ship 0.7.4" done P3`) when the work is complete and no PR is left open: work that needed no PR, or whose PR closed unmerged because the work landed elsewhere. Use `set P3 --blocked "why"` (and `--unblock`) when it can't move, `drop P3` when it's no longer wanted, `set P4 --owner Sam` when someone else took it, each with `--goal`.
    - `ccdeck plan --goal "Ship 0.7.4"` prints the items with their states.
 
 Report briefly and only when something changed. Don't mention the report to the user unless they ask.
