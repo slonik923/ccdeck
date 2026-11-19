@@ -137,16 +137,18 @@ const isOldClosed = (s, now) => s.g === "closed" && s.k !== "parked" && now - s.
 function goalToggleCounts(all, now) {
   const byId = Object.fromEntries(all.map((s) => [s.id, s]));
   const goals = data.goals || [];
-  const done = goals.filter((g) => !g.open).length + goals.filter((g) => g.open).reduce((a, g) => a + (g.todos_done || []).length, 0);
+  // a done goal counts once; in open goals, each done to-do and done session Show done would reveal
+  const done = goals.filter((g) => !g.open).length + goals.filter((g) => g.open).reduce((a, g) => a + (g.todos_done || []).length + g.sessions.filter((x) => x.done).length, 0);
   const old = new Set(goals.flatMap((g) => g.sessions.map((x) => byId[x.id]).filter((s) => s && isOldClosed(s, now)).map((s) => s.id)));
   return [done, old.size];
 }
 // the PRs view's done ones: merged or closed PRs that sessions owned, once each (older: also from sessions closed long ago)
 function donePrs(all, now, older) {
+  const open = new Set(((data.plan && data.plan.rows) || []).map((r) => String(r.url).toLowerCase()));  // newer than the cached states
   const seen = new Set(), out = [];
   for (const s of all.slice().sort((a, b) => b.ts - a.ts)) {
     if (!older && isOldClosed(s, now)) continue;
-    for (const p of s.prs) if (p.own && (p.k === "merged" || p.label === "Closed") && !seen.has(p.url)) { seen.add(p.url); out.push(Object.assign({ s }, p)); }
+    for (const p of s.prs) if (p.own && (p.k === "merged" || p.label === "Closed") && !seen.has(p.url) && !open.has(String(p.url).toLowerCase())) { seen.add(p.url); out.push(Object.assign({ s }, p)); }
   }
   return out;
 }
@@ -910,7 +912,7 @@ function planView(q) {
       h("span", { class: "rr-repo mono" }, p.repo), nameChip(p.s, "n:prd:" + p.url) || h("span", { class: "rr-by mono" }, p.s.sid || p.s.id.slice(0, 8)),
       h("span", { class: "ago mono", title: "The session's last activity" }, agoShort(p.s.ts)))))));
   else if (!ui.showDone && !ui.step && done.length) out.push(h("div", { class: "more-line" }, ic("merge", "i-sm"), h("span", {}, plural(done.length, "merged or closed PR") + " hidden"),
-    h("button", { class: "linkbtn", onclick: toggleDone }, "Show"), h("span", { class: "rule" })));
+    h("button", { class: "linkbtn", "data-key": "prdm", onclick: toggleDone }, "Show"), h("span", { class: "rule" })));
   out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"),
     p.disabled ? "PR plan fetching is disabled" : p.fetched ? [(p.state === "failed" || p.state === "auth_required" ? "Refresh failed; cached data from GitHub, " : "From GitHub, "),
       h("span", { "data-ago-from": String(p.fetched) }, agoText(Math.round(Date.now() / 1000 - p.fetched))), " · refreshes every 5 min · no AI, statuses only"] : "Waiting for GitHub")));
@@ -941,12 +943,12 @@ const afterLinks = (urls) => (urls || []).map((u) => {
   return /^https?:\/\//i.test(u) ? [" · After ", h("a", { href: u, target: "_blank", rel: "noopener noreferrer", title: u }, m ? "#" + m[1] : shortUrl(u))] : null;
 }).flat().filter(Boolean);
 // the open to-dos, then a line that shows or hides the ticked ones (unticking one opens it again)
-function todoList(todos, ticked) {
+function todoList(todos, ticked, key) {
   const shown = ui.showDone ? ticked : [];
   return h("div", { class: "todo-wrap" },
     todos.length || shown.length ? h("ul", { class: "rrlist todos" }, todos.concat(shown).map(todoRow)) : null,
     ticked.length ? h("div", { class: "more-line todo-more" }, ic("check", "i-sm"), h("span", {}, plural(ticked.length, "done to-do") + (ui.showDone ? "" : " hidden")),
-      h("button", { class: "linkbtn", "aria-expanded": String(!!ui.showDone), title: "Same as Show done at the top", onclick: toggleDone },
+      h("button", { class: "linkbtn", "data-key": "tdm:" + key, "aria-expanded": String(!!ui.showDone), title: "Same as Show done at the top", onclick: toggleDone },
         ui.showDone ? "Hide" : "Show"), h("span", { class: "rule" })) : null);
 }
 function todoRow(t) {
@@ -987,11 +989,11 @@ function goalsView(q) {
       h("div", { class: "goal-body" },
         sessions.length ? h("ul", { class: "rrlist" }, sessions.map(goalSession)) : null,
         prs.length ? h("ul", { class: "rrlist plan" }, prs.map((r) => planRow(r, STEPS.find((st) => st.s === r.step), true))) : null,
-        g.todos.length || (g.todos_done || []).length ? todoList(g.todos, g.todos_done || []) : null)));
+        g.todos.length || (g.todos_done || []).length ? todoList(g.todos, g.todos_done || [], g.key) : null)));
   }
   if (done.length) out.push(h("div", { class: "more-line", style: "margin-top: 32px" }, ic("check-circle", "i-sm"),
     h("span", {}, plural(done.length, "done goal") + (ui.showDone ? "" : " hidden")),
-    h("button", { class: "linkbtn", onclick: toggleDone }, ui.showDone ? "Hide" : "Show"), h("span", { class: "rule" })));
+    h("button", { class: "linkbtn", "data-key": "dgm", onclick: toggleDone }, ui.showDone ? "Hide" : "Show"), h("span", { class: "rule" })));
   out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"), "From the sessions' own reports (ccdeck report) and GitHub statuses · no AI")));
   return out;
 }
