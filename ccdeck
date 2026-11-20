@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.10"
+VERSION = "0.9.11"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1188,6 +1188,7 @@ PR_PLAN_QUERY = """query {
   viewer { login }
   mine: search(type: ISSUE, query: "is:pr is:open author:@me archived:false", first: 100) { pageInfo { hasNextPage } nodes { ... on PullRequest {
     url number title isDraft updatedAt headRefName baseRefName mergeStateStatus reviewDecision
+    isInMergeQueue mergeQueueEntry { position } autoMergeRequest { enabledAt } reviewRequests { totalCount }
     headRepository { nameWithOwner }
     repository { nameWithOwner defaultBranchRef { name } } author { login }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
@@ -1249,9 +1250,27 @@ def fetch_pr_plan():
                     threads["pageInfo"] = more["pageInfo"]
                 except (ValueError, KeyError, TypeError, AttributeError):
                     break
-        return parse_pr_plan(data)
+        return verify_failing(parse_pr_plan(data), deadline)
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def verify_failing(plan, deadline):
+    """GitHub's rollup state can read FAILURE while every check passed in a newer run (and flips
+    between reads), so a failing PR is checked against its full check list, as sessions' PRs are.
+    Also gives the failing check names. Out of time or on an error, the rollup's answer stays."""
+    for p in plan["prs"]:
+        if p["checks"] != "failing" or time.monotonic() > deadline:
+            continue
+        try:
+            r = subprocess.run(["gh", "pr", "view", p["url"], "--json", "statusCheckRollup"],
+                               capture_output=True, text=True, timeout=max(1, min(20, deadline - time.monotonic())))
+            rollup = json.loads(r.stdout).get("statusCheckRollup") if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            continue
+        if isinstance(rollup, list) and rollup:
+            p["checks"], p["failing"] = summarize_checks(rollup), failing_checks(rollup)[:8]
+    return plan
 
 
 _plan_state = "pending"
@@ -1322,6 +1341,11 @@ def parse_pr_plan(d):
             # someone else spoke last: work for the author; you did: only you can resolve the thread
             "threads": sum(1 for a in last if a != viewer), "threads_yours": sum(1 for a in last if a == viewer),
             "threads_more": bool((((n.get("reviewThreads") or {}).get("pageInfo")) or {}).get("hasNextPage")),
+            # 0: not queued; else its place in the merge queue (1 merges next)
+            "queue": ((n.get("mergeQueueEntry") or {}).get("position") or 1) if n.get("isInMergeQueue") else 0,
+            "auto_merge": bool(n.get("autoMergeRequest")),
+            "review_requests": (n.get("reviewRequests") or {}).get("totalCount") or 0,
+            "failing": [],
         })
     return {"viewer": viewer, "prs": prs, "truncated": bool(((d.get("mine") or {}).get("pageInfo") or {}).get("hasNextPage"))}
 
@@ -1358,12 +1382,16 @@ def pr_step(p, stacked_on=None, session=None, now=None, working=False):
         return 4, ["Review status unknown: check GitHub"], None
     if p["merge"] == "blocked" and p["threads_yours"]:
         return 2, ["Resolve " + plural(p["threads_yours"], "thread"), "Waiting for a review or a required check"], "you"
-    if stacked_on:
+    if p.get("queue"):
+        wait = f"In the merge queue, #{p['queue']}"
+    elif stacked_on:
         wait = f"After #{stacked_on} merges"
+    elif p.get("auto_merge"):
+        wait = "Merges by itself when ready (auto-merge)"
     elif p["checks"] == "pending":
         wait = "CI running"
     elif p["merge"] == "blocked":
-        wait = "Waiting for a review or a required check"
+        wait = "Waiting for a review" if p["review"] == "review_required" else "Waiting for a review or a required check"
     elif p["merge"] not in ("clean", "has_hooks", "unstable", "behind"):
         wait = "GitHub is still checking whether it can merge"
     else:

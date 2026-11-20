@@ -1024,6 +1024,7 @@ function planRow(r, st, inGoal) {
     h("div", { class: "plan-main" },
       h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title, "data-key": "prt:" + r.url }, link), r.title),
       h("span", { class: "plan-next" }, r.texts.join(" · "), ...afterLinks(r.after)),
+      st.s !== 3 ? h("span", { class: "plan-status pst-meta" }, planStatus(r)) : null,
       !inGoal && (r.session_next || r.goal) ? h("span", { class: "plan-say" }, goalChip(r.goal, "g:" + r.url), r.session_next ? h("span", { title: "What the session reported" }, r.session_next) : null) : null),
     h("span", { class: "rr-repo mono" }, r.repo),
     s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }), "n:" + s.id + ":" + r.url)
@@ -1172,6 +1173,29 @@ const linkLi = (l) => h("li", {},
   h("a", { class: "lchip", href: l.url, target: "_blank", rel: "noopener noreferrer", title: l.url }, ic(l.icon), l.name),
   h("a", { class: "ref-title", href: l.url, target: "_blank", rel: "noopener noreferrer" }, l.title || shortUrl(l.url)),
   h("span", { class: "ref-src" }, SOURCE[l.source] || ""));
+// One fact about a PR (CI, review, merge…): an icon and a few words, colored by what it means
+const pstItem = (cls, icon, text, title) => h("span", { class: "pst-i " + cls, title: title || null }, icon ? ic(icon, "i-xs") : null, text);
+const ciItem = (checks, failing) => checks === "failing" ? pstItem("bad", "x-circle", "CI failing" + (failing.length > 1 ? " · " + failing.length : ""), failing.length ? "Failing: " + failing.join(", ") : "")
+  : checks === "pending" ? pstItem("run", "clock", "CI running") : checks === "passing" ? pstItem("ok", "check", "CI passing") : pstItem("", null, "No checks");
+const reviewItem = (review, asked) => review === "approved" ? pstItem("ok", "check-circle", "Approved")
+  : review === "changes_requested" ? pstItem("chg", "changes", "Changes requested")
+  : review !== "review_required" ? null : asked == null ? pstItem("", "reply", "Review required")  // asked: how many reviewers were asked, if known
+  : asked ? pstItem("", "reply", "Review requested · " + asked, asked + (asked === 1 ? " reviewer or team" : " reviewers or teams") + " asked")
+  : pstItem("", "reply", "Needs a review", "No reviewer asked yet");
+// The PRs view's status line: the whole state of an open PR of yours, beside the step's next action
+function planStatus(r) {
+  const m = r.merge || "unknown", out = [];
+  if (r.stacked_on) out.push(pstItem("", "branch", "On #" + r.stacked_on, "Stacked: targets the branch of #" + r.stacked_on));
+  out.push(ciItem(r.checks, r.failing || []));
+  out.push(r.draft ? pstItem("", "draft", "Draft") : reviewItem(r.review, r.review_requests));
+  if (r.queue) out.push(pstItem("run", "clock", "Merge queue · #" + r.queue, r.queue === 1 ? "Merges next" : (r.queue - 1) + " ahead of it"));
+  else if (r.auto_merge) out.push(pstItem("run", "merge", "Auto-merge on", "GitHub merges it once it's ready"));
+  if (m === "dirty") out.push(pstItem("bad", "conflict", "Conflicts"));
+  else if (m === "behind") out.push(pstItem("", "branch", "Behind " + (r.base || "base"), "Update the branch before it can merge"));
+  else if (r.step === 1) out.push(pstItem("ok", "merge", "Ready to merge"));  // GitHub's "mergeable" alone also covers failing CI that isn't required
+  else if (!r.draft && !r.queue && !r.auto_merge && m === "blocked") out.push(pstItem("", "lock", "Merge blocked", "A required review or check is still missing"));
+  return out.filter((el) => el && !(r.texts || []).includes(el.textContent));  // the next action already says it
+}
 // The details' PRs, by repo: a stack as a rail, top first, down to the branch its bottom PR targets; other
 // PRs as rows of their own. Each PR: its title, then CI, review, merge and draft as separate items, and what failed
 function prStack(prs) {
@@ -1185,19 +1209,12 @@ function prStack(prs) {
 }
 function prRail(prs, onto) {
   const top = [...prs].reverse(), stacked = prs.length > 1 || !!onto;
-  const item = (cls, icon, text, title) => h("span", { class: "pst-i " + cls, title }, icon ? ic(icon, "i-xs") : null, text);
   const meta = (p) => {
-    if (p.state === "merged") return [item("ok-pr", "merge", "Merged")];
-    if (p.state === "closed") return [item("", "slash", "Closed")];
-    if (p.error) return [item("", "info", "State unknown", p.error)];
-    return [
-      p.checks === "failing" ? item("bad", "x-circle", "CI failing" + (p.failing.length > 1 ? " · " + p.failing.length : ""))
-        : p.checks === "pending" ? item("run", "clock", "CI running") : p.checks === "passing" ? item("ok", "check", "CI passing") : item("", null, "No checks"),
-      p.review === "approved" ? item("ok", "check-circle", "Approved") : p.review === "changes_requested" ? item("chg", "changes", "Changes requested")
-        : p.review === "review_required" ? item("", "reply", "Review required") : null,
-      p.mergeable === "conflicting" ? item("bad", "conflict", "Conflicts") : null,
-      p.draft ? item("", "draft", "Draft") : null,
-    ];
+    if (p.state === "merged") return [pstItem("ok-pr", "merge", "Merged")];
+    if (p.state === "closed") return [pstItem("", "slash", "Closed")];
+    if (p.error) return [pstItem("", "info", "State unknown", p.error)];
+    return [ciItem(p.checks, p.failing), reviewItem(p.review),
+      p.mergeable === "conflicting" ? pstItem("bad", "conflict", "Conflicts") : null, p.draft ? pstItem("", "draft", "Draft") : null];
   };
   return h("ol", { class: "prstack", "data-stacked": stacked ? "1" : null },
     top.map((p) => h("li", { class: "pst", "data-k": p.k },

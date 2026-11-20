@@ -864,6 +864,8 @@ a.ref-title:hover { text-decoration: underline; }
 .ccd .plan-say { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ccd .plan-say > span { overflow: hidden; text-overflow: ellipsis; }
 .ccd .plan-next a { color: inherit; }
+/* the PR's whole state under its next action: CI, review, merge, queue */
+.ccd .plan-status { flex-wrap: nowrap; gap: 4px 12px; overflow: hidden; min-width: 0; }
 .ccd .stale-note { color: var(--work-fg); }
 .ccd .prio { margin-left: 8px; padding: 1px 6px; border-radius: var(--r-sm); font-size: var(--t-12); font-weight: 500; background: var(--surface-2); color: var(--text-2); vertical-align: middle; }
 .ccd .prio[data-p="high"] { background: var(--need-tint, var(--surface-2)); color: var(--need-fg, var(--text)); }
