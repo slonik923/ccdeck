@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.7"
+VERSION = "0.9.9"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -62,6 +62,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 INBOX_DIR = DATA_DIR / "inbox"  # notifications not acted on yet, one file each
 REQ_DIR = DATA_DIR / "requests"
 REPORTS_DIR = DATA_DIR / "reports"  # what each session says about its own work (`ccdeck report`), one file each
+GOALS_DIR = DATA_DIR / "goals"  # each goal's plan (`ccdeck plan`): kept per goal, so it outlives the sessions that work it
 SCRIPT = Path(__file__).resolve()
 WEB_DIR = SCRIPT.parent / "web"
 IS_MAC = sys.platform == "darwin"
@@ -1761,6 +1762,8 @@ REPORT_PRIORITY = ("high", "normal", "low")
 TODO_KINDS = ("review", "validate", "decide", "hands-on")
 TODO_SIZES = ("small", "medium", "large")
 REPORT_TEXT, REPORT_GOAL, REPORT_TODOS, REPORT_AFTER = 200, 80, 10, 10
+REPORT_TODOS_DONE = 20  # ticked to-dos kept so you can see and untick them; the oldest go first
+ITEM_ID_RE = re.compile(r"P[1-9][0-9]{0,3}")  # a plan item: P1, P2, … never reused within a goal
 REPORT_STALE = 3 * 3600  # a report this much older than the session's last activity may no longer hold
 
 
@@ -1773,6 +1776,21 @@ def _text(v, n):
     return " ".join(v.encode("utf-8", "replace").decode().split())[:n] if isinstance(v, str) else ""
 
 
+def _finite(v):
+    """A timestamp as JSON can hold it: a finite number, not a bool."""
+    try:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def trim_todos(todos):
+    """The newest REPORT_TODOS open to-dos and the REPORT_TODOS_DONE most recently ticked, in list order."""
+    keep = {id(t) for t in [t for t in todos if not t["done_at"]][-REPORT_TODOS:]}
+    keep |= {id(t) for t in sorted((t for t in todos if t["done_at"]), key=lambda t: -t["done_at"])[:REPORT_TODOS_DONE]}
+    return [t for t in todos if id(t) in keep]
+
+
 def sanitize_report(d):
     """A report as the page and the CLI may use it, or None. Files are written by sessions: check everything."""
     if not isinstance(d, dict):
@@ -1781,6 +1799,7 @@ def sanitize_report(d):
     w = d.get("waiting")
     out["waiting"] = w if w in REPORT_WAITING or _http(w) else ""
     out["priority"] = d.get("priority") if d.get("priority") in REPORT_PRIORITY else "normal"
+    out["item"] = d["item"] if isinstance(d.get("item"), str) and ITEM_ID_RE.fullmatch(d["item"]) else ""
     after = d.get("after") if isinstance(d.get("after"), list) else []
     out["after"] = [u for u in after if _http(u)][:REPORT_AFTER]
     todos, seen = [], set()
@@ -1796,14 +1815,11 @@ def sanitize_report(d):
             todos.append({"id": tid, "text": text,
                           "kind": t.get("kind") if t.get("kind") in TODO_KINDS else "",
                           "size": t.get("size") if t.get("size") in TODO_SIZES else "",
-                          "url": t.get("url") if _http(t.get("url")) else ""})
-    out["todos"] = todos[:REPORT_TODOS]
+                          "url": t.get("url") if _http(t.get("url")) else "",
+                          "done_at": t["done_at"] if _finite(t.get("done_at")) and t["done_at"] > 0 else 0})
+    out["todos"] = trim_todos(todos)
     up = d.get("updated")
-    try:
-        finite = isinstance(up, (int, float)) and not isinstance(up, bool) and math.isfinite(up)
-    except OverflowError:  # an int too large for a float
-        finite = False
-    out["updated"] = up if finite else 0  # NaN isn't JSON
+    out["updated"] = up if _finite(up) else 0  # NaN isn't JSON
     return out
 
 
@@ -1843,9 +1859,10 @@ def edit_distance(a, b):
     return prev[-1]
 
 
-def goals_in_use(reports, skip=None, done=frozenset()):
-    """{goal key: [spelling, number of sessions]} over reports of sessions not marked done."""
-    out = {}
+def goals_in_use(reports, skip=None, done=frozenset(), plans=None):
+    """{goal key: [spelling, number of sessions]} over reports of sessions not marked done, and goals with an
+    open plan (a plan's spelling wins: it outlives sessions)."""
+    out = {k: [p["goal"], 0] for k, p in (load_plans() if plans is None else plans).items() if plan_open(p)}
     for sid, r in reports.items():
         if sid != skip and sid not in done and r.get("goal"):
             e = out.setdefault(goal_key(r["goal"]), [r["goal"], 0])
@@ -1888,16 +1905,33 @@ def _update_report(sid, path, changes, add_todo, done_todo):
             changes["goal"] = same[0]  # one spelling per goal
         elif (other := similar_goal(changes["goal"], used)):
             notes.append(f'Did you mean "{other}"? If it\'s the same goal: ccdeck report --goal "{other}"')
+    item = changes.pop("item", None)
+    before = goal_key(cur["goal"])
     cur.update(changes)
+    if item is None and goal_key(cur["goal"]) != before:
+        cur["item"] = ""  # the item belonged to the old goal's plan
+    if item:  # this session works a plan item: the item learns the session, so the link outlives the session's report
+        if not cur["goal"]:
+            raise ValueError("--item needs the session's goal: add --goal")
+        plan = load_plans().get(goal_key(cur["goal"]))
+        if not plan:
+            raise ValueError(f'"{cur["goal"]}" has no plan; see ccdeck plan --goal "{cur["goal"]}"')
+        it = find_item(plan, item)
+        if sid not in it["sessions"]:
+            it["sessions"].append(sid)
+            save_plan(plan)
+        cur["item"] = it["id"]
+    elif item == "":
+        cur["item"] = ""
     if add_todo:
-        cur["todos"].append(dict(add_todo, id=secrets.token_hex(4)))
-        if len(cur["todos"]) > REPORT_TODOS:
-            notes.append(f"Only {REPORT_TODOS} to-dos are kept; the oldest was dropped.")
-            cur["todos"] = cur["todos"][-REPORT_TODOS:]
-    if done_todo is not None:
-        if not 1 <= done_todo <= len(cur["todos"]):
-            raise ValueError(f"no to-do {done_todo}; there are {len(cur['todos'])}")
-        cur["todos"].pop(done_todo - 1)
+        cur["todos"].append(dict(add_todo, id=secrets.token_hex(4), done_at=0))
+        if len(open_todos(cur)) > REPORT_TODOS:
+            notes.append(f"Only {REPORT_TODOS} open to-dos are kept; the oldest was dropped.")
+    if done_todo is not None:  # the session takes back a to-do it gave: gone, not ticked (ticks are yours)
+        todos = open_todos(cur)
+        if not 1 <= done_todo <= len(todos):
+            raise ValueError(f"no to-do {done_todo}; there are {len(todos)}")
+        cur["todos"].remove(todos[done_todo - 1])
     cur["updated"] = time.time()
     report = sanitize_report(cur)
     save_json(path, report)
@@ -1908,22 +1942,279 @@ def done_session_ids():
     return {sid for sid, m in load_json(MARKS_FILE, {}).items() if isinstance(m, dict) and m.get("done")}
 
 
-def remove_todo(sid, tid):
-    """The dashboard's tick: drop the to-do with this id, if it's still there."""
+def open_todos(report):
+    return [t for t in report["todos"] if not t["done_at"]]
+
+
+def tick_todo(sid, tid, done=True):
+    """The dashboard's tick and untick. A ticked to-do stays in the report, with when, so it can be unticked."""
     path = report_file(sid)
     with reports_lock():
         r = load_reports().get(sid)
-        todos = (r or {}).get("todos") or []
-        if not any(t["id"] == tid for t in todos):
+        t = next((t for t in (r or {}).get("todos") or [] if t["id"] == tid), None)
+        if t is None:
             raise ValueError("that to-do changed; reload and try again")
-        r["todos"] = [t for t in todos if t["id"] != tid]
-        save_json(path, r)  # `updated` stays: that's when the session last reported
+        if not done and t["done_at"] and len(open_todos(r)) >= REPORT_TODOS:
+            raise ValueError(f"the session already has {REPORT_TODOS} open to-dos")
+        t["done_at"] = (t["done_at"] or time.time()) if done else 0
+        save_json(path, sanitize_report(r))  # `updated` stays: that's when the session last reported
+
+
+# ----------------------------------------------------------------- plans
+# A goal's plan: work items in priority order. Sessions and the dashboard both write it, under reports_lock.
+# An item's state isn't typed in: it comes from the sessions that work it (`ccdeck report --item P3`) and its PRs.
+
+PLAN_ITEMS, PLAN_AFTER, PLAN_LINKS = 100, 10, 10
+PLAN_STATUS = ("", "blocked", "done", "dropped")  # set by hand; "" is open: its state is derived
+
+
+def plan_file(goal):
+    return GOALS_DIR / (hashlib.sha1(goal_key(goal).encode()).hexdigest()[:12] + ".json")
+
+
+def sanitize_plan(d):
+    """A plan as the page and the CLI may use it, or None. Sessions write these files: check everything."""
+    if not isinstance(d, dict) or not _text(d.get("goal"), REPORT_GOAL):
+        return None
+    items, seen = [], set()
+    for t in d.get("items") if isinstance(d.get("items"), list) else []:
+        if not isinstance(t, dict) or not isinstance(t.get("id"), str) or not ITEM_ID_RE.fullmatch(t["id"]) or t["id"] in seen:
+            continue
+        title = _text(t.get("title"), REPORT_TEXT)
+        if not title:
+            continue
+        seen.add(t["id"])
+        lst = lambda k: t.get(k) if isinstance(t.get(k), list) else []
+        items.append({"id": t["id"], "title": title, "url": t.get("url") if _http(t.get("url")) else "",
+                      "size": t.get("size") if t.get("size") in TODO_SIZES else "", "note": _text(t.get("note"), REPORT_TEXT),
+                      "owner": _text(t.get("owner"), 40), "status": t.get("status") if t.get("status") in PLAN_STATUS else "",
+                      "blocked_on": _text(t.get("blocked_on"), REPORT_TEXT),
+                      "after": [a for a in lst("after") if isinstance(a, str) and ITEM_ID_RE.fullmatch(a)][:PLAN_AFTER],
+                      "prs": [u for u in lst("prs") if _http(u)][:PLAN_LINKS],
+                      "sessions": [x for x in lst("sessions") if isinstance(x, str) and REPORT_ID_RE.fullmatch(x)][-PLAN_LINKS:],
+                      "cwd": t["cwd"] if isinstance(t.get("cwd"), str) and t["cwd"].startswith("/") and len(t["cwd"]) <= 500 else ""})
+    items = items[:PLAN_ITEMS]
+    top = max([int(t["id"][1:]) for t in items] + [0])
+    nid = d.get("next_id")
+    nid = nid if isinstance(nid, int) and not isinstance(nid, bool) and top < nid < 10000 else top + 1
+    return {"goal": _text(d.get("goal"), REPORT_GOAL), "items": items, "next_id": nid,
+            "closed": d["closed"] if _finite(d.get("closed")) and d["closed"] > 0 else 0,
+            "created": d["created"] if _finite(d.get("created")) and d["created"] > 0 else 0}
+
+
+def load_plans():
+    """{goal key: plan}"""
+    out = {}
+    for f in GOALS_DIR.glob("*.json") if GOALS_DIR.is_dir() else []:
+        try:
+            p = sanitize_plan(load_json(f, None))
+        except Exception:
+            continue
+        if p and f.name == plan_file(p["goal"]).name:
+            out[goal_key(p["goal"])] = p
+    return out
+
+
+def save_plan(plan):
+    save_json(plan_file(plan["goal"]), sanitize_plan(plan))
+
+
+def plan_open(plan):
+    """Open until closed, or until every item is done or dropped."""
+    return not plan["closed"] and any(t["status"] not in ("done", "dropped") for t in plan["items"])
+
+
+def find_item(plan, iid):
+    iid = str(iid).upper()
+    for t in plan["items"]:
+        if t["id"] == iid:
+            return t
+    raise ValueError(f'no item {iid} in "{plan["goal"]}"' + (f"; it has {', '.join(t['id'] for t in plan['items'])}" if plan["items"] else ""))
+
+
+def change_plan(goal, fn, create=False):
+    """Run fn(plan) on a goal's plan under the lock and save it. Returns (plan, fn's result)."""
+    with reports_lock():
+        plans = load_plans()
+        plan = plans.get(goal_key(goal))
+        if plan is None:
+            if not create:
+                raise ValueError(f'"{goal}" has no plan; add an item with ccdeck plan add')
+            used = goals_in_use(load_reports(), plans=plans)
+            plan = sanitize_plan({"goal": (used.get(goal_key(goal)) or [goal])[0], "created": time.time()})
+        out = fn(plan)
+        save_plan(plan)
+        return plan, out
+
+
+def plan_add(plan, title, url="", size="", after=(), owner="", note="", at=None, cwd=""):
+    if len(plan["items"]) >= PLAN_ITEMS:
+        raise ValueError(f"a plan holds {PLAN_ITEMS} items; drop or remove done ones first")
+    for a in after:
+        find_item(plan, a)
+    item = {"id": f"P{plan['next_id']}", "title": title, "url": url, "size": size, "after": [a.upper() for a in after],
+            "owner": owner, "note": note, "status": "", "blocked_on": "", "prs": [], "sessions": [], "cwd": cwd}
+    if not _text(title, REPORT_TEXT):
+        raise ValueError("an item needs a title")
+    plan["next_id"] += 1
+    plan["items"].insert(len(plan["items"]) if at is None else max(0, at - 1), item)
+    return item
+
+
+def plan_move(plan, iid, to):
+    item = find_item(plan, iid)
+    plan["items"].remove(item)
+    plan["items"].insert(max(0, min(len(plan["items"]), to - 1)), item)
+    return item
+
+
+def plan_place(plan, iid, target, after):
+    """Move an item just before or after another one."""
+    item, other = find_item(plan, iid), find_item(plan, target)
+    if item is other:
+        raise ValueError("an item can't move next to itself")
+    plan["items"].remove(item)
+    plan["items"].insert(plan["items"].index(other) + after, item)
+    return item
+
+
+ISSUE_IN_URL_RE = re.compile(r"/([A-Za-z][A-Za-z0-9]{0,9}-\d{1,7})(?:[/?#]|$)")
+
+
+def item_key(item):
+    """The ticket key in an item's link (linear.app/…/issue/VOY-12/…, …/browse/VOY-12), or ""."""
+    m = ISSUE_IN_URL_RE.search(item["url"] or "")
+    return m.group(1).upper() if m else ""
+
+
+def mentions_key(text, key):
+    return bool(key) and re.search(rf"(?<![A-Z0-9]){re.escape(key)}(?![0-9])", (text or "").upper()) is not None
+
+
+def item_state(item, prs, sessions, waiting_on):
+    """What the dashboard shows for one plan item: (state, text, who).
+    item: the plan item; item["status"] is what was set by hand: "" (open), "blocked", "done" or "dropped",
+      item["owner"] is "" (you) or someone else's name, item["blocked_on"] says why it's blocked.
+    prs: its PRs, each {"state": "open" | "merged" | "closed", "step": 1-5 (open PRs in the PR plan, else None),
+      "texts": [what the step means, e.g. "Changes requested"]}.
+    sessions: its sessions, newest first, each {"alive": bool, "group": "needs" | "fix" | "yours" | "waiting" | "later" | "done"}
+      (the Sessions view's sections: needs you, PRs to fix, your turn, in progress, set aside, done).
+    waiting_on: ids of the items in item["after"] that aren't done yet.
+    state is one of ITEM_STATES; who is "you", "session", a name, or None.
+    First match wins: dropped; done (marked, or every PR merged); a live session (it would clear a block itself);
+    someone else's; blocked (by hand, or an item it comes after); an open PR; a closed session (paused); queued."""
+    if item["status"] == "dropped":
+        return "dropped", "", None
+    if item["status"] == "done":
+        return "done", "Marked done", None
+    merged = [p for p in prs if p["state"] == "merged"]
+    if merged and all(p["state"] != "open" for p in prs):  # a closed, unmerged PR was given up on: it doesn't hold the item open
+        return "done", (plural(len(merged), "PR") + " merged") if len(merged) > 1 else "PR merged", None
+    live = [s for s in sessions if s["alive"]]
+    if live:
+        if any(s["group"] in ("needs", "yours") for s in live):
+            return "you", "", "you"  # the chip says it; the line shows the session's next step
+        if any(p["state"] == "open" for p in prs):
+            return pr_item_state(prs, live=True)
+        return "working", "", "session"
+    if item["owner"]:
+        return "theirs", "", item["owner"]  # the row shows who
+    if item["status"] == "blocked":
+        return "blocked", item["blocked_on"] or "Marked blocked", None
+    if waiting_on:
+        return "blocked", "After " + ", ".join(waiting_on), None
+    if any(p["state"] == "open" for p in prs):
+        return pr_item_state(prs, live=False)
+    if sessions:
+        return "paused", "Its session is closed: resume it", "you"
+    return "queued", "", None
+
+
+def pr_item_state(prs, live):
+    """An item's state from its most urgent open PR: something to fix, then to merge, then waiting."""
+    urgency = {2: 0, 5: 1, 1: 2, 4: 3, None: 4}
+    p = min((p for p in prs if p["state"] == "open"), key=lambda p: urgency.get(p["step"], 4))
+    text = "; ".join(p["texts"])
+    if p["step"] in (2, 5):
+        return "fix", text or "Fix the PR", "session" if live and p["step"] == 2 else "you"
+    if p["step"] == 1:
+        return "merge", text or "Merge it", "you"
+    return "review", text or "Waiting for review or CI", "session" if live else None
+
+
+ITEM_STATES = {  # state: (label, colour as the page names the Sessions view's sections)
+    "queued": ("Queued", "closed"), "working": ("Working", "work"), "you": ("Waiting for you", "need"),
+    "fix": ("Fix the PR", "pr"), "review": ("In review", "work"), "merge": ("Ready to merge", "turn"),
+    "paused": ("Paused", "closed"), "blocked": ("Blocked", "closed"), "theirs": ("Someone else's", "work"),
+    "done": ("Done", "done"), "dropped": ("Dropped", "done"),
+}
+
+
+def plan_view(plan, sessions, plan_rows, cache=None):
+    """A plan's items in order, each with its PRs, sessions and derived state."""
+    cache = pr_cache() if cache is None else cache
+    gk = goal_key(plan["goal"])
+    by_sid = {s["id"]: s for s in sessions}
+    rows = {pr_key(r["url"]): r for r in plan_rows if r.get("step") != 3}
+    keys = {t["id"]: item_key(t) for t in plan["items"]}
+    known = {}  # PRs the items could own: the plan's open PRs, and the PRs sessions own (with merged or closed state)
+    for r in rows.values():
+        known[pr_key(r["url"])] = {"url": r["url"], "number": r.get("number"), "title": r.get("title") or "", "head": r.get("head") or "",
+                                   "state": "open", "step": r["step"], "texts": r.get("texts") or []}
+    owner = {}
+    for s in sessions:
+        for d in s.get("pr_details") or []:
+            if d.get("own"):
+                k = pr_key(d["url"])
+                known.setdefault(k, {"url": d["url"], "number": d.get("number"), "title": d.get("title") or "", "head": d.get("head") or "",
+                                     "state": d.get("state") or "open", "step": None, "texts": []})
+                owner.setdefault(k, s["id"])
+    by_hand = {pr_key(u) for t in plan["items"] for u in t["prs"]}  # a PR given to an item with --pr is that item's only
+    by_key_match = {k: None if k in by_hand else next((iid for iid, key in keys.items() if mentions_key(p["title"] + " " + p["head"], key)), None)
+                    for k, p in known.items()}
+    found = []
+    for t in plan["items"]:
+        linked = [by_sid[x] for x in reversed(t["sessions"]) if x in by_sid
+                  and goal_key(((by_sid[x].get("report") or {}).get("goal")) or "") == gk and (by_sid[x].get("report") or {}).get("item") == t["id"]]
+        mine = {pr_key(u) for u in t["prs"]}
+        mine |= {k for k, iid in by_key_match.items() if iid == t["id"]}
+        mine |= {k for k, sid in owner.items() if by_key_match[k] is None and k not in by_hand and any(s["id"] == sid for s in linked)}
+        prs = []
+        for k in sorted(mine):
+            p = known.get(k)
+            if p is None:  # added by hand and not one of yours: the cache has its state
+                info = pr_info(next(u for u in t["prs"] if pr_key(u) == k), cache)
+                p = {"url": info["url"], "number": info.get("number"), "title": info.get("title") or "", "head": info.get("head") or "",
+                     "state": info.get("state") or "open", "step": None, "texts": []}
+            prs.append(p)
+        found.append((t, linked, prs))
+    # done as item_state sees it: marked, or every PR merged; an item after it waits until then
+    done_ids = {t["id"] for t, _, prs in found if t["status"] in ("done", "dropped")
+                or (any(p["state"] == "merged" for p in prs) and not any(p["state"] == "open" for p in prs))}
+    out = []
+    for rank, (t, linked, prs) in enumerate(found, 1):
+        waiting_on = [a for a in t["after"] if a not in done_ids]
+        state, text, who = item_state(t, prs, [{"alive": bool(s.get("alive")), "group": s.get("group")} for s in linked], waiting_on)
+        if state not in ITEM_STATES:
+            state = "queued"
+        nxt = next(((s.get("report") or {}).get("next") for s in linked if (s.get("report") or {}).get("next")), "")
+        out.append(dict(t, rank=rank, state=state, text=text, who=who, next=nxt, waiting_on=waiting_on,
+                        prs=[{k: p[k] for k in ("url", "number", "title", "state", "step")} for p in prs],
+                        sessions=[s["id"] for s in linked], start=start_command(plan["goal"], t)))
+    return out
+
+
+def start_command(goal, item):
+    """What "Start" copies: a new Claude session told which item it works."""
+    prompt = (f'Work on {item["id"]} of the goal "{goal}": {item["title"]}' + (f' {item["url"]}' if item["url"] else "")
+              + f'. First tell ccdeck: ccdeck report --goal "{goal}" --item {item["id"]}')
+    return (f"cd {shlex.quote(item['cwd'])} && " if item["cwd"] else "") + "claude " + shlex.quote(prompt)
 
 
 PRIORITY_RANK = {p: i for i, p in enumerate(REPORT_PRIORITY)}
 
 
-def goal_board(sessions, plan_rows, now=None):
+def goal_board(sessions, plan_rows, now=None, plans=None, cache=None):
     """Goals from session reports: each with its sessions, their open PRs, to-dos for you and a summary.
     Open goals first, by priority, then by their oldest open item; sessions that reported no goal last."""
     now = now or time.time()
@@ -1938,20 +2229,23 @@ def goal_board(sessions, plan_rows, now=None):
             continue
         key = goal_key(rep["goal"])
         g = goals.setdefault(key, {"key": key, "goal": rep["goal"] or "Other", "other": not key, "sessions": [], "prs": [],
-                                   "todos": [], "priority": "low", "since": None, "last": 0, "open": False})
+                                   "todos": [], "todos_done": [], "priority": "low", "since": None, "last": 0, "open": False})
         g["last"] = max(g["last"], rep["updated"])
         done = (s.get("mark") or {}).get("done") or s.get("group") == "done"
         g["sessions"].append({"id": s["id"], "done": bool(done)})
         prs = by_owner.get(s["id"], [])
         g["prs"] += [{"url": p["url"], "step": p["step"]} for p in prs]
-        todos = [] if done else [dict(t, sid=s["id"]) for t in rep["todos"]]
+        todos = [] if done else [dict(t, sid=s["id"]) for t in rep["todos"] if not t["done_at"]]
         g["todos"] += todos
+        g["todos_done"] += [] if done else [dict(t, sid=s["id"]) for t in rep["todos"] if t["done_at"]]
         if not done:
             if PRIORITY_RANK[rep["priority"]] < PRIORITY_RANK[g["priority"]]:
                 g["priority"] = rep["priority"]
             g["since"] = min([x for x in (g["since"], rep["updated"] or now) if x is not None] + [p["updated"] for p in prs])
         g["open"] = g["open"] or bool(prs or todos or (not done and s.get("alive")))
     for g in goals.values():
+        g["todos_done"].sort(key=lambda t: -t["done_at"])  # the latest tick first
+        g["plan"] = []
         if g["since"] is None:  # only done sessions: their last report, not the clock (it would change every snapshot)
             g["since"] = g["last"]
         del g["last"]
@@ -1962,6 +2256,23 @@ def goal_board(sessions, plan_rows, now=None):
         if g["todos"]:
             parts.append(plural(len(g["todos"]), "to-do") + " for you")
         g["summary"] = ", ".join(parts) or ("Done" if not g["open"] else "Sessions working")
+    for key, plan in (load_plans() if plans is None else plans).items():
+        g = goals.get(key)
+        if g is None:
+            if plan["closed"]:
+                continue
+            g = goals[key] = {"key": key, "goal": plan["goal"], "other": False, "sessions": [], "prs": [], "todos": [], "todos_done": [],
+                              "priority": "normal", "since": None, "open": False, "summary": ""}
+        g["goal"] = plan["goal"]  # the plan's spelling
+        g["plan"] = plan_view(plan, sessions, plan_rows, cache)
+        left = [t for t in g["plan"] if t["state"] not in ("done", "dropped")]
+        g["open"] = g["open"] or (plan_open(plan) and bool(left))
+        if g["since"] is None:  # a stable time, not the clock: the snapshot shouldn't change by itself
+            g["since"] = plan["created"]
+        counted = [t for t in g["plan"] if t["state"] != "dropped"]
+        if counted:
+            done = len(counted) - len([t for t in left if t["state"] != "dropped"])
+            g["summary"] = f"{done}/{len(counted)} done" + (", " + g["summary"] if g["summary"] and g["summary"] not in ("Done", "Sessions working") else "")
     return sorted(goals.values(), key=lambda g: (not g["open"], g["other"], PRIORITY_RANK[g["priority"]], g["since"]))
 
 
@@ -1978,10 +2289,11 @@ def report_session_id():
 
 def format_report(r):
     lines = [f"next: {r['next'] or '—'}", f"waiting: {r['waiting'] or '—'}", f"priority: {r['priority']}",
-             f"goal: {r['goal'] or '—'}"]
+             f"goal: {r['goal'] or '—'}"] + ([f"item: {r['item']}"] if r["item"] else [])
     lines += [f"after: {u}" for u in r["after"]]
     lines += [f"to-do {i}: {t['text']}" + "".join(f"  [{x}]" for x in (t["kind"], t["size"], t["url"]) if x)
-              for i, t in enumerate(r["todos"], 1)]
+              for i, t in enumerate(open_todos(r), 1)]
+    lines += [f"done by the user: {t['text']}" for t in r["todos"] if t["done_at"]]
     return "\n".join(lines)
 
 
@@ -2003,7 +2315,7 @@ def cmd_report(args):
                 path.unlink(missing_ok=True)
             print("Report cleared.")
             return
-        changes = {k: getattr(args, k) for k in ("next", "waiting", "priority", "goal", "after") if getattr(args, k) is not None}
+        changes = {k: getattr(args, k) for k in ("next", "waiting", "priority", "goal", "after", "item") if getattr(args, k) is not None}
         if changes.get("waiting") and changes["waiting"] not in REPORT_WAITING and not _http(changes["waiting"]):
             raise ValueError("--waiting is you, ci, review, session or a URL")
         bad = [u for u in changes.get("after") or [] if not _http(u)]
@@ -2654,6 +2966,7 @@ class Dashboard:
             "default_days": DEFAULT_DAYS, "port": self.port, "gh_install": GH_INSTALL, "preview": PREVIEW,
             "reviews": review_requests(sessions), "settings": settings_view(),
             "notifications": inbox_items(), "plan": pr_plan(sessions),
+            "item_states": {k: {"label": l, "g": g} for k, (l, g) in ITEM_STATES.items()},
         }
         snap["goals"] = goal_board(sessions, snap["plan"]["rows"])
         etag = hashlib.sha1(json.dumps(snap, sort_keys=True).encode()).hexdigest()[:16]
@@ -2748,6 +3061,7 @@ class Dashboard:
                 for s in sessions:
                     if s["group"] != "done" or time.time() - s["last_ts"] < 2 * 86400:
                         urls.extend(p["url"] for p in s["pr_details"])
+                urls += [u for p in load_plans().values() if plan_open(p) for t in p["items"] for u in t["prs"]]  # PRs given by hand
                 if urls and refresh_prs(list(dict.fromkeys(urls))):
                     self.wake.set()
             except Exception as e:
@@ -2771,6 +3085,21 @@ class Dashboard:
                 return 400, {"error": str(e)}
             self.refresh()
             return 200, {"ok": True, "settings": settings_view()}
+        if action == "plan_item":  # the Goals view: move, done or reopen an item of a goal's plan
+            goal, iid, op = body.get("goal"), body.get("item"), body.get("op")
+            target = body.get("target")  # the item next to it on the page: done ones in between may be hidden
+            ops = {"up": lambda p: plan_place(p, iid, target, after=False),
+                   "down": lambda p: plan_place(p, iid, target, after=True),
+                   "done": lambda p: find_item(p, iid).update(status="done"),
+                   "reopen": lambda p: find_item(p, iid).update(status="")}
+            if not (isinstance(goal, str) and isinstance(iid, str) and op in ops):
+                return 400, {"error": "plan_item takes a goal, an item and an op"}
+            try:
+                change_plan(goal, ops[op])
+            except ValueError as e:
+                return 409, {"error": str(e)}
+            self.refresh()
+            return 200, {"ok": True}
         if action in ("dismiss", "dismiss_all"):
             for d in inbox_items():
                 if action == "dismiss_all" or d["id"] == body.get("nid"):
@@ -2784,11 +3113,11 @@ class Dashboard:
         if action in ("done", "undone", "park", "unpark", "note"):
             text = body.get("text")
             apply_action(sid, action, text if isinstance(text, str) else None)
-        elif action == "todo_done":
+        elif action in ("todo_done", "todo_undone"):
             try:
                 if not isinstance(body.get("todo"), str):
-                    raise ValueError("todo_done takes the to-do's id")
-                remove_todo(sid, body["todo"])
+                    raise ValueError(f"{action} takes the to-do's id")
+                tick_todo(sid, body["todo"], done=action == "todo_done")
             except ValueError as e:
                 return 409, {"error": str(e)}
         elif action == "focus":
@@ -3064,8 +3393,6 @@ def cmd_prs(args):
     sessions = collect(include_all=True, days=10 ** 6)
     assembled = pr_plan(sessions, saved=dict(plan, fetched=time.time()) if plan is not None else {}, reviews=items or [])
     rows = assembled["rows"]
-    names = {s["id"]: "@" + s["peer_name"] if s.get("peer_name") else s["id"][:8] for s in sessions}
-    todos = [(g["goal"], t) for g in goal_board(sessions, rows) for t in g["todos"]]
     if assembled["truncated"]:
         print("Warning: authored PRs limited to the first 100 results; stack targets may be missing.", file=sys.stderr)
     if args.sessions:
@@ -3073,11 +3400,6 @@ def cmd_prs(args):
     width = shutil.get_terminal_size((120, 20)).columns
     if not rows:
         print("No available PR data." if unavailable else "No open PRs.")
-    if todos:
-        print("\n" + bold("To do for you") + dim(f"  {len(todos)}"))
-        for goal, td in todos:
-            print(f"  {one_line(td['text'], max(20, width - 30))}")
-            print(dim("      " + " · ".join(x for x in (goal, td["kind"], td["size"], names.get(td["sid"], td["sid"][:8]), td["url"]) if x)))
     for step, label in PR_STEPS.items():
         part = [r for r in rows if r["step"] == step]
         if not part:
@@ -3088,6 +3410,126 @@ def cmd_prs(args):
             print(f"  {r['repo']}#{r['number']}  {one_line(r['title'], max(20, width - 70))}")
             print(dim("      " + " · ".join(r["texts"]) + (f"  → {who}" if who else "")
                       + (f"  [@{s['name']}]" if s and s["name"] != who else "")))
+
+
+def format_plan_item(t, width=120):
+    """One item: rank, id, title, then what it is, in dim. t is a plan item, or one from plan_view (with state)."""
+    st = ITEM_STATES[t["state"]][0] + (f": {t['text']}" if t.get("text") else "") if t.get("state") else (t["status"] or "open")
+    raw = not t.get("state")  # a stored item, without the state that already says why it's blocked
+    meta = [st, t["size"], t["owner"] and f"owner: {t['owner']}", raw and t["after"] and "after " + ", ".join(t["after"]),
+            raw and t["status"] == "blocked" and t["blocked_on"] and f"blocked on: {t['blocked_on']}", t.get("next") and f"next: {t['next']}", t["url"]]
+    return f"  {t['id']:<5} {one_line(t['title'], max(20, width - 10))}\n" + dim("        " + " · ".join(x for x in meta if x))
+
+
+def plan_goal(args):
+    """--goal, or the goal of the session running the command."""
+    if args.goal:
+        return args.goal
+    sid = report_session_id()
+    goal = (load_reports().get(sid) or {}).get("goal") if sid else ""
+    if not goal:
+        sys.exit('Which goal? Pass --goal "…" (ccdeck report --goals lists them).')
+    return goal
+
+
+def cmd_plan(args):
+    goal = plan_goal(args)
+    width = shutil.get_terminal_size((120, 20)).columns
+    op = args.op
+    try:
+        if op in (None, "show"):
+            sessions = collect(include_all=True, days=10 ** 6)
+            plan = load_plans().get(goal_key(goal))
+            if not plan:
+                print(f'"{goal}" has no plan yet. Add items: ccdeck plan --goal "{goal}" add "Title" --url …')
+                return
+            for t in plan_view(plan, sessions, pr_plan(sessions)["rows"]):
+                print(format_plan_item(t, width))
+            return
+        if op == "add":
+            def fn(p):
+                p["closed"] = 0
+                return plan_add(p, args.title, url=args.url or "", size=args.size or "", after=args.after or [],
+                                owner=args.owner or "", note=args.note or "", at=args.at, cwd=os.getcwd())
+            if args.url and not _http(args.url):
+                raise ValueError("--url must be an http(s) URL")
+            plan, item = change_plan(goal, fn, create=True)
+            print(f"Added {item['id']}.")
+        elif op == "move":
+            plan, _ = change_plan(goal, lambda p: plan_move(p, args.item, args.to))
+        elif op in ("done", "drop", "reopen"):
+            status = {"done": "done", "drop": "dropped", "reopen": ""}[op]
+            plan, _ = change_plan(goal, lambda p: find_item(p, args.item).update(status=status))
+        elif op == "set":
+            if args.pr and not all(_http(u) for u in args.pr):
+                raise ValueError("--pr takes PR URLs")
+            def fn(p):
+                t = find_item(p, args.item)
+                for a in args.after or []:
+                    if a.upper() == t["id"]:
+                        raise ValueError("an item can't come after itself")
+                    find_item(p, a)
+                if args.title is not None and not _text(args.title, REPORT_TEXT):
+                    raise ValueError("an item needs a title")
+                if args.url and not _http(args.url):
+                    raise ValueError("--url must be an http(s) URL")
+                for k in ("title", "url", "size", "owner", "note"):
+                    if getattr(args, k) is not None:
+                        t[k] = getattr(args, k)
+                if args.after is not None:
+                    t["after"] = [a.upper() for a in args.after]
+                if args.pr:
+                    t["prs"] = list(dict.fromkeys(t["prs"] + args.pr))
+                if args.blocked is not None:
+                    t["status"], t["blocked_on"] = "blocked", args.blocked
+                if args.unblock and t["status"] == "blocked":
+                    t["status"], t["blocked_on"] = "", ""
+            plan, _ = change_plan(goal, fn)
+        elif op == "close":
+            plan, _ = change_plan(goal, lambda p: p.update(closed=time.time()))
+            print(f'Closed "{plan["goal"]}".')
+            return
+    except ValueError as e:
+        sys.exit(str(e))
+    print(dim(f'{plan["goal"]}  ({plural(len(plan["items"]), "item")})'))
+    for t in plan["items"]:
+        print(format_plan_item(t, width))
+
+
+def cmd_goals(args):
+    """Goals as the dashboard's Goals view has them: summary, sessions and their next steps, your to-dos.
+    PR steps come from the dashboard's last GitHub fetch: no network here."""
+    sessions = collect(include_all=True, days=10 ** 6)
+    by_id = {s["id"]: s for s in sessions}
+    name = lambda sid: "@" + by_id[sid]["peer_name"] if by_id.get(sid, {}).get("peer_name") else sid[:8]
+    board = [g for g in goal_board(sessions, pr_plan(sessions)["rows"]) if g["open"] or args.all]
+    width = shutil.get_terminal_size((120, 20)).columns
+    if not board:
+        print("No open goals." if not args.all else "No goals yet.")
+        print(dim('Sessions report what they work toward with ccdeck report --goal "Ship 1.2".'))
+    for g in board:
+        prio = f"  {g['priority']}" if g["open"] and g["priority"] != "normal" else ""
+        print("\n" + bold(g["goal"]) + dim(prio + "  " + g["summary"]))
+        items = [t for t in g["plan"] if args.all or t["state"] not in ("done", "dropped")]
+        if items:
+            print("  " + bold("Plan"))
+        for t in items:
+            print("  " + format_plan_item(t, width - 2).replace("\n", "\n  "))
+        for x in g["sessions"]:
+            s, rep = by_id.get(x["id"]) or {}, (by_id.get(x["id"]) or {}).get("report") or {}
+            if x["done"] and not args.all:
+                continue
+            print(f"  {name(x['id']):<10} {one_line(title_of(s) if s else '', max(20, width - 16))}")
+            if rep.get("next"):
+                print(dim(f"             next: {one_line(rep['next'], max(20, width - 20))}"))
+        todos = g["todos"] + (g["todos_done"] if args.done else [])
+        if todos:
+            print("  " + bold("To do for you"))
+        for td in todos:
+            print(f"    [{'x' if td['done_at'] else ' '}] {one_line(td['text'], max(20, width - 10))}")
+            print(dim("        " + " · ".join(x for x in (td["kind"], td["size"], name(td["sid"]), td["url"]) if x)))
+        if g["todos_done"] and not args.done:
+            print(dim(f"    {plural(len(g['todos_done']), 'done to-do')} hidden (--done)"))
 
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -4174,12 +4616,43 @@ def main():
     s.add_argument("text", nargs="*")
     s = sub.add_parser("prs", help="your open PRs in steps: merge, fix, review, wait, clean up")
     s.add_argument("--sessions", action="store_true", help="only PRs one of your sessions owns, plus review requests")
+    s = sub.add_parser("goals", help="what sessions work toward: each goal's sessions, next steps and to-dos for you")
+    s.add_argument("--all", action="store_true", help="also done goals and done sessions")
+    s.add_argument("--done", action="store_true", help="also the to-dos you marked done")
+    s = sub.add_parser("plan", help="a goal's plan: work items in priority order, with the state of each (sessions use it)")
+    s.add_argument("--goal", help="the goal (default: the goal this session reported)")
+    ps = s.add_subparsers(dest="op")
+    ps.add_parser("show", help="the items with their states (the default)")
+    a = ps.add_parser("add", help="add an item (at the end, or --at N)")
+    a.add_argument("title")
+    for k, h in (("--url", "its ticket or issue"), ("--owner", "someone else who took it"), ("--note", "a line about it")):
+        a.add_argument(k, help=h)
+    a.add_argument("--size", choices=TODO_SIZES)
+    a.add_argument("--after", action="append", metavar="ID", help="an item that must be done first (repeat)")
+    a.add_argument("--at", type=int, metavar="N", help="its place, 1 = first")
+    a = ps.add_parser("move", help="move an item to place N")
+    a.add_argument("item")
+    a.add_argument("--to", type=int, required=True, metavar="N")
+    for name, hlp in (("done", "mark an item done (one with a PR is done when the PR merges)"), ("drop", "drop an item"),
+                      ("reopen", "reopen a done or dropped item")):
+        ps.add_parser(name, help=hlp).add_argument("item")
+    a = ps.add_parser("set", help="change an item")
+    a.add_argument("item")
+    for k in ("--title", "--url", "--owner", "--note"):
+        a.add_argument(k)
+    a.add_argument("--size", choices=TODO_SIZES)
+    a.add_argument("--after", action="append", metavar="ID", help="replaces the list; repeat for each")
+    a.add_argument("--pr", action="append", metavar="URL", help="a PR for this item, when ccdeck can't tell (repeat)")
+    a.add_argument("--blocked", metavar="WHY", help="mark it blocked")
+    a.add_argument("--unblock", action="store_true")
+    ps.add_parser("close", help="close the plan: the goal leaves the board")
     s = sub.add_parser("report", help="run by a session: its next step, what it waits on, its goal and to-dos for you")
     s.add_argument("--next", help="the next step, one line")
     s.add_argument("--waiting", help="who it waits on: you, ci, review, session (it's working), or a URL")
     s.add_argument("--priority", choices=REPORT_PRIORITY)
     s.add_argument("--goal", help='what the work is for, e.g. "Ship 0.7.4"; see --goals first ("" clears it)')
     s.add_argument("--after", action="append", metavar="URL", help="a PR or issue that must land first (repeat; replaces the list)")
+    s.add_argument("--item", metavar="ID", help='the item of the goal\'s plan this session works, e.g. P3 ("" clears it)')
     s.add_argument("--todo", metavar="TEXT", help="add something only the user can do")
     s.add_argument("--kind", choices=TODO_KINDS, help="of the --todo")
     s.add_argument("--size", choices=TODO_SIZES, help="of the --todo")
@@ -4225,7 +4698,7 @@ def main():
     args = p.parse_args()
 
     handlers = {
-        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "report": cmd_report, "show": cmd_show, "resume": cmd_resume,
+        None: cmd_list, "list": cmd_list, "prs": cmd_prs, "goals": cmd_goals, "plan": cmd_plan, "report": cmd_report, "show": cmd_show, "resume": cmd_resume,
         "done": cmd_mark("done"), "undone": cmd_mark("undone"), "park": cmd_mark("park"),
         "unpark": cmd_mark("unpark"), "note": cmd_mark("note"), "serve": cmd_serve,
         "open": cmd_open, "install": cmd_install, "approvals": cmd_approvals, "review-requests": cmd_review_requests, "notifications": cmd_notifications, "uninstall": cmd_uninstall, "hook": cmd_hook,

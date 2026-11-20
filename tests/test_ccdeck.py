@@ -3,8 +3,11 @@
 Each test class gets a throwaway HOME with synthetic Claude Code transcripts and a
 fake `gh` on PATH, so nothing touches your real ~/.claude.
 """
+import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -801,6 +804,8 @@ class ReportTest(unittest.TestCase):
     def setUp(self):
         shutil.rmtree(cc.REPORTS_DIR, ignore_errors=True)
         self.addCleanup(shutil.rmtree, cc.REPORTS_DIR, True)
+        shutil.rmtree(cc.GOALS_DIR, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, cc.GOALS_DIR, True)
         marks = mock.patch.object(cc, "done_session_ids", lambda: set())
         marks.start()
         self.addCleanup(marks.stop)
@@ -855,7 +860,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((r["waiting"], r["priority"], r["goal"], r["updated"]), ("", "normal", "", 0))
         self.assertEqual(r["after"], ["https://github.com/a/b/pull/1"] * 5)
         self.assertEqual(len(r["todos"]), cc.REPORT_TODOS)
-        self.assertEqual(dict(r["todos"][0], id=None), {"id": None, "text": "t0", "kind": "", "size": "", "url": ""})
+        self.assertEqual(dict(r["todos"][0], id=None), {"id": None, "text": "t10", "kind": "", "size": "", "url": "", "done_at": 0})  # the newest
         self.assertRegex(r["todos"][0]["id"], "^[0-9a-f]{8}$")  # a file without ids gets stable ones
         self.assertEqual(r["todos"], cc.sanitize_report({"todos": r["todos"]})["todos"])
         self.assertEqual(cc.sanitize_report({"updated": float("nan")})["updated"], 0)  # NaN would break the API's JSON
@@ -863,6 +868,10 @@ class ReportTest(unittest.TestCase):
         odd = cc.sanitize_report({"todos": [{"text": "Check \ud800", "id": "0000aaaa"}, {"text": "Other", "id": "0000aaaa"}]})
         self.assertEqual(odd["todos"][0]["text"], "Check ?")  # an unpaired surrogate
         self.assertEqual(len({x["id"] for x in odd["todos"]}), 2)  # a repeated id is made unique
+        ticked = cc.sanitize_report({"todos": [{"text": "d%d" % i, "done_at": 1000 + i} for i in range(30)]
+                                     + [{"text": "o", "done_at": x} for x in (True, float("inf"), -5, "1")]})
+        self.assertEqual([t["text"] for t in ticked["todos"] if t["done_at"]], ["d%d" % i for i in range(10, 30)])  # the latest ticks
+        self.assertEqual(len(cc.open_todos(ticked)), 4)  # a done_at that isn't a time is open
         cc.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         (cc.REPORTS_DIR / "not.a-session.json").write_text('{"next": "x"}')
         (cc.REPORTS_DIR / (self.A + ".json")).write_text("not json")
@@ -873,16 +882,212 @@ class ReportTest(unittest.TestCase):
             cc.update_report(self.A, {}, {"text": "Check it", "kind": "", "size": "", "url": url})
         first, second = cc.load_reports()[self.A]["todos"]
         self.assertNotEqual(first["id"], second["id"])
-        cc.remove_todo(self.A, first["id"])
+        cc.tick_todo(self.A, first["id"])
+        cc.tick_todo(self.A, first["id"])  # a repeated click keeps it ticked, and the other one open
+        ticked, still = cc.load_reports()[self.A]["todos"]
+        self.assertEqual((ticked["id"], still), (first["id"], second))
+        self.assertGreater(ticked["done_at"], 0)
         with self.assertRaises(ValueError):
-            cc.remove_todo(self.A, first["id"])  # a repeated click doesn't take the other one
-        self.assertEqual(cc.load_reports()[self.A]["todos"], [second])
+            cc.tick_todo(self.A, "0000ffff")
+        cc.tick_todo(self.A, first["id"], done=False)
+        self.assertEqual(cc.load_reports()[self.A]["todos"], [first, second])
+
+    def test_ticked_todos_dont_count(self):
+        add = lambda text: cc.update_report(self.A, {}, {"text": text, "kind": "", "size": "", "url": ""})
+        add("first")
+        cc.tick_todo(self.A, cc.load_reports()[self.A]["todos"][0]["id"])
+        for i in range(cc.REPORT_TODOS):
+            rep, notes = add("t%d" % i)
+        self.assertEqual((len(rep["todos"]), notes), (cc.REPORT_TODOS + 1, []))  # ten open and the ticked one
+        with self.assertRaises(ValueError):  # unticking would make eleven open
+            cc.tick_todo(self.A, rep["todos"][0]["id"], done=False)
+        self.assertIn("1: t0", cc.format_report(rep))  # --done N counts open to-dos
+        self.assertIn("done by the user: first", cc.format_report(rep))
+        rep, _ = cc.update_report(self.A, {}, done_todo=1)
+        self.assertEqual([t["text"] for t in rep["todos"]][:2], ["first", "t1"])  # the session's --done removes; your tick stays
+        rep, notes = add("t10")
+        rep, notes = add("t11")
+        self.assertIn("oldest was dropped", notes[0])
+        self.assertEqual([t["text"] for t in rep["todos"]][:2], ["first", "t2"])
+
+    def test_goals_command(self):
+        cc.update_report(self.A, {"goal": "Ship 1.2", "next": "Waiting for the review"},
+                         {"text": "Check the preview", "kind": "validate", "size": "small", "url": ""})
+        cc.update_report(self.A, {}, {"text": "Tag the release", "kind": "", "size": "", "url": ""})
+        cc.tick_todo(self.A, cc.load_reports()[self.A]["todos"][1]["id"])
+        sessions = [{"id": self.A, "alive": True, "title": "Release 1.2", "report": cc.load_reports()[self.A]}]
+        out = io.StringIO()
+        with mock.patch.object(cc, "collect", lambda **kw: sessions), mock.patch.object(cc, "pr_plan", lambda s: {"rows": []}), \
+                contextlib.redirect_stdout(out):
+            cc.cmd_goals(argparse.Namespace(all=False, done=False))
+            cc.cmd_goals(argparse.Namespace(all=False, done=True))
+        first, second = out.getvalue().split("Ship 1.2")[1:]
+        self.assertIn("next: Waiting for the review", first)
+        self.assertIn("[ ] Check the preview", first)
+        self.assertNotIn("Tag the release", first)
+        self.assertIn("1 done to-do hidden (--done)", first)
+        self.assertIn("[x] Tag the release", second)
+
+    def run_plan(self, *args, sid=None):
+        env = dict(os.environ, CLAUDE_CODE_SESSION_ID=sid or self.A)
+        return subprocess.run([sys.executable, str(ROOT / "ccdeck"), "plan", *args], capture_output=True, text=True, env=env, timeout=30)
+
+    def test_plan_commands(self):
+        G = ("--goal", "Fix DC bugs")
+        r = self.run_plan(*G, "add", "Wrong vesting date", "--url", "https://linear.app/acme/issue/VOY-12/vesting", "--size", "small")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Added P1.", r.stdout)
+        self.run_plan(*G, "add", "Rounding in exports", "--after", "P1")
+        self.run_plan(*G, "add", "Copy for the banner", "--at", "1")
+        plan = cc.load_plans()["fix dc bugs"]
+        self.assertEqual([t["id"] for t in plan["items"]], ["P3", "P1", "P2"])
+        self.assertEqual((plan["items"][2]["after"], plan["items"][1]["size"]), (["P1"], "small"))
+        self.assertTrue(plan["items"][0]["cwd"].startswith("/"))  # where Start opens the session
+        self.run_plan(*G, "move", "p2", "--to", "1")
+        self.run_plan(*G, "set", "P3", "--blocked", "client copy", "--owner", "Dana", "--pr", PR.format(5))
+        self.run_plan(*G, "drop", "P1")
+        plan = cc.load_plans()["fix dc bugs"]
+        self.assertEqual([t["id"] for t in plan["items"]], ["P2", "P3", "P1"])
+        p3 = plan["items"][1]
+        self.assertEqual((p3["status"], p3["blocked_on"], p3["owner"], p3["prs"]), ("blocked", "client copy", "Dana", [PR.format(5)]))
+        self.assertEqual(plan["items"][2]["status"], "dropped")
+        for bad, msg in ((["move", "P9", "--to", "1"], "no item P9"), (["set", "P2", "--after", "P2"], "after itself"),
+                         (["add", "x", "--after", "P7"], "no item P7"), (["add", "x", "--url", "ftp://x"], "--url must"),
+                         (["set", "P2", "--pr", "nope"], "--pr takes"), (["set", "P2", "--title", " "], "needs a title")):
+            with self.subTest(bad=bad):
+                r = self.run_plan(*G, *bad)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(msg, r.stderr)
+        self.assertIn("has no plan", self.run_plan("--goal", "Other goal", "done", "P1").stderr)
+        self.assertIn("Which goal?", self.run_plan("done", "P1").stderr)  # this session reported no goal
+        cc.update_report(self.A, {"goal": "fix dc bugs"})
+        self.assertEqual(cc.load_reports()[self.A]["goal"], "Fix DC bugs")  # the plan's spelling
+        self.assertEqual(self.run_plan("done", "P2").returncode, 0)  # the session's goal
+        self.assertEqual(cc.load_plans()["fix dc bugs"]["items"][0]["status"], "done")
+        self.assertIn("Fix DC bugs", self.run_report("--goals").stdout)  # a goal with a plan is in use
+        self.assertIn("Closed", self.run_plan(*G, "close").stdout)
+        self.assertNotIn("Fix DC bugs", cc.goals_in_use({}))
+
+    def test_report_item(self):
+        cc.change_plan("Ship 2.0", lambda p: cc.plan_add(p, "Migrate the queue"), create=True)
+        with self.assertRaises(ValueError):
+            cc.update_report(self.A, {"item": "P1"})  # no goal yet
+        with self.assertRaises(ValueError):
+            cc.update_report(self.A, {"goal": "Ship 2.0", "item": "P4"})
+        rep, _ = cc.update_report(self.A, {"goal": "Ship 2.0", "item": "p1"})
+        self.assertEqual(rep["item"], "P1")
+        cc.update_report(self.A, {"item": "P1"})
+        self.assertEqual(cc.load_plans()["ship 2.0"]["items"][0]["sessions"], [self.A])  # once
+        self.assertIn("item: P1", cc.format_report(rep))
+        self.assertEqual(cc.update_report(self.A, {"item": ""})[0]["item"], "")
+        cc.update_report(self.A, {"item": "P1"})
+        self.assertEqual(cc.update_report(self.A, {"goal": "ship  2.0"})[0]["item"], "P1")  # the same goal, spelled differently
+        self.assertEqual(cc.update_report(self.A, {"goal": "Billing"})[0]["item"], "")  # P1 was the old goal's
+        self.assertEqual(cc.sanitize_report({"item": "../x"})["item"], "")
+
+    def test_item_state(self):
+        item = lambda **kw: dict({"status": "", "owner": "", "blocked_on": ""}, **kw)
+        pr = lambda state, step=None, *texts: {"state": state, "step": step, "texts": list(texts)}
+        live = lambda g="waiting": {"alive": True, "group": g}
+        closed = {"alive": False, "group": "later"}
+        cases = [
+            (item(status="dropped"), [pr("merged")], [live()], [], ("dropped", None)),
+            (item(status="done"), [pr("open", 2)], [], [], ("done", None)),  # marked by hand
+            (item(), [pr("merged"), pr("merged")], [live()], [], ("done", None)),  # every PR merged
+            (item(), [pr("merged"), pr("closed")], [], [], ("done", None)),  # a closed PR was given up on
+            (item(), [pr("merged"), pr("open", 4)], [], [], ("review", None)),  # a follow-up is still open
+            (item(status="blocked", blocked_on="copy"), [], [live()], [], ("working", "session")),  # live wins over a block
+            (item(), [], [live("needs")], [], ("you", "you")),
+            (item(), [pr("open", 2, "Changes requested")], [live()], [], ("fix", "session")),
+            (item(), [pr("open", 4), pr("open", 1)], [live()], [], ("merge", "you")),  # the most urgent PR
+            (item(owner="Sam"), [pr("open", 2)], [], [], ("theirs", "Sam")),  # their PR isn't yours to fix
+            (item(status="blocked", blocked_on="copy"), [], [closed], [], ("blocked", None)),
+            (item(), [], [], ["P1"], ("blocked", None)),
+            (item(), [pr("open", 2)], [], [], ("fix", "you")),
+            (item(), [], [closed], [], ("paused", "you")),
+            (item(), [], [], [], ("queued", None)),
+        ]
+        for it, prs, sessions, after, (state, who) in cases:
+            with self.subTest(item=it, prs=prs, sessions=sessions):
+                got = cc.item_state(it, prs, sessions, after)
+                self.assertEqual((got[0], got[2]), (state, who))
+                self.assertIn(got[0], cc.ITEM_STATES)
+        self.assertEqual(cc.item_state(item(status="blocked", blocked_on="client copy"), [], [], [])[1], "client copy")
+        self.assertEqual(cc.item_state(item(), [], [], ["P1", "P2"])[1], "After P1, P2")
+        self.assertEqual(cc.item_state(item(owner="Sam"), [], [], [])[1:], ("", "Sam"))
+        self.assertEqual(cc.item_state(item(), [pr("open", 2, "CI failing", "Conflicts")], [], [])[1], "CI failing; Conflicts")
+
+    def test_plan_place_and_dependencies(self):
+        plan = cc.sanitize_plan({"goal": "G", "items": [{"id": "P1", "title": "a"}, {"id": "P2", "title": "b", "status": "done"},
+                                                        {"id": "P3", "title": "c", "after": ["P1"]}]})
+        cc.plan_place(plan, "P1", "P3", after=True)  # the page shows P1, P3: down puts P1 after P3, past the hidden P2
+        self.assertEqual([t["id"] for t in plan["items"]], ["P2", "P3", "P1"])
+        cc.plan_place(plan, "P1", "P3", after=False)
+        self.assertEqual([t["id"] for t in plan["items"]], ["P2", "P1", "P3"])
+        plan["items"][1]["prs"] = [PR.format(1)]
+        state = lambda cache: {t["id"]: t for t in cc.plan_view(plan, [], [], cache)}["P3"]
+        self.assertEqual(state({PR.format(1): {"data": {"state": "open"}}})["waiting_on"], ["P1"])
+        p3 = state({PR.format(1): {"data": {"state": "merged"}}})
+        self.assertEqual((p3["waiting_on"], p3["state"]), ([], "queued"))  # P1's PR merged: P1 is done, P3 can start
+
+    def test_pr_given_by_hand_wins(self):
+        plan = cc.sanitize_plan({"goal": "G", "items": [{"id": "P2", "title": "a", "url": "https://linear.app/acme/issue/ENG-2/a"},
+                                                        {"id": "P3", "title": "b", "prs": [PR.format(4)]}]})
+        sessions = [{"id": self.A, "alive": False, "group": "later", "report": None,
+                     "pr_details": [{"url": PR.format(4), "own": True, "state": "open", "title": "ENG-2 and more", "head": "x"}]}]
+        by = {t["id"]: t for t in cc.plan_view(plan, sessions, [], {})}
+        self.assertEqual(([p["url"] for p in by["P2"]["prs"]], [p["url"] for p in by["P3"]["prs"]]), ([], [PR.format(4)]))
+
+    def test_sanitize_plan(self):
+        self.assertIsNone(cc.sanitize_plan({"items": []}))  # no goal
+        p = cc.sanitize_plan({"goal": "G", "next_id": 2, "closed": float("nan"), "items": [
+            {"id": "P1", "title": "a", "url": "javascript:x", "status": "weird", "sessions": ["../x", "s1"], "cwd": "rel/dir"},
+            {"id": "P1", "title": "dup"}, {"id": "Q2", "title": "bad id"}, {"id": "P3", "title": " "}, {"id": "P5", "title": "b", "after": ["P1", "nope"]}]})
+        self.assertEqual([t["id"] for t in p["items"]], ["P1", "P5"])
+        self.assertEqual((p["items"][0]["url"], p["items"][0]["status"], p["items"][0]["sessions"], p["items"][0]["cwd"]), ("", "", ["s1"], ""))
+        self.assertEqual((p["items"][1]["after"], p["next_id"], p["closed"]), (["P1"], 6, 0))  # ids are never reused
+        cc.GOALS_DIR.mkdir(parents=True, exist_ok=True)
+        (cc.GOALS_DIR / "wrongname.json").write_text(json.dumps({"goal": "G", "items": []}))  # not where G's plan lives
+        (cc.GOALS_DIR / "x.json").write_text("not json")
+        self.assertEqual(cc.load_plans(), {})
+
+    def test_plan_links_prs_and_sessions(self):
+        plan = cc.sanitize_plan({"goal": "Ship 2.0", "created": 100, "items": [
+            {"id": "P1", "title": "Queue", "url": "https://linear.app/acme/issue/ENG-7/queue", "sessions": [self.A]},
+            {"id": "P2", "title": "Retry", "url": "https://linear.app/acme/issue/ENG-8/retry", "sessions": [self.A], "after": ["P1"]},
+            {"id": "P3", "title": "Docs", "prs": [PR.format(9)]}]})
+        rep = cc.sanitize_report({"goal": "ship 2.0", "item": "P2", "next": "Fix the review"})
+        sessions = [{"id": self.A, "alive": True, "group": "waiting", "report": rep, "pr_details": [
+            {"url": PR.format(1), "own": True, "state": "merged", "title": "ENG-7: queue", "head": "x"},  # ENG-7 in the title: P1's
+            {"url": PR.format(2), "own": True, "state": "open", "title": "Retry", "head": "me/eng-8-retry"},
+            {"url": PR.format(3), "own": True, "state": "open", "title": "No key", "head": "misc"},  # the session's item: P2
+            {"url": PR.format(4), "own": False, "state": "open", "title": "ENG-8 mentioned", "head": "y"}]}]
+        rows = [{"url": PR.format(2), "number": 2, "title": "Retry", "head": "me/eng-8-retry", "step": 2, "texts": ["Changes requested"], "session": {"id": self.A}, "updated": 150}]
+        cache = {PR.format(9): {"data": {"state": "closed", "title": "Docs"}}}
+        seen = []
+        with mock.patch.object(cc, "item_state", lambda t, prs, ss, w: seen.append((t["id"], prs, ss, w)) or ("working", "", None)):
+            view = cc.plan_view(plan, sessions, rows, cache)
+        by = {t["id"]: t for t in view}
+        self.assertEqual([p["url"] for p in by["P1"]["prs"]], [PR.format(1)])
+        self.assertEqual([p["url"] for p in by["P2"]["prs"]], [PR.format(2), PR.format(3)])
+        self.assertEqual([(p["url"], p["state"]) for p in by["P3"]["prs"]], [(PR.format(9), "closed")])  # given by hand: from the cache
+        self.assertEqual((by["P1"]["sessions"], by["P2"]["sessions"]), ([], [self.A]))  # the session works P2 now
+        self.assertEqual((by["P2"]["next"], by["P2"]["waiting_on"], by["P2"]["rank"]), ("Fix the review", [], 2))  # P1: its only PR merged
+        p2 = next(x for x in seen if x[0] == "P2")
+        self.assertEqual(p2[1][0]["step"], 2)  # an open PR in the PR plan has its step
+        self.assertEqual(p2[2], [{"alive": True, "group": "waiting"}])
+        self.assertIn("--item P2", by["P2"]["start"])
+        board = cc.goal_board(sessions, rows, now=200, plans={"ship 2.0": plan}, cache=cache)
+        self.assertEqual((board[0]["goal"], board[0]["summary"].split(",")[0]), ("Ship 2.0", "1/3 done"))  # P1: its only PR merged
+        plan["closed"] = 1
+        self.assertFalse(cc.goal_board([], [], now=200, plans={"ship 2.0": plan}))  # a closed plan with no sessions: gone
 
     def test_goal_board(self):
         now = time.time()
         rep = lambda **kw: cc.sanitize_report(dict({"updated": now - 100}, **kw))
         sessions = [
-            {"id": "s1", "alive": True, "report": rep(goal="Ship 1.2", priority="low", todos=[{"text": "Submit to the stores"}])},
+            {"id": "s1", "alive": True, "report": rep(goal="Ship 1.2", priority="low", todos=[
+                {"text": "Submit to the stores"}, {"text": "Tag it", "done_at": now - 9}, {"text": "Bump it", "done_at": now - 5}])},
             {"id": "s2", "alive": False, "report": rep(goal="ship 1.2", priority="high")},
             {"id": "s3", "alive": False, "report": rep(goal="Billing", todos=[{"text": "old"}]), "mark": {"done": True}},
             {"id": "s4", "alive": True, "report": rep()},
@@ -899,6 +1104,7 @@ class ReportTest(unittest.TestCase):
                          ("high", ["s1", "s2"], [PR.format(1), PR.format(2)]))
         self.assertEqual(ship["summary"], "2 PRs: 1 to merge, 1 waiting, 1 to-do for you")
         self.assertEqual([(x["text"], x["sid"]) for x in ship["todos"]], [("Submit to the stores", "s1")])
+        self.assertEqual([x["text"] for x in ship["todos_done"]], ["Bump it", "Tag it"])  # the latest tick first
         self.assertEqual((board[3]["open"], board[3]["todos"], board[3]["summary"]), (False, [], "Done"))  # a done session's to-dos are over
         self.assertTrue(board[2]["other"])
         self.assertEqual(board[3]["since"], now - 100)  # a done goal: its last report, so snapshots don't change by themselves
@@ -926,7 +1132,21 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": "0000ffff"})[0], 409)
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": 0})[0], 409)
         self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_done", "todo": tid})[0], 200)
-        self.assertEqual(cc.load_reports()[self.A]["todos"], [])
+        self.assertEqual(cc.open_todos(cc.load_reports()[self.A]), [])
+        dash.refresh()
+        self.assertEqual([t["id"] for t in dash.snapshot["goals"][0]["todos_done"]], [tid])
+        self.assertEqual(dash.handle_action({"id": self.A, "action": "todo_undone", "todo": tid})[0], 200)
+        self.assertEqual(cc.open_todos(cc.load_reports()[self.A])[0]["id"], tid)
+        cc.change_plan("Ship 1.2", lambda p: [cc.plan_add(p, "One"), cc.plan_add(p, "Two")], create=True)
+        for op, target, order in (("down", "P2", ["P2", "P1"]), ("up", "P2", ["P1", "P2"]), ("done", None, ["P1", "P2"])):
+            self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": op, "target": target})[0], 200)
+            self.assertEqual([t["id"] for t in cc.load_plans()["ship 1.2"]["items"]], order)
+        self.assertEqual(cc.load_plans()["ship 1.2"]["items"][0]["status"], "done")
+        self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P9", "op": "done"})[0], 409)
+        self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": "rm"})[0], 400)
+        self.assertEqual(dash.handle_action({"action": "plan_item", "goal": "ship 1.2", "item": "P1", "op": "up", "target": "P1"})[0], 409)
+        self.assertEqual([t["id"] for t in dash.snapshot["goals"][0]["plan"]], ["P1", "P2"])
+        self.assertIn("queued", dash.snapshot["item_states"])
         cc.REPORTS_DIR.joinpath(self.A + ".json").write_text(json.dumps(dict(cc.load_reports()[self.A], updated=time.time() - 30 * 3600)))
         dash.refresh()
         self.assertTrue(next(x for x in dash.snapshot["sessions"] if x["id"] == self.A)["report_stale"])

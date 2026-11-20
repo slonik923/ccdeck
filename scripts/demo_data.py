@@ -214,20 +214,38 @@ def build(home, pid):
     # what sessions said about their own work (`ccdeck report`): goals, next steps and to-dos for you
     (data / "reports").mkdir(exist_ok=True)
     for sid, rep in {
-        "d-deploy": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "you",
+        "d-deploy": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "you", "item": "P1",
                      "next": "Deploy to staging, then replay the last 50 Stripe events",
-                     "todos": [{"text": "Rotate the Stripe test key in the staging vault", "kind": "hands-on", "size": "small"}]},
-        "d-rate": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "session",
+                     "todos": [{"text": "Rotate the Stripe test key in the staging vault", "kind": "hands-on", "size": "small"},
+                               {"text": "Approve the staging deploy window", "kind": "decide", "size": "small", "done_at": now - 40 * 60}]},
+        "d-rate": {"goal": "Launch Stripe billing", "priority": "high", "waiting": "session", "item": "P2",
                    "next": "Add the per-key override the review asked for", "after": [REPO.format("billing-api", 90)]},
-        "d-cache": {"goal": "Launch Stripe billing", "waiting": "review", "next": "Waiting for the payments team's review",
+        "d-cache": {"goal": "Launch Stripe billing", "waiting": "review", "item": "P3", "next": "Waiting for the payments team's review",
                     "todos": [{"text": "Decide the exchange-rate cache TTL (1 h or 24 h)", "kind": "decide", "size": "small"}]},
         "d-dark": {"goal": "Settings refresh", "waiting": "you", "next": "Mark the PR ready once the preview looks right",
                    "todos": [{"text": "Check the dark theme on the preview", "kind": "validate", "size": "small",
-                              "url": "https://preview.example.com/settings"}]},
+                              "url": "https://preview.example.com/settings"},
+                             {"text": "Review the new settings copy", "kind": "review", "size": "small", "done_at": now - 3 * 3600}]},
         "d-node": {"goal": "Settings refresh", "priority": "low", "waiting": "ci", "next": "Merge when CI passes"},
         "d-csv": {"goal": "Reports v2", "waiting": "session", "next": "Make ReportRow.total required, then fix the e2e timeout"},
     }.items():
         (data / "reports" / f"{sid}.json").write_text(json.dumps(dict(rep, updated=now - 60)))
+    # a goal's plan (`ccdeck plan`): items in priority order; their states come from the sessions and PRs above
+    issue = lambda n, slug: f"https://linear.app/acme/issue/BIL-{n}/{slug}"
+    item = lambda iid, title, url="", **kw: dict({"id": iid, "title": title, "url": url, "cwd": "/home/demo/billing-api"}, **kw)
+    (data / "goals").mkdir(exist_ok=True)
+    plan = {"goal": "Launch Stripe billing", "created": now - 5 * 86400, "next_id": 9, "items": [
+        item("P1", "Stripe webhook handler", issue(101, "stripe-webhook-handler"), size="medium", sessions=["d-deploy"]),
+        item("P2", "Rate-limit the public API", issue(102, "rate-limit-public-api"), size="small", sessions=["d-rate"]),
+        item("P3", "Cache exchange rates", issue(103, "cache-exchange-rates"), size="small", sessions=["d-cache"]),
+        item("P7", "Invoice timezone fix", issue(107, "invoice-timezone"), size="small", prs=[REPO.format("billing-api", 77)]),
+        item("P4", "Refund flow", issue(104, "refund-flow"), size="medium", owner="Sam"),
+        item("P5", "Invoice emails", issue(105, "invoice-emails"), size="medium", after=["P2"]),
+        item("P6", "Tax rates per region", issue(106, "tax-rates"), size="large", status="blocked", blocked_on="Waiting for finance's rate table"),
+        item("P8", "Usage-based pricing", issue(108, "usage-pricing"), size="large"),
+    ]}
+    name = __import__("hashlib").sha1(" ".join(plan["goal"].lower().split()).encode()).hexdigest()[:12]
+    (data / "goals" / f"{name}.json").write_text(json.dumps(plan))
     (data / "marks.json").write_text(json.dumps({
         "d-bun": {"parked": True, "note": "after Q4 freeze"},
         "d-node": {"note": "waiting on QA"},

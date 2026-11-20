@@ -132,6 +132,26 @@ const GR = [
   { k: "done", l: "Done", i: "check-circle", layout: "dense", hint: "" },
 ];
 const OLD_AFTER = 24 * 3600;
+const isOldClosed = (s, now) => s.g === "closed" && s.k !== "parked" && now - s.ts > OLD_AFTER;
+// Show done and Older closed in the Goals view: [done goals and done to-dos of open goals, older closed sessions in goals]
+function goalToggleCounts(all, now) {
+  const byId = Object.fromEntries(all.map((s) => [s.id, s]));
+  const goals = data.goals || [];
+  // a done goal counts once; in open goals, each done to-do and done session Show done would reveal
+  const done = goals.filter((g) => !g.open).length + goals.filter((g) => g.open).reduce((a, g) => a + (g.todos_done || []).length + g.sessions.filter((x) => x.done).length, 0);
+  const old = new Set(goals.flatMap((g) => g.sessions.map((x) => byId[x.id]).filter((s) => s && isOldClosed(s, now)).map((s) => s.id)));
+  return [done, old.size];
+}
+// the PRs view's done ones: merged or closed PRs that sessions owned, once each (older: also from sessions closed long ago)
+function donePrs(all, now, older) {
+  const open = new Set(((data.plan && data.plan.rows) || []).map((r) => String(r.url).toLowerCase()));  // newer than the cached states
+  const seen = new Set(), out = [];
+  for (const s of all.slice().sort((a, b) => b.ts - a.ts)) {
+    if (!older && isOldClosed(s, now)) continue;
+    for (const p of s.prs) if (p.own && (p.k === "merged" || p.label === "Closed") && !seen.has(p.url) && !open.has(String(p.url).toLowerCase())) { seen.add(p.url); out.push(Object.assign({ s }, p)); }
+  }
+  return out;
+}
 const LINKS = {
   artifact: ["sparkle", "Artifact"], notion: ["doc", "Notion"], linear: ["issue", "Linear"],
   figma: ["pen", "Figma"], gdoc: ["doc", "Google Doc"],
@@ -196,7 +216,7 @@ const ui = {
   filter: "all", showDone: ls.get("showDone", false), showOld: ls.get("showOld", false), q: "",
   menu: "", drawer: "", settings: false, focus: "", hint: false, legend: false, hintOff: ls.get("hintOff", false), notifOpen: "",
   view: ls.get("view", "sessions"), scope: ls.get("prScope", "sessions"), step: 0,
-  groupBy: ls.get("groupBy", "state"), showDoneGoals: false,
+  groupBy: ls.get("groupBy", "state"),
 };
 const offline = () => !!data && failures > 0 && Date.now() - lastOk > 6000;
 
@@ -231,7 +251,7 @@ async function act(id, action, extra) {
       focus: "Switched to its " + (j.focused || "terminal") + " tab",
       undone: "Reopened", park: "Parked", unpark: "Unparked", note: "Note saved",
       open_folder: "Opening the folder…", refresh_prs: "PR states refreshed",
-      dismiss: "Dismissed", dismiss_all: "Notifications cleared", todo_done: "To-do done",
+      dismiss: "Dismissed", dismiss_all: "Notifications cleared", todo_done: "To-do done", todo_undone: "To-do reopened", plan_item: "Plan updated",
     };
     toast(msgs[action] || "Done");
     etag = ""; load();
@@ -579,9 +599,21 @@ function renderHint() {
         h("button", { class: "linkbtn", onclick: () => { ui.hintOff = true; ls.set("hintOff", true); renderHint(); } }, "Don’t show again"))) : null);
 }
 
+// the Goals view's legend: [key, title, icon, color group, lines]
+const GOAL_HELP = [
+  ["what", "Goals", "plan", "work", ["What sessions work toward. Each session names its goal with ccdeck report --goal; sessions with the same goal share a section.",
+    "Open goals come first, the highest priority first, then the oldest."]],
+  ["plan", "Plan", "issue", "work", ["A goal's work items in priority order (ccdeck plan). An item's state comes from the session that works it and its PRs; it's done when its PRs merge.",
+    "\u2191/\u2193 reorder, Done marks one done by hand, Start copies a command that starts a session on it."]],
+  ["parts", "In a goal", "deck", "turn", ["Plan items, then sessions: what each one does next.", "PRs: where each one stands, as in the PRs view.", "To-dos: what the sessions handed you."]],
+  ["todos", "To-dos", "check-circle", "need", ["Things only you can do: review, validate, decide or a hands-on step.",
+    "Mark done when you've done it. Done ones show with Show done at the top; clicking Done reopens one."]],
+  ["done", "Priority and done goals", "check", "done", ["High or Low next to a goal is the priority its sessions reported, as you ranked it.",
+    "A goal is done when it has no open PR, no open to-do and no running session. Show done shows done goals and done sessions; Older closed, sessions closed over a day ago."]],
+];
 function renderLegend() {
   $("legendBtn").setAttribute("aria-expanded", ui.legend ? "true" : "false");
-  $("legendBtn").setAttribute("aria-label", ui.view === "prs" ? "Legend: what the PR steps mean" : "Legend: what the states mean");
+  $("legendBtn").setAttribute("aria-label", ui.view === "prs" ? "Legend: what the PR steps mean" : ui.view === "goals" ? "Legend: how goals work" : "Legend: what the states mean");
   const gicon = (i) => h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(i, "i-xs"));
   if (ui.legend && ui.view === "prs") return $("legendHost").replaceChildren(h("div", { class: "legend", role: "dialog", "aria-label": "PR steps legend", onclick: (e) => e.stopPropagation() },
     STEPS.map((st) => h("div", { "data-g": st.g, "data-key": "lg:" + st.s },
@@ -589,6 +621,9 @@ function renderLegend() {
       h("ul", {}, st.d.map((t) => h("li", {}, h("span", {}, t)))))),
     h("div", { "data-key": "lg:who" }, h("h4", {}, "Who acts"),
       h("ul", {}, WHO.map(([l, k, t]) => h("li", {}, h("span", { class: "plan-who", "data-who": k }, l), h("span", { style: "padding-top: 2px" }, t)))))));
+  if (ui.legend && ui.view === "goals") return $("legendHost").replaceChildren(h("div", { class: "legend", role: "dialog", "aria-label": "Goals legend", onclick: (e) => e.stopPropagation() },
+    GOAL_HELP.map(([key, title, icon, g, lines]) => h("div", { "data-g": g, "data-key": "lg:" + key },
+      h("h4", {}, gicon(icon), title), h("ul", {}, lines.map((t) => h("li", {}, h("span", {}, t))))))));
   $("legendHost").replaceChildren(ui.legend ? h("div", { class: "legend", role: "dialog", "aria-label": "State legend", onclick: (e) => e.stopPropagation() },
     GR.map((g) => h("div", { "data-g": g.k },
       h("h4", {}, h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(g.i, "i-xs")), g.l),
@@ -653,7 +688,11 @@ function render() {
   const q = ui.q.trim();
   const count = (k) => all.filter((s) => s.g === k).length;
   const needN = count("need"), prN = count("pr"), doneN = count("done");
-  const isOld = (s) => s.g === "closed" && s.k !== "parked" && now - s.ts > OLD_AFTER;
+  const isOld = (s) => isOldClosed(s, now);
+  // the two header toggles count what they'd show in the current view
+  const tab = isOff || !data.plan ? "sessions" : ui.view;
+  const [doneCount, oldCount] = tab === "goals" ? goalToggleCounts(all, now) : tab === "prs" ? [donePrs(all, now, false).length, donePrs(all, now, true).length - donePrs(all, now, false).length]
+    : [doneN, all.filter(isOld).length];
   const oldClosed = all.filter(isOld).length;
 
   document.title = (needN ? `(${needN}) ` : "") + (data.preview ? "ccdeck preview" : "ccdeck");
@@ -663,8 +702,10 @@ function render() {
   setFavicon(needN, needN ? "#E9887D" : prN ? "#C393C2" : count("turn") ? "#10b981" : count("work") ? "#F0B44C" : "#10b981");
   $("needBadge").hidden = !needN || isOff; $("needBadge").textContent = needN;
   $("host").textContent = "localhost:" + data.port + " · v" + data.version;
-  $("cDone").textContent = doneN; $("tDone").setAttribute("aria-pressed", ui.showDone ? "true" : "false");
-  $("cOld").textContent = oldClosed; $("tOld").setAttribute("aria-pressed", ui.showOld ? "true" : "false");
+  $("cDone").textContent = doneCount; $("tDone").setAttribute("aria-pressed", ui.showDone ? "true" : "false");
+  $("cOld").textContent = oldCount; $("tOld").setAttribute("aria-pressed", ui.showOld ? "true" : "false");
+  $("tDone").title = { goals: "Done goals and the to-dos you marked done", prs: "Merged and closed PRs of your sessions" }[tab] || "Sessions you marked done or whose PR merged";
+  $("tOld").title = { goals: "Goals' sessions closed more than a day ago", prs: "Also merged and closed PRs of sessions closed more than a day ago" }[tab] || "Sessions closed more than a day ago";
   renderHint(); renderLegend(); renderContours(all, isOff);
 
   const visibleGroup = (k) => isOff ? k === "need" : ui.filter === "all" ? (k !== "done" || ui.showDone) : ui.filter === k;
@@ -851,8 +892,6 @@ function planView(q) {
       const k = "st:" + ui.step; ui.step = 0; render();
       const chip = document.querySelector('[data-key="' + k + '"]'); if (chip) chip.focus();  // this button is gone: back to the step chip
     } }, "Clear step selection") : null));
-  const todos = allTodos().filter((t) => !q || (t.text + " " + t.goal).toLowerCase().includes(q.toLowerCase()));
-  if (todos.length && !ui.step) out.push(todoSection(todos));
   for (const st of STEPS) {
     if (ui.step && ui.step !== st.s) continue;
     const part = rows.filter((r) => r.step === st.s);
@@ -863,6 +902,19 @@ function planView(q) {
         h("span", { class: "rule" }), h("span", { class: "ghint" }, st.hint)),
       h("ul", { class: "rrlist plan", "data-g": st.g }, part.map((r) => planRow(r, st)))));
   }
+  // Show done: merged and closed PRs your sessions owned (Older closed adds those of sessions closed long ago)
+  const now = Date.now() / 1000, all = Object.values(lastById);
+  const done = donePrs(all, now, ui.showOld).filter((p) => !q || [p.repo, p.title, p.n, p.s.title].join(" ").toLowerCase().includes(q.toLowerCase()));
+  if (ui.showDone && !ui.step && done.length) out.push(h("section", { class: "section", "data-g": "done", "aria-labelledby": "h-prdone" },
+    h("div", { class: "ghdr ghdr-quiet" }, h("h2", { id: "h-prdone" }, h("span", { class: "gicon" }, ic("merge")), "Merged or closed ", h("span", { class: "gcount" }, done.length)),
+      h("span", { class: "rule" }), h("span", { class: "ghint" }, ui.showOld ? "PRs your sessions owned" : "PRs your sessions owned; Older closed adds those of sessions closed long ago")),
+    h("ul", { class: "rrlist plan", "data-g": "done" }, done.map((p) => h("li", { "data-key": "prd:" + p.url },
+      h("a", { class: "prchip", "data-k": p.k, href: p.url, target: "_blank", rel: "noopener noreferrer", title: p.label }, ic(p.icon), h("span", { class: "num" }, p.n)),
+      h("div", { class: "plan-main" }, h("span", { class: "rr-title", title: p.title }, p.title || p.url), h("span", { class: "plan-next" }, p.label)),
+      h("span", { class: "rr-repo mono" }, p.repo), nameChip(p.s, "n:prd:" + p.url) || h("span", { class: "rr-by mono" }, p.s.sid || p.s.id.slice(0, 8)),
+      h("span", { class: "ago mono", title: "The session's last activity" }, agoShort(p.s.ts)))))));
+  else if (!ui.showDone && !ui.step && done.length) out.push(h("div", { class: "more-line" }, ic("merge", "i-sm"), h("span", {}, plural(done.length, "merged or closed PR") + " hidden"),
+    h("button", { class: "linkbtn", "data-key": "prdm", onclick: toggleDone }, "Show"), h("span", { class: "rule" })));
   out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"),
     p.disabled ? "PR plan fetching is disabled" : p.fetched ? [(p.state === "failed" || p.state === "auth_required" ? "Refresh failed; cached data from GitHub, " : "From GitHub, "),
       h("span", { "data-ago-from": String(p.fetched) }, agoText(Math.round(Date.now() / 1000 - p.fetched))), " · refreshes every 5 min · no AI, statuses only"] : "Waiting for GitHub")));
@@ -892,31 +944,63 @@ const afterLinks = (urls) => (urls || []).map((u) => {
   const m = /\/(?:pull|issues)\/(\d+)/.exec(u);
   return /^https?:\/\//i.test(u) ? [" · After ", h("a", { href: u, target: "_blank", rel: "noopener noreferrer", title: u }, m ? "#" + m[1] : shortUrl(u))] : null;
 }).flat().filter(Boolean);
-const allTodos = () => (data.goals || []).flatMap((g) => g.todos.map((t) => Object.assign({ goal: g.other ? "" : g.goal }, t)));
-function todoSection(todos) {
-  return h("section", { class: "section", "data-g": "need", "aria-labelledby": "h-todos" },
-    h("div", { class: "ghdr ghdr-strong" }, h("h2", { id: "h-todos" }, h("span", { class: "gicon" }, ic("check-circle")), "To do for you ", h("span", { class: "gcount" }, todos.length)),
-      h("span", { class: "rule" }), h("span", { class: "ghint" }, "Things sessions handed you; tick them off when done")),
-    h("ul", { class: "rrlist todos" }, todos.map((t) => todoRow(t, true))));
+// the open to-dos, then a line that shows or hides the ticked ones (unticking one opens it again)
+function todoList(todos, ticked, key) {
+  const shown = ui.showDone ? ticked : [];
+  return h("div", { class: "todo-wrap" },
+    todos.length || shown.length ? h("ul", { class: "rrlist todos" }, todos.concat(shown).map(todoRow)) : null,
+    ticked.length ? h("div", { class: "more-line todo-more" }, ic("check", "i-sm"), h("span", {}, plural(ticked.length, "done to-do") + (ui.showDone ? "" : " hidden")),
+      h("button", { class: "linkbtn", "data-key": "tdm:" + key, "aria-expanded": String(!!ui.showDone), title: "Same as Show done at the top", onclick: toggleDone },
+        ui.showDone ? "Hide" : "Show"), h("span", { class: "rule" })) : null);
 }
-function todoRow(t, withGoal) {
+function todoRow(t) {
   const s = lastById[t.sid];
   const key = t.sid + ":" + t.id;
-  return h("li", { "data-key": "td:" + key },
-    h("button", { class: "ibtn ibtn-sm", "data-key": "tdd:" + key, "aria-label": "Done: " + t.text, title: "Done: remove it from the session's report",
-      onclick: () => act(t.sid, "todo_done", { todo: t.id }) }, ic("check", "i-sm")),
+  const done = !!t.done_at;
+  return h("li", { "data-key": "td:" + key, "data-done": done ? "true" : null },
+    h("button", { class: "btn btn-sm todo-tick", "data-key": "tdd:" + key, "aria-pressed": String(done), "aria-label": (done ? "Reopen: " : "Done: ") + t.text,
+      title: done ? "Done " + (agoShort(t.done_at) === "now" ? "just now" : agoShort(t.done_at) + " ago") + ". Click to reopen it" : "Mark it done (you can undo it)",
+      onclick: () => act(t.sid, done ? "todo_undone" : "todo_done", { todo: t.id }) }, ic("check", "i-sm"), done ? "Done" : "Mark done"),
     h("div", { class: "plan-main" }, h("span", { class: "rr-title", title: t.text }, t.text),
-      h("span", { class: "plan-next" }, [t.kind, t.size].filter(Boolean).join(" · ") || "To do"),
-      withGoal && t.goal ? h("span", { class: "plan-say" }, goalChip(t.goal, "g:td:" + key)) : null),
+      h("span", { class: "plan-next" }, [t.kind, t.size].filter(Boolean).join(" · ") || "To do")),
     /^https?:\/\//i.test(t.url || "") ? h("a", { class: "lchip", href: t.url, target: "_blank", rel: "noopener noreferrer", title: t.url }, ic("doc", "i-xs"), shortUrl(t.url)) : h("span", {}),
     (s && nameChip(s, "n:td:" + key)) || h("span", { class: "rr-by mono" }, s ? s.sid : t.sid.slice(0, 8)),
     h("span", {}));
 }
 const PRIO = { high: "High priority", low: "Low priority" };
+// A goal's plan (ccdeck plan): items in priority order, each with the state its sessions and PRs give it
+function planList(g) {
+  const items = (g.plan || []).filter((t) => ui.showDone || (t.state !== "done" && t.state !== "dropped"));
+  if (!items.length) return null;
+  const open = (g.plan || []).filter((t) => t.state !== "done" && t.state !== "dropped");
+  const move = (t, op, target) => act("", "plan_item", { goal: g.goal, item: t.id, op, target: target && target.id });
+  return h("ol", { class: "rrlist planitems", "aria-label": "Plan for " + g.goal }, items.map((t) => {
+    const st = (data.item_states || {})[t.state] || { label: t.state, g: "closed" };
+    const s = t.sessions.map((id) => lastById[id]).find(Boolean);
+    const at = open.indexOf(t), finished = t.state === "done" || t.state === "dropped";
+    const pr = t.prs.find((p) => p.state === "open") || t.prs[0];
+    const line = [t.text, t.next && "next: " + t.next].filter(Boolean).join(" · ");
+    return h("li", { "data-key": "pi:" + g.key + ":" + t.id, "data-done": finished ? "true" : null },
+      h("span", { class: "pi-id mono", title: "Item " + t.id + ", number " + t.rank + " in the plan" }, t.id),
+      h("div", { class: "plan-main" },
+        h("span", { class: "rr-title", title: t.title + (t.note ? "\n" + t.note : "") }, t.title, t.size ? h("span", { class: "pi-size" }, " · " + t.size) : null),
+        h("span", { class: "plan-next" }, h("span", { class: "pill", "data-g": st.g }, st.label), line ? " " + line : "")),
+      h("span", { class: "pi-links" },
+        pr ? h("a", { class: "lchip", href: pr.url, target: "_blank", rel: "noopener noreferrer", title: pr.title || pr.url }, ic(pr.state === "merged" ? "merge" : "pr", "i-xs"), "#" + pr.number) : null,
+        /^https?:\/\//i.test(t.url || "") ? h("a", { class: "lchip", href: t.url, target: "_blank", rel: "noopener noreferrer", title: t.url }, ic("doc", "i-xs"), ((k) => k ? k.toUpperCase() : shortUrl(t.url))((t.url.match(/\/([A-Za-z][A-Za-z0-9]{0,9}-\d{1,7})(?:[/?#]|$)/) || [])[1])) : null),
+      s ? nameChip(s, "n:pi:" + g.key + t.id) || h("span", { class: "rr-by mono" }, s.sid) : h("span", { class: "rr-by" }, t.owner || ""),
+      h("span", { class: "pi-acts" },
+        !finished && at > 0 ? h("button", { class: "ibtn ibtn-sm", "aria-label": "Move " + t.id + " up", title: "Move up", onclick: () => move(t, "up", open[at - 1]) }, ic("chevron", "i-sm up")) : h("span", { class: "pi-gap" }),
+        !finished && at < open.length - 1 ? h("button", { class: "ibtn ibtn-sm", "aria-label": "Move " + t.id + " down", title: "Move down", onclick: () => move(t, "down", open[at + 1]) }, ic("chevron", "i-sm")) : h("span", { class: "pi-gap" }),
+        !finished && !s && !t.owner ? h("button", { class: "btn btn-sm", title: "Copy a command that starts a Claude session on this item:\n" + t.start, onclick: () => copy(t.start, "Start command for " + t.id) }, ic("copy", "i-sm"), "Start") : null,
+        h("button", { class: "btn btn-sm todo-tick", "aria-pressed": String(t.state === "done"), title: finished ? "Reopen it" : "Mark it done by hand (one with a PR is done when the PR merges)",
+          onclick: () => move(t, finished ? "reopen" : "done") }, ic("check", "i-sm"), finished ? (t.state === "dropped" ? "Dropped" : "Done") : "Done")));
+  }));
+}
 function goalsView(q) {
   const plan = Object.fromEntries(((data.plan && data.plan.rows) || []).map((r) => [r.url, r]));
   const lq = q.toLowerCase();
-  const hit = (g) => !q || [g.goal, ...g.sessions.map((x) => (lastById[x.id] || {}).title || ""), ...g.prs.map((p) => (plan[p.url] || {}).title || "")]
+  const hit = (g) => !q || [g.goal, ...g.sessions.map((x) => (lastById[x.id] || {}).title || ""), ...g.prs.map((p) => (plan[p.url] || {}).title || ""), ...(g.plan || []).map((t) => t.id + " " + t.title + " " + t.url)]
     .join(" ").toLowerCase().includes(lq);
   const goals = (data.goals || []).filter(hit);
   const open = goals.filter((g) => g.open), done = goals.filter((g) => !g.open);
@@ -924,8 +1008,9 @@ function goalsView(q) {
   if (!goals.length) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, q ? "No goals match “" + q + "”" : "No goals yet"),
     h("p", {}, "Sessions report what they work toward with ", h("span", { class: "mono" }, "ccdeck report --goal \"Ship 1.2\""),
       ". The plugin's report skill tells them when: after opening a PR, when they wait on you, and when they hand you a to-do.")));
-  for (const g of open.concat(ui.showDoneGoals ? done : [])) {
-    const sessions = g.sessions.map((x) => lastById[x.id]).filter(Boolean);
+  const now = Date.now() / 1000;
+  for (const g of open.concat(ui.showDone ? done : [])) {
+    const sessions = g.sessions.filter((x) => ui.showDone || !x.done || !g.open).map((x) => lastById[x.id]).filter((s) => s && (ui.showOld || !isOldClosed(s, now)));
     const prs = g.prs.map((p) => plan[p.url]).filter(Boolean);
     const id = "h-goal-" + goalKey(g.goal).replace(/[^a-z0-9]+/g, "-");
     out.push(h("section", { class: "section goal", "data-g": g.open ? (g.todos.length ? "need" : "work") : "done", "aria-labelledby": id },
@@ -933,13 +1018,14 @@ function goalsView(q) {
         PRIO[g.priority] && g.open ? h("span", { class: "prio", "data-p": g.priority }, PRIO[g.priority]) : null),
         h("span", { class: "rule" }), h("span", { class: "ghint" }, g.summary)),
       h("div", { class: "goal-body" },
+        planList(g),
         sessions.length ? h("ul", { class: "rrlist" }, sessions.map(goalSession)) : null,
         prs.length ? h("ul", { class: "rrlist plan" }, prs.map((r) => planRow(r, STEPS.find((st) => st.s === r.step), true))) : null,
-        g.todos.length ? h("ul", { class: "rrlist todos" }, g.todos.map((t) => todoRow(t, false))) : null)));
+        g.todos.length || (g.todos_done || []).length ? todoList(g.todos, g.todos_done || [], g.key) : null)));
   }
   if (done.length) out.push(h("div", { class: "more-line", style: "margin-top: 32px" }, ic("check-circle", "i-sm"),
-    h("span", {}, plural(done.length, "done goal") + (ui.showDoneGoals ? "" : " hidden")),
-    h("button", { class: "linkbtn", onclick: () => { ui.showDoneGoals = !ui.showDoneGoals; render(); } }, ui.showDoneGoals ? "Hide" : "Show"), h("span", { class: "rule" })));
+    h("span", {}, plural(done.length, "done goal") + (ui.showDone ? "" : " hidden")),
+    h("button", { class: "linkbtn", "data-key": "dgm", onclick: toggleDone }, ui.showDone ? "Hide" : "Show"), h("span", { class: "rule" })));
   out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"), "From the sessions' own reports (ccdeck report) and GitHub statuses · no AI")));
   return out;
 }
