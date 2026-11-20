@@ -98,11 +98,15 @@ sys.exit(1)
 '''
 
 
-def pr(n, title, state="OPEN", draft=False, review="", checks="SUCCESS", mergeable="MERGEABLE", head=""):
+def pr(n, title, state="OPEN", draft=False, review="", checks="SUCCESS", mergeable="MERGEABLE", head="", base="main", failing=()):
+    """One PR as `gh pr view` returns it. failing: names of failed checks (the rest pass)."""
     roll = [] if checks is None else [{"status": "IN_PROGRESS" if checks == "PENDING" else "COMPLETED",
                                        "conclusion": "" if checks == "PENDING" else checks}]
+    if failing:
+        roll = [{"name": c, "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": ts(30)} for c in failing] + \
+               [{"name": "build", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": ts(30)}]
     return {"number": n, "title": title, "state": state, "isDraft": draft, "reviewDecision": review,
-            "mergeable": mergeable, "statusCheckRollup": roll, "headRefName": head}
+            "mergeable": mergeable, "statusCheckRollup": roll, "headRefName": head, "baseRefName": base}
 
 
 def gql(repo, n, title, head, base="main", draft=False, merge="CLEAN", review=None, checks="SUCCESS", said=(), mins=60):
@@ -156,6 +160,10 @@ def build(home, pid):
         S("d-badges", "Update README badges", "tooling", "main", "badges", 61).say([text("Updated 4 badges and the install snippet.")], 60),
         S("d-bun", "Explore Bun for build scripts", "tooling", "spike/bun-scripts", "try bun", 2881)
         .say([text("Bun cut cold start from 1.9 s to 0.4 s; two scripts still need Node APIs.")], 2880),
+        # a stack of three PRs, the middle one failing: one chip in the list, a stack view in the details
+        S("d-stack", "Split ledger export into a stack", "billing-api", "feat/ledger-3-ui", "split the ledger export", 26)
+        .created_pr("billing-api", 95, 25).created_pr("billing-api", 96, 24).created_pr("billing-api", 97, 23)
+        .say([text("Stacked the ledger export as three PRs: query, CSV writer, download button.")], 22, ctx=188000),
         S("d-tz", "Fix timezone bug in invoices", "billing-api", "fix/invoice-tz", "fix tz", 1441)
         .created_pr("billing-api", 77, 1440).say([text("Merged.")], 1440),
     ]
@@ -168,6 +176,10 @@ def build(home, pid):
         REPO.format("web-app", 299): pr(299, "Settings dark mode", draft=True),
         REPO.format("billing-api", 90): pr(90, "Cache exchange rates", review="REVIEW_REQUIRED"),
         REPO.format("billing-api", 77): pr(77, "Invoice timezone fix", state="MERGED", review="APPROVED"),
+        REPO.format("billing-api", 95): pr(95, "Ledger export: query entries by period", review="APPROVED", head="feat/ledger-1-query"),
+        REPO.format("billing-api", 96): pr(96, "Ledger export: stream entries as CSV", review="REVIEW_REQUIRED", head="feat/ledger-2-csv",
+                                           base="feat/ledger-1-query", failing=("test-unit", "lint")),
+        REPO.format("billing-api", 97): pr(97, "Ledger export: download button", draft=True, head="feat/ledger-3-ui", base="feat/ledger-2-csv"),
     }
     reviews = [{"number": 412, "title": "Move webhooks to the event bus", "url": REPO.format("platform", 412), "isDraft": False,
                 "repository": {"name": "platform", "nameWithOwner": "acme/platform"}, "author": {"login": "sam"},

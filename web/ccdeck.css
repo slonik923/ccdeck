@@ -440,6 +440,21 @@
 .ccd .prchip[data-k="pass"] .i, .ccd .prchip[data-k="approved"] .i { color: var(--turn); }
 .ccd .prchip[data-k="merged"] .i { color: var(--pr); }
 .ccd .prchip[data-k="ready"] .i { color: var(--turn); }
+/* several PRs in one chip: a dot per PR, the ones to fix spelled out */
+.ccd .prstrip { display: inline-flex; align-items: center; height: 24px; padding: 0 2px; border-radius: var(--r-sm); border: 1px solid var(--border); background: var(--surface); font-size: var(--t-12); color: var(--text-2); white-space: nowrap; }
+.ccd .prstrip .seg { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 4px; border-radius: 4px; color: inherit; text-decoration: none; }
+.ccd .prstrip .seg:hover { background: var(--surface-2); color: var(--text); }
+.ccd .prstrip .seg[data-bad] { padding: 0 6px 0 5px; }
+.ccd .prstrip .seg .i { width: 13px; height: 13px; }
+.ccd .prstrip .seg .num { font-family: var(--mono); font-weight: 600; color: var(--text); }
+.ccd .prstrip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); opacity: .55; }
+.ccd .prstrip .seg[data-k="fail"] .i, .ccd .prstrip .seg[data-k="conflict"] .i { color: var(--need); }
+.ccd .prstrip .seg[data-k="changes"] .i { color: var(--pr); }
+.ccd .prstrip .seg[data-k="merged"] .dot { background: var(--pr); opacity: 1; }
+.ccd .prstrip .seg[data-k="run"] .dot { background: var(--wait); opacity: 1; }
+.ccd .prstrip .seg[data-k="ready"] .dot, .ccd .prstrip .seg[data-k="approved"] .dot { background: var(--turn); opacity: 1; }
+.ccd .prstrip .sum { border: 0; background: none; padding: 0 6px 0 4px; font: inherit; color: var(--text-3); cursor: pointer; }
+.ccd .prstrip .sum:hover { color: var(--text); }
 .ccd .lchip { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px 0 6px; border-radius: var(--r-sm); background: var(--surface-2); color: var(--text-2); font-size: var(--t-12); text-decoration: none; white-space: nowrap; }
 .ccd .lchip:hover { color: var(--text); background: var(--surface-3); }
 .ccd .lchip .i { width: 13px; height: 13px; color: var(--text-3); }
@@ -549,10 +564,33 @@
 .ccd .msg { margin: 0; font-size: var(--t-14); line-height: 1.6; color: var(--text); white-space: pre-line; }
 .ccd .cmd { display: flex; align-items: center; gap: var(--s-4); font: 500 12.5px/1.5 var(--mono); padding: 8px 8px 8px 12px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
 .ccd .cmd span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ccd .prcard { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
-.ccd .prcard-h { display: flex; align-items: center; gap: var(--s-4); padding: 10px 12px; background: var(--surface-2); }
-.ccd .prcard-h .num { font: 600 12.5px var(--mono); }
-.ccd .prcard-h .ttl { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* the details' PRs: a stack view, top first, a rail joining the nodes down to the base branch */
+.ccd .prstack { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.ccd .pst { position: relative; display: grid; grid-template-columns: 22px 1fr; gap: var(--s-4); padding-bottom: 14px; }
+.ccd .pst:last-child { padding-bottom: 0; }
+.ccd .prstack[data-stacked] .pst:not(:last-child)::before { content: ""; position: absolute; left: 10px; top: 22px; bottom: 0; width: 2px; background: var(--border); }
+.ccd .pst-node { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-3); position: relative; z-index: 1; }
+.ccd .pst-node .i { width: 12px; height: 12px; }
+.ccd .pst[data-k="fail"] .pst-node, .ccd .pst[data-k="conflict"] .pst-node { color: var(--need); background: var(--need-tint); border-color: var(--need-line); }
+.ccd .pst[data-k="changes"] .pst-node, .ccd .pst[data-k="merged"] .pst-node { color: var(--pr); background: var(--pr-tint); border-color: var(--pr-line); }
+.ccd .pst[data-k="run"] .pst-node { color: var(--wait); background: var(--wait-tint); border-color: var(--wait-line); }
+.ccd .pst[data-k="approved"] .pst-node, .ccd .pst[data-k="ready"] .pst-node { color: var(--turn); background: var(--turn-tint); border-color: var(--turn-line); }
+.ccd .pst-body { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding-top: 1px; }
+.ccd .pst-h { display: flex; align-items: baseline; gap: var(--s-3); min-width: 0; color: var(--text); text-decoration: none; font-size: var(--t-14); }
+.ccd .pst-h:hover .ttl { text-decoration: underline; }
+.ccd .pst-h .num { font: 600 12.5px var(--mono); color: var(--text-2); flex: none; }
+.ccd .pst-h .ttl { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ccd .pst-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-size: var(--t-12); color: var(--text-3); }
+.ccd .pst-i { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.ccd .pst-i .i { width: 12px; height: 12px; }
+.ccd .pst-i.ok .i { color: var(--turn); } .ccd .pst-i.bad { color: var(--need-fg); } .ccd .pst-i.run .i { color: var(--wait); }
+.ccd .pst-i.chg, .ccd .pst-i.ok-pr .i { color: var(--pr-fg); }
+.ccd .pst-repo { margin-left: auto; font-size: 11.5px; }
+.ccd .pst-fail { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: var(--t-12); color: var(--text-3); }
+.ccd .pst-fail span { margin-right: 2px; }
+.ccd .pst-fail code { font: 11.5px var(--mono); padding: 1px 6px; border-radius: var(--r-sm); background: var(--need-tint); color: var(--need-fg); }
+.ccd .pst-trunk .pst-node { background: var(--surface); }
+.ccd .pst-trunk .pst-body { justify-content: center; font-size: var(--t-12); color: var(--text-3); }
 .ccd .checks { list-style: none; margin: 0; padding: 4px 0; }
 .ccd .checks li { display: flex; align-items: center; gap: var(--s-4); padding: 5px 12px; font-size: var(--t-12); color: var(--text-2); }
 .ccd .checks li .dur { margin-left: auto; color: var(--text-3); font-family: var(--mono); font-size: 11.5px; }

@@ -127,6 +127,8 @@ The groups say what you have to do, most urgent first:
 
 "In progress" means someone else is on it: Claude, CI or your reviewers. A PR waiting for review counts as in progress, because you can't approve your own (or your agent's) PR.
 
+**A session with several PRs**, such as a stack, gets one PR chip with a dot per PR, bottom of the stack first. A PR with failing CI, requested changes or conflicts shows its number instead, so you can see which one to fix. The details show the stack top first, each PR with its CI, review, conflicts and draft state, and the names of the checks that failed. A check counts by its newest run: a job re-run green passes, and a run cancelled because a newer run started doesn't count as a failure.
+
 **Review requests.** PRs where a colleague asked for your review aren't part of any session, so they get their own list on the dashboard (and in `ccdeck`), refreshed every 5 minutes with `gh search prs`. Your own sessions' PRs are left out. By default the list includes requests made to a team you're in. If your teams get many of those, `ccdeck review-requests mine` lists only the PRs where you were asked by name; `ccdeck review-requests all` goes back. `ccdeck review-requests off` (or `CCDECK_REVIEW_REQUESTS=0`) turns the list off.
 
 <!-- coderabbit-ai-generated:v1 -->

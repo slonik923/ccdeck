@@ -27,7 +27,7 @@ PRs that change what the dashboard shows get before/after screenshots, made with
   The fake `gh` answers within a second, so the defaults are enough. No login is needed.
 - **Specs** live in `scripts/shots/`. `states-pr.json` is an example.
 - **Selectors:**
-  - cards and rows have `data-sid` (the demo ids are `d-deploy`, `d-auth`, `d-queue`, `d-flaky`, `d-csv`, `d-rate`, `d-pdf`, `d-node`, `d-dark`, `d-cache`, `d-badges`, `d-bun` and `d-tz`);
+  - cards and rows have `data-sid` (the demo ids are `d-deploy`, `d-auth`, `d-queue`, `d-flaky`, `d-csv`, `d-rate`, `d-pdf`, `d-node`, `d-dark`, `d-cache`, `d-badges`, `d-bun`, `d-tz` and `d-stack`);
   - the Needs-you queue buttons have `data-nav`;
   - pills have `data-g` (group) and `data-k` (state);
   - the drawer is `.drawer`, and its sections are `.dsec`.
