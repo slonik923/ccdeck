@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.9"
+VERSION = "0.9.10"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1028,21 +1028,49 @@ _pr_lock = threading.Lock()
 FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"}
 
 
+def current_checks(rollup):
+    """The checks still in effect. The head commit's list also holds runs a newer one replaced, and
+    GitHub's own rollup state can't be trusted to leave them out (it flips between reads), so:
+    each check counts by its newest attempt (a failed job re-run green passes), and a cancelled
+    check doesn't count once its workflow started anything later (a newer run replaced it; that's
+    also how cancelled `${{ matrix.x }}` names that never ran go away)."""
+    checks = [ch for ch in rollup or [] if isinstance(ch, dict)]
+    newest = {}
+    for ch in checks:
+        key = (ch.get("workflowName") or "", ch.get("name") or ch.get("context") or "")
+        if key not in newest or (ch.get("startedAt") or "") >= (newest[key].get("startedAt") or ""):
+            newest[key] = ch
+    last_start = {}  # workflow -> when its newest check started
+    for ch in checks:
+        wf = ch.get("workflowName")
+        if wf:
+            last_start[wf] = max(last_start.get(wf, ""), ch.get("startedAt") or "")
+    return [ch for ch in newest.values()
+            if not ((ch.get("conclusion") or "").upper() == "CANCELLED" and ch.get("workflowName")
+                    and (ch.get("startedAt") or "") < last_start[ch["workflowName"]])]
+
+
+def failing_checks(rollup):
+    """Names of the checks in effect that failed, in the order GitHub lists them."""
+    out = []
+    for ch in current_checks(rollup):
+        if (ch.get("conclusion") or "").upper() in FAIL or (ch.get("state") or "").upper() in ("FAILURE", "ERROR"):
+            name = ch.get("name") or ch.get("context") or "?"
+            if name not in out:
+                out.append(name)
+    return out
+
+
 def summarize_checks(rollup):
     if not rollup:
         return "none"
-    failing = pending = False
-    for ch in rollup:
-        if not isinstance(ch, dict):
-            continue
-        concl = (ch.get("conclusion") or "").upper()
-        state = (ch.get("state") or "").upper()
+    if failing_checks(rollup):
+        return "failing"
+    for ch in current_checks(rollup):
         status = (ch.get("status") or "").upper()
-        if concl in FAIL or state in ("FAILURE", "ERROR"):
-            failing = True
-        elif (status and status != "COMPLETED") or state in ("PENDING", "EXPECTED"):
-            pending = True
-    return "failing" if failing else "pending" if pending else "passing"
+        if (status and status != "COMPLETED") or (ch.get("state") or "").upper() in ("PENDING", "EXPECTED"):
+            return "pending"
+    return "passing"
 
 
 def fetch_pr(url):
@@ -1051,7 +1079,7 @@ def fetch_pr(url):
     try:
         r = subprocess.run(
             ["gh", "pr", "view", url, "--json",
-             "number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,headRefName"],
+             "number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,headRefName,baseRefName"],
             capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as e:
         return {"error": str(e)}
@@ -1068,7 +1096,9 @@ def fetch_pr(url):
         "review": (d.get("reviewDecision") or "").lower(),  # approved | changes_requested | review_required
         "mergeable": (d.get("mergeable") or "").lower(),  # mergeable | conflicting | unknown
         "checks": summarize_checks(d.get("statusCheckRollup")),
+        "failing": failing_checks(d.get("statusCheckRollup"))[:8],  # what to fix, for the details
         "head": d.get("headRefName") or "",
+        "base": d.get("baseRefName") or "",  # with head: a stack's order
     }
 
 
