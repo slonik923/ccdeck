@@ -3790,6 +3790,7 @@ def find_version(version, repo):
 
 def resolve_preview(target, repo, trust):
     """(source folder, label) for a PR number, ccdeck version (0.8.5), branch, tag, commit, or local checkout."""
+    target = os.path.expanduser(target)  # a quoted "~/…" reaches us as typed
     if (m := VERSION_RE.fullmatch(target)) and not os.path.isdir(target):
         found = find_version(m.group(1), repo)
         if not found:
@@ -3843,6 +3844,10 @@ def preview_config_dir():
             shutil.copy(real, cfg / "ccdeck" / real.name)
         else:  # none of yours: start without one, not with what the last preview changed
             (cfg / "ccdeck" / real.name).unlink(missing_ok=True)
+    for real in (REPORTS_DIR, GOALS_DIR):  # copies too: a to-do ticked or a plan item moved in the preview stays there
+        shutil.rmtree(cfg / "ccdeck" / real.name, ignore_errors=True)
+        if real.is_dir():
+            shutil.copytree(real, cfg / "ccdeck" / real.name)
     return cfg
 
 
