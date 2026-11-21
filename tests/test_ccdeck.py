@@ -2776,6 +2776,24 @@ class PreviewTest(unittest.TestCase):
         cc.save_json(copied, {"review_requests": "off"})  # changed in the preview
         self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}), {"review_requests": "mine"})
 
+    def test_config_dir_copies_reports_and_plans(self):
+        cc.update_report("s1", {"goal": "Ship"}, {"text": "Check it", "kind": "", "size": "", "url": ""})
+        cc.change_plan("Ship", lambda p: cc.plan_add(p, "One"), create=True)
+        self.addCleanup(lambda: [shutil.rmtree(d, ignore_errors=True) for d in (cc.REPORTS_DIR, cc.GOALS_DIR)])
+        cfg = cc.preview_config_dir()
+        reports, goals = cfg / "ccdeck" / "reports", cfg / "ccdeck" / "goals"
+        self.assertEqual(cc.load_json(reports / "s1.json", {})["goal"], "Ship")  # the preview shows your goals and to-dos
+        self.assertEqual(sorted(p.name for p in goals.iterdir()), sorted(p.name for p in cc.GOALS_DIR.iterdir()))
+        (reports / "s1.json").write_text("{}")  # changed in the preview
+        self.assertEqual(cc.load_reports()["s1"]["goal"], "Ship")
+        shutil.rmtree(cc.REPORTS_DIR)
+        self.assertFalse(cc.preview_config_dir().joinpath("ccdeck", "reports").exists())  # none of yours: none from the last preview
+
+    def test_preview_target_expands_home(self):
+        with mock.patch.dict(os.environ, {"HOME": str(ROOT.parent)}):
+            src, label = cc.resolve_preview("~/" + ROOT.name, "slonik923/ccdeck", trust=False)
+        self.assertEqual((src, label), (ROOT.resolve(), "local " + ROOT.name))
+
     def test_unpack_refuses_escaping_paths(self):
         import io
         import tarfile
