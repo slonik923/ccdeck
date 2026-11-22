@@ -2030,10 +2030,11 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(json.loads(self.req("/api/sessions")[1])["settings"]["review_requests"]["value"], "mine")
         self.assertEqual(set_("approvals", True)[0], 200)
         self.assertEqual(set_("notifications.desktop", False)[0], 200)
-        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}),
-                         {"review_requests": "mine", "approvals": True, "notifications": {"desktop": False}})
+        self.assertEqual(set_("terminal_tabs", True)[0], 200)
+        self.assertEqual(cc.load_json(cc.CONFIG_FILE, {}), {"review_requests": "mine", "approvals": True,
+                                                            "notifications": {"desktop": False}, "terminal_tabs": True})
         for key, value in (("review_requests", "team"), ("review_requests", []), ("review_requests", {}),
-                           ("approvals", "yes"), ("notifications.sms", True), ("token", "x"), (None, 1)):
+                           ("approvals", "yes"), ("terminal_tabs", 1), ("notifications.sms", True), ("token", "x"), (None, 1)):
             self.assertEqual(set_(key, value)[0], 400, key)
         self.assertEqual(self.req("/api/action", token=False, data={"action": "set_setting", "key": "approvals", "value": True})[0], 403)
 
@@ -2547,6 +2548,12 @@ class MacDesktopTest(unittest.TestCase):
         i = cc.mac_terminal_command("/tmp", ["claude"], "iterm")
         self.assertIn('tell application "iTerm"', i)
         self.assertTrue(any("write text" in x for x in i))
+        ti = cc.mac_terminal_command("/tmp", ["claude"], "iterm", tab=True)
+        self.assertIn("tell w to create tab with default profile", ti)
+        self.assertIn("set w to (create window with default profile)", ti)  # when no window is open
+        tt = cc.mac_terminal_command("/tmp", ["claude"], "terminal", tab=True)
+        self.assertIn('tell application "System Events" to keystroke "t" using command down', tt)
+        self.assertIn('do script "cd /tmp && claude" in front window', tt)
 
     def test_resume_opens_the_terminal_you_use(self):
         """Both installed: the app most open sessions run in, else the one the dashboard started from."""
@@ -2639,6 +2646,32 @@ class TerminalTest(unittest.TestCase):
             del os.environ["CCDECK_TERMINAL"]
         self.assertEqual(cmd[:4], ["gh", "--", "bash", "-lc"])
         self.assertIn("cd '/tmp/it'\"'\"'s here' && claude --resume abc", cmd[4])
+
+    def test_tab_mode_uses_the_terminals_tab_flag(self):
+        saved = cc.TERMINALS, cc.shutil.which, cc.IS_MAC
+        cc.IS_MAC = False
+        cc.shutil.which = lambda b: "/usr/bin/" + b
+        try:
+            cc.TERMINALS = [("gnome-terminal", ["--"], ["--tab", "--"])]
+            self.assertEqual(cc.terminal_command("/tmp", ["claude"], tab=True)[:4], ["gnome-terminal", "--tab", "--", "bash"])
+            self.assertEqual(cc.terminal_command("/tmp", ["claude"], tab=False)[:3], ["gnome-terminal", "--", "bash"])
+            cc.TERMINALS = [("xterm", ["-e"], None)]  # no tabs: a window
+            self.assertEqual(cc.terminal_command("/tmp", ["claude"], tab=True)[:3], ["xterm", "-e", "bash"])
+        finally:
+            cc.TERMINALS, cc.shutil.which, cc.IS_MAC = saved
+
+    def test_tab_mode_follows_the_setting(self):
+        self.addCleanup(lambda: cc.CONFIG_FILE.unlink(missing_ok=True))
+        saved = cc.TERMINALS, cc.shutil.which, cc.IS_MAC
+        cc.IS_MAC, cc.TERMINALS = False, [("gnome-terminal", ["--"], ["--tab", "--"])]
+        cc.shutil.which = lambda b: "/usr/bin/" + b
+        try:
+            cc.set_setting("terminal_tabs", True)
+            self.assertEqual(cc.terminal_command("/tmp", ["claude"])[1], "--tab")
+            cc.set_setting("terminal_tabs", False)
+            self.assertEqual(cc.terminal_command("/tmp", ["claude"])[1], "--")
+        finally:
+            cc.TERMINALS, cc.shutil.which, cc.IS_MAC = saved
 
 
 class ChecksTest(unittest.TestCase):
