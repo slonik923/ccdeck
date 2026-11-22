@@ -2647,6 +2647,13 @@ class TerminalTest(unittest.TestCase):
         self.assertEqual(cmd[:4], ["gh", "--", "bash", "-lc"])
         self.assertIn("cd '/tmp/it'\"'\"'s here' && claude --resume abc", cmd[4])
 
+    def test_resume_drops_the_starting_sessions_env(self):
+        """The dashboard is started by a session's hook; a claude it resumes mustn't think it's that session's child."""
+        env = cc.without_session_env({"CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_CODE_SESSION_ID": "x", "CLAUDECODE": "1",
+                                      "CLAUDE_CODE_MESSAGING_TOKEN": "t", "CLAUDE_CODE_USE_BEDROCK": "1",
+                                      "CLAUDE_CONFIG_DIR": "/c", "PATH": "/bin"})
+        self.assertEqual(env, {"CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": "/c", "PATH": "/bin"})
+
     def test_tab_mode_uses_the_terminals_tab_flag(self):
         saved = cc.TERMINALS, cc.shutil.which, cc.IS_MAC
         cc.IS_MAC = False

@@ -2779,12 +2779,25 @@ def terminal_command(cwd, argv, tab=None):
     return None
 
 
+# The Claude Code session whose hook started the dashboard: its own marks, which a claude started from the
+# dashboard must not inherit (CLAUDE_CODE_CHILD_SESSION turns its transcript saving off).
+# shortcut: names seen in Claude Code 2.x; add new per-session ones here when they turn up
+SESSION_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_TMPDIR", "CLAUDE_CODE_TMPDIR",
+               "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SSE_PORT")
+SESSION_ENV_PREFIXES = ("CLAUDE_CODE_CHILD_", "CLAUDE_CODE_SESSION_", "CLAUDE_CODE_MESSAGING_", "CLAUDE_CODE_HOST_")
+
+
+def without_session_env(env):
+    return {k: v for k, v in env.items() if k not in SESSION_ENV and not k.startswith(SESSION_ENV_PREFIXES)}
+
+
 def open_terminal(cwd, argv):
     """Open a new terminal window running argv in cwd; leaves a shell open afterwards."""
     cmd = terminal_command(cwd, argv)
     if not cmd:
         raise RuntimeError("No terminal emulator found; set CCDECK_TERMINAL")
-    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=user_env(desktop_env()),
+    env = without_session_env(user_env(desktop_env()))
+    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     if cmd[0] == "osascript":
         return "iTerm" if 'tell application "iTerm"' in cmd else "Terminal"
