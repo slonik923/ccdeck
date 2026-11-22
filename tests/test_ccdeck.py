@@ -1468,6 +1468,20 @@ class HookTest(unittest.TestCase):
         finally:
             cc.running_claude_processes = saved
 
+    def test_hook_activity_after_the_transcript_clears_its_error(self):
+        """Under /remote-control Claude Code stops writing the transcript; the hooks still fire."""
+        build_fixtures()
+        sid = "s-error"
+        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        self.assertEqual(by_id(cc.collect(True, 10 ** 6))[sid]["state"], "error")
+        self.run_hook({"session_id": sid, "hook_event_name": "Stop"})  # ending the turn isn't activity
+        self.assertEqual(by_id(cc.collect(True, 10 ** 6))[sid]["state"], "error")
+        self.run_hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+        self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
+        row = by_id(cc.collect(True, 10 ** 6))[sid]
+        self.assertNotEqual(row["state"], "error")
+        self.assertGreater(row["last_ts"], time.time() - 60)
+
     def test_print_resume_does_not_mark_session_alive(self):
         build_fixtures()
         (cc.STATE_DIR / "s-closed.json").unlink(missing_ok=True)  # only the -p process may speak for it

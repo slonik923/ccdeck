@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.13"
+VERSION = "0.9.14"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1771,6 +1771,11 @@ def collect(include_all=False, days=DEFAULT_DAYS):
         else:
             alive = sid in peers or sid in resumed or sid in guessed_live
             s["live_source"] = "guess"
+        active = (hook or {}).get("active_ts") or 0
+        if active > s.get("last_ts", 0) + 1:
+            # The hooks saw the session work after its transcript's last entry: Claude Code stops writing the
+            # transcript in some modes (/remote-control). That entry's API error is over, and its age is wrong.
+            sessions[sid] = s = dict(s, last_ts=active, api_error=False)
         if (sid in resumed or sid in peers) and not hook_live:
             hook = None  # another process resumed it; the ended one's status (ended, permission) isn't the live one's
         s["alive"] = alive
@@ -4123,6 +4128,7 @@ def cmd_hook(_args):
         state["status"] = "stopped"
     elif event in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure"):
         state["status"] = "working"
+        state["active_ts"] = state["ts"]  # the session did something; Stop and SessionEnd don't count
         state.pop("message", None)
     elif event == "PermissionRequest":
         state["status"] = "permission"
