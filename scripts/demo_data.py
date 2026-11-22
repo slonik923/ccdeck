@@ -160,9 +160,11 @@ def build(home, pid):
         S("d-badges", "Update README badges", "tooling", "main", "badges", 61).say([text("Updated 4 badges and the install snippet.")], 60),
         S("d-bun", "Explore Bun for build scripts", "tooling", "spike/bun-scripts", "try bun", 2881)
         .say([text("Bun cut cold start from 1.9 s to 0.4 s; two scripts still need Node APIs.")], 2880),
-        # a stack of three PRs, the middle one failing: one chip in the list, a stack view in the details
+        # a stack of three PRs, the middle one failing: one chip in the list, a stack view in the details;
+        # plus a PR in another repo, which the details show apart from the stack
         S("d-stack", "Split ledger export into a stack", "billing-api", "feat/ledger-3-ui", "split the ledger export", 26)
         .created_pr("billing-api", 95, 25).created_pr("billing-api", 96, 24).created_pr("billing-api", 97, 23)
+        .created_pr("web-app", 302, 22)
         .say([text("Stacked the ledger export as three PRs: query, CSV writer, download button.")], 22, ctx=188000),
         S("d-tz", "Fix timezone bug in invoices", "billing-api", "fix/invoice-tz", "fix tz", 1441)
         .created_pr("billing-api", 77, 1440).say([text("Merged.")], 1440),
@@ -180,6 +182,7 @@ def build(home, pid):
         REPO.format("billing-api", 96): pr(96, "Ledger export: stream entries as CSV", review="REVIEW_REQUIRED", head="feat/ledger-2-csv",
                                            base="feat/ledger-1-query", failing=("test-unit", "lint")),
         REPO.format("billing-api", 97): pr(97, "Ledger export: download button", draft=True, head="feat/ledger-3-ui", base="feat/ledger-2-csv"),
+        REPO.format("web-app", 302): pr(302, "Ledger export link in the billing menu", head="feat/ledger-3-ui"),  # same branch name, other repo
     }
     reviews = [{"number": 412, "title": "Move webhooks to the event bus", "url": REPO.format("platform", 412), "isDraft": False,
                 "repository": {"name": "platform", "nameWithOwner": "acme/platform"}, "author": {"login": "sam"},
@@ -193,6 +196,9 @@ def build(home, pid):
         gql("web-app", 299, "Settings dark mode", "feat/settings-dark", draft=True, mins=7),
         gql("billing-api", 90, "Cache exchange rates", "feat/fx-cache", merge="BLOCKED", review="REVIEW_REQUIRED", mins=49),
         gql("billing-api", 93, "Refresh cached rates hourly", "feat/fx-refresh", base="feat/fx-cache", mins=45),
+        gql("billing-api", 95, "Ledger export: query entries by period", "feat/ledger-1-query", review="APPROVED", mins=25),
+        gql("billing-api", 96, "Ledger export: stream entries as CSV", "feat/ledger-2-csv", base="feat/ledger-1-query", checks="FAILURE", mins=24),
+        gql("billing-api", 97, "Ledger export: download button", "feat/ledger-3-ui", base="feat/ledger-2-csv", draft=True, mins=23),
         gql("tooling", 55, "Pin GitHub Actions to commit SHAs", "ci/pin-actions", said=("you", "you"), mins=300),
         gql("storefront", 140, "Lazy-load product images", "perf/lazy-images", mins=150),
         gql("web-app", 256, "Remove old feature flags", "chore/flags", merge="DIRTY", mins=30 * 1440),
