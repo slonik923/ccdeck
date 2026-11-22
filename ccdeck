@@ -1032,22 +1032,29 @@ def current_checks(rollup):
     """The checks still in effect. The head commit's list also holds runs a newer one replaced, and
     GitHub's own rollup state can't be trusted to leave them out (it flips between reads), so:
     each check counts by its newest attempt (a failed job re-run green passes), and a cancelled
-    check doesn't count once its workflow started anything later (a newer run replaced it; that's
-    also how cancelled `${{ matrix.x }}` names that never ran go away)."""
+    check doesn't count once a newer run of its workflow exists (that run replaced it; that's also how
+    cancelled `${{ matrix.x }}` names that never ran go away). A later job of the same run replaces
+    nothing: a run cancelled halfway still has a cancelled check."""
     checks = [ch for ch in rollup or [] if isinstance(ch, dict)]
     newest = {}
     for ch in checks:
         key = (ch.get("workflowName") or "", ch.get("name") or ch.get("context") or "")
         if key not in newest or (ch.get("startedAt") or "") >= (newest[key].get("startedAt") or ""):
             newest[key] = ch
-    last_start = {}  # workflow -> when its newest check started
+    last_run = {}  # workflow -> its newest run's id
     for ch in checks:
-        wf = ch.get("workflowName")
-        if wf:
-            last_start[wf] = max(last_start.get(wf, ""), ch.get("startedAt") or "")
+        wf, run = ch.get("workflowName"), run_id(ch)
+        if wf and run:
+            last_run[wf] = max(last_run.get(wf, 0), run)
     return [ch for ch in newest.values()
-            if not ((ch.get("conclusion") or "").upper() == "CANCELLED" and ch.get("workflowName")
-                    and (ch.get("startedAt") or "") < last_start[ch["workflowName"]])]
+            if not ((ch.get("conclusion") or "").upper() == "CANCELLED" and run_id(ch)
+                    and run_id(ch) < last_run.get(ch.get("workflowName"), 0))]
+
+
+def run_id(ch):
+    """The GitHub Actions run a check belongs to (from its link), or 0 when it isn't from Actions."""
+    m = re.search(r"/actions/runs/(\d+)", ch.get("detailsUrl") or "")
+    return int(m.group(1)) if m else 0
 
 
 def failing_checks(rollup):
