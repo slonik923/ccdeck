@@ -1180,7 +1180,9 @@ const ciItem = (checks, failing) => checks === "failing" ? pstItem("bad", "x-cir
   : checks === "pending" ? pstItem("run", "clock", "CI running") : checks === "passing" ? pstItem("ok", "check", "CI passing") : pstItem("", null, "No checks");
 const reviewItem = (review, asked) => review === "approved" ? pstItem("ok", "check-circle", "Approved")
   : review === "changes_requested" ? pstItem("chg", "changes", "Changes requested")
-  : review !== "review_required" ? null : asked == null ? pstItem("", "reply", "Review required")  // asked: how many reviewers were asked, if known
+  // asked: how many reviewers were asked, if known. Without a rule that requires reviews, GitHub has no
+  // review decision ("") even while reviewers are asked
+  : review !== "review_required" && !(review === "" && asked) ? null : asked == null ? pstItem("", "reply", "Review required")
   : asked ? pstItem("", "reply", "Review requested · " + asked, asked + (asked === 1 ? " reviewer or team" : " reviewers or teams") + " asked")
   : pstItem("", "reply", "Needs a review", "No reviewer asked yet");
 // The PRs view's status line: the whole state of an open PR of yours, beside the step's next action
