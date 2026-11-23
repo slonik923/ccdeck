@@ -45,6 +45,7 @@
 <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"></circle><circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="7" r="2"></circle><path d="M6 7v10"></path><path d="M18 9c0 4-4 6-10 8"></path></symbol>
 <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path></symbol>
 <symbol id="i-issue" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><circle cx="12" cy="12" r="2"></circle></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"></path></symbol>
 <symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path><path d="M9 13h6M9 17h4"></path></symbol>
 <symbol id="i-pen" viewBox="0 0 24 24"><path d="M12 19l7-7 3 3-7 7z"></path><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18z"></path><path d="M2 2l7.6 7.6"></path><circle cx="11" cy="11" r="2"></circle></symbol>
 <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path><path d="M19 17v4M17 19h4"></path></symbol>
@@ -1019,17 +1020,21 @@ function planRow(r, st, inGoal) {
   const validUrl = /^https?:\/\//i.test(r.url || "");
   const link = validUrl ? { href: r.url, target: "_blank", rel: "noopener noreferrer" } : {};
   const msg = st.s === 2 && s && s.alive && r.actor === "session" ? r.repo + "#" + r.number + " needs work: " + r.texts.join("; ") + ". Please fix what's worth fixing and reply on the review threads; I resolve them. " + r.url : "";
-  return h("li", { "data-key": "pr:" + r.url },
+  // under a goal, a title opens the session's details, as a session row's does; a PR without one looks like just a PR
+  const own = inGoal && s && lastById[s.id], alone = inGoal && !s;
+  return h("li", { "data-key": "pr:" + r.url, "data-alone": alone ? "1" : null },
     h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l, "data-key": "prn:" + r.url }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
     h("div", { class: "plan-main" },
-      h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title, "data-key": "prt:" + r.url }, link), r.title),
+      own ? h("button", { class: "rr-title title-btn", title: r.title + "\nOpens @" + s.name + "'s details", "data-key": "prt:" + r.url, onclick: () => openDrawer(s.id, "prt:" + r.url) }, r.title)
+        : h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title + (alone && validUrl ? "\nNo session: opens the PR on GitHub" : ""), "data-key": "prt:" + r.url }, link),
+          r.title, alone && validUrl ? ic("external", "i-xs rr-ext") : null),
       // the status line drops a "CI failing" the next action already says, so its list of failed checks shows here
       h("span", { class: "plan-next", title: (r.failing || []).length ? "Failing: " + r.failing.join(", ") : null }, r.texts.join(" · "), ...afterLinks(r.after)),
       st.s !== 3 ? h("span", { class: "plan-status pst-meta" }, planStatus(r)) : null,
       !inGoal && (r.session_next || r.goal) ? h("span", { class: "plan-say" }, goalChip(r.goal, "g:" + r.url), r.session_next ? h("span", { title: "What the session reported" }, r.session_next) : null) : null),
     h("span", { class: "rr-repo mono" }, r.repo),
     s ? nameChip(Object.assign({ id: s.id, run: s.alive, peerOpen: false }, lastById[s.id], { name: s.name }), "n:" + s.id + ":" + r.url)
-      : h("span", { class: "rr-by" }, st.s === 3 ? "by " + r.author : "no session"),
+      : h("span", { class: alone ? "rr-by rr-alone" : "rr-by" }, st.s === 3 ? "by " + r.author : alone ? "No session" : "no session"),
     h("span", { class: "plan-who", "data-who": r.actor || "none" }, r.actor === "you" ? "You" : r.actor === "session" ? "Session" : "—"),
     msg ? h("button", { class: "btn btn-sm", "data-key": "prm:" + r.url, title: "Copy a message for @" + s.name, onclick: () => copy(msg, "Message for @" + s.name) }, ic("copy", "i-sm"), "Message")
       : h("span", {}),
