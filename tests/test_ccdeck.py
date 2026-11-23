@@ -2616,6 +2616,40 @@ class TerminalTest(unittest.TestCase):
         self.assertIn("cd '/tmp/it'\"'\"'s here' && claude --resume abc", cmd[4])
 
 
+class ChecksTest(unittest.TestCase):
+    """CI state from every check on the head commit, less the runs a newer one replaced."""
+
+    @staticmethod
+    def ch(name, concl, started, wf="CI", status="COMPLETED", run=1):
+        return {"__typename": "CheckRun", "workflowName": wf, "name": name, "status": status, "conclusion": concl, "startedAt": started,
+                "detailsUrl": f"https://github.com/o/r/actions/runs/{run}/job/{abs(hash(name)) % 1000}"}
+
+    def test_replaced_runs_dont_count(self):
+        c = self.ch
+        cancelled_run = [c("lint", "CANCELLED", "10:00:00"), c("test (${{ matrix.shard }})", "CANCELLED", "10:00:00"),
+                         c("lint", "SUCCESS", "10:00:03", run=2)]
+        self.assertEqual(cc.summarize_checks(cancelled_run), "passing")
+        rerun = [c("test", "FAILURE", "10:00:00"), c("test", "SUCCESS", "10:05:00")]
+        self.assertEqual(cc.summarize_checks(rerun), "passing")
+        self.assertEqual(cc.summarize_checks(rerun[::-1][:1] + [c("test", "FAILURE", "10:09:00")]), "failing")  # re-run red
+        self.assertEqual(cc.summarize_checks(rerun[:1] + [c("test", "", "10:05:00", status="IN_PROGRESS")]), "pending")
+
+    def test_real_failures_still_count(self):
+        c = self.ch
+        self.assertEqual(cc.summarize_checks([c("deploy", "CANCELLED", "10:00:00")]), "failing")  # nothing newer replaced it
+        # run 2 failed; run 1's job started later and was cancelled: run 2's failure is the one in effect
+        self.assertEqual(cc.summarize_checks([c("unit", "FAILURE", "10:00:00", run=2), c("unit", "CANCELLED", "10:01:00", run=1)]), "failing")
+        # cancelled halfway: lint, started later in the same run, is no newer run
+        self.assertEqual(cc.summarize_checks([c("unit", "CANCELLED", "10:00:00"), c("lint", "SUCCESS", "10:01:00")]), "failing")
+        no_link = dict(c("unit", "CANCELLED", "10:00:00"), detailsUrl="")  # not from Actions: can't tell, so it counts
+        self.assertEqual(cc.summarize_checks([no_link, c("lint", "SUCCESS", "10:01:00", run=9)]), "failing")
+        self.assertEqual(cc.summarize_checks([c("lint", "SUCCESS", "10:00:00"), c("review", "CANCELLED", "10:00:00", wf="Bot"),
+                                              c("lint", "SUCCESS", "10:09:00")]), "failing")  # another workflow's run is no newer run of Bot
+        fail_fast = [c("unit", "FAILURE", "10:00:00"), c("e2e", "CANCELLED", "10:00:00"), c("report", "SKIPPED", "10:02:00")]
+        self.assertEqual(cc.summarize_checks(fail_fast), "failing")
+        self.assertEqual(cc.summarize_checks([{"__typename": "StatusContext", "context": "ci/legacy", "state": "ERROR"}]), "failing")
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

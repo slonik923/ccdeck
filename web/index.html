@@ -382,7 +382,7 @@ function deco(s) {
   });
   const issues = (s.linear || []).map((r) => ({ key: r.key, url: r.url, title: r.title || "", source: r.start ? "start" : r.source, primary: !!r.primary }));
   // The session's own things (its ticket, the page it started from, PRs and docs it made) vs. ones it only touched
-  const main = { prs: prs.filter((p) => p.own), issues: issues.filter((i) => i.primary), links: links.filter((l) => l.primary) };
+  const main = { prs: stackOrder(prs.filter((p) => p.own)), issues: issues.filter((i) => i.primary), links: links.filter((l) => l.primary) };
   const related = { prs: prs.filter((p) => !p.own), issues: issues.filter((i) => !i.primary), links: links.filter((l) => !l.primary) };
   const relatedN = related.prs.length + related.issues.length + related.links.length;
   const full = (msg || "").trim();
@@ -416,7 +416,46 @@ function prView(p) {
     else if (p.draft) { k = "draft"; icon = "draft"; label = p.checks === "passing" ? "Draft · CI passing" : "Draft"; short = "Draft"; }
     else { k = "ready"; icon = "pr"; label = "Ready for review"; short = "Ready"; }
   } else if (p.error) { label = short = "State unknown"; }
-  return { k, icon, n, label, short, url: p.url, title: p.title || "", repo: p.repo || "", error: p.error, own: p.own !== false, source: p.source };
+  return { k, icon, n, label, short, url: p.url, title: p.title || "", repo: p.repo || "", error: p.error, own: p.own !== false, source: p.source,
+    state: p.state || "", checks: p.checks || "", review: p.review || "", mergeable: p.mergeable || "", draft: !!p.draft,
+    failing: p.failing || [], head: p.head || "", base: p.base || "", fork: !!p.fork, bad: BAD_PR.has(k) };
+}
+const BAD_PR = new Set(["fail", "changes", "conflict"]);  // a PR that needs fixing before anything else
+const PR_RANK = ["fail", "changes", "conflict", "run", "draft", "ready", "approved", "merged"];
+// Stacks: PRs of one repo where each targets the branch of the one below. Returns the chains, bottom PR
+// first, a repo's chains together; a PR on its own is a chain of one. Where two PRs target the same PR's
+// branch, each starts a chain of its own, with onto: that PR. A PR never sits on itself (a fork's main
+// into main), and a branch name only links PRs of the same repo.
+function prChains(prs) {
+  const key = (p, branch) => p.repo + "\n" + branch;
+  // a parent's branch must be in the repo its child merges into: a fork's main isn't that repo's main
+  const inRepo = (p) => p.head && !p.fork && (!p.head_repo || p.head_repo === p.repo);
+  const byHead = new Map(prs.filter(inRepo).map((p) => [key(p, p.head), p]));
+  const below = (p) => { const q = p.base ? byHead.get(key(p, p.base)) : null; return q && q !== p ? q : null; };
+  const above = new Map();
+  for (const p of prs) { const b = below(p); if (b) { if (!above.has(b)) above.set(b, []); above.get(b).push(p); } }
+  const seen = new Set(), chains = [];
+  const start = (p, onto) => {
+    const c = Object.assign([], { onto }), forks = [];
+    for (let q = p; q && !seen.has(q);) {
+      seen.add(q); c.push(q);
+      const up = (above.get(q) || []).filter((x) => !seen.has(x));
+      if (up.length > 1) forks.push(...up.map((x) => [x, q]));
+      q = up.length === 1 ? up[0] : null;
+    }
+    chains.push(c);
+    for (const [x, on] of forks) if (!seen.has(x)) start(x, on);
+  };
+  for (const p of prs) if (!below(p)) start(p, null);
+  for (const p of prs) if (!seen.has(p)) start(p, null);  // a loop of branches: start anywhere
+  const repoAt = new Map();
+  prs.forEach((p, i) => { if (!repoAt.has(p.repo)) repoAt.set(p.repo, i); });
+  return chains.sort((a, b) => repoAt.get(a[0].repo) - repoAt.get(b[0].repo));  // stable: a repo's chains stay in order
+}
+// A stack bottom first, each stack together; stacked marks the PRs that are part of one
+function stackOrder(prs) {
+  const chains = prChains(prs), under = new Set(chains.map((c) => c.onto));
+  return chains.flatMap((c) => c.map((p) => Object.assign(p, { stacked: c.length > 1 || !!c.onto || under.has(p) })));
 }
 function matches(s, q) {
   if (!q) return true;
@@ -444,11 +483,23 @@ function issueChip(i, withTitle) {
 function chipRow(s, max, withTitle) {
   const m = s.main;
   const all = [...m.issues.map((i) => () => issueChip(i, withTitle && m.issues.length === 1)),
-    ...m.prs.map((p) => () => prChip(p, max < 4)), ...m.links.map((l) => () => linkChip(l))];
+    ...(m.prs.length > 1 ? [() => prStrip(s, m.prs)] : m.prs.map((p) => () => prChip(p, max < 4))), ...m.links.map((l) => () => linkChip(l))];
   const shown = all.slice(0, max).map((f) => f());
   const rest = all.length - shown.length;
   if (rest > 0) shown.push(h("button", { class: "metaitem linkcount", title: "Show all in the details", onclick: () => openDrawer(s.id) }, "+" + rest));
   return shown;
+}
+// Several PRs (often a stack, bottom first) in one chip: a dot per PR, colored by its state; the ones
+// to fix show their number, and their state when only one does. Each part links to its PR
+function prStrip(s, prs) {
+  const bad = prs.filter((p) => p.bad);
+  const lead = [...prs].sort((a, b) => PR_RANK.indexOf(a.k) - PR_RANK.indexOf(b.k))[0];
+  const tip = (p) => p.n + " · " + p.label + (p.title ? "\n" + p.title : "") + (p.failing.length ? "\nFailing: " + p.failing.join(", ") : "");
+  const sum = prs.length + " PRs" + (bad.length ? (bad.length > 1 ? ", " + bad.length + " to fix" : "") : " · " + lead.short);
+  return h("span", { class: "prstrip", "data-k": lead.k, role: "group", "aria-label": sum + ": " + prs.map((p) => p.n + " " + p.short).join(", ") },
+    prs.map((p) => h("a", { class: "seg", "data-k": p.k, "data-bad": p.bad ? "1" : null, href: p.url, target: "_blank", rel: "noopener noreferrer", title: tip(p) },
+      p.bad ? [ic(p.icon), h("span", { class: "num" }, p.n), bad.length === 1 ? h("span", { class: "lbl" }, p.short) : null] : h("span", { class: "dot" }))),
+    bad.length === 1 ? null : h("button", { class: "sum", title: "Show the PRs in the details", onclick: () => openDrawer(s.id) }, sum));
 }
 const linkChip = (l, full) => h("a", { class: "lchip", href: l.url, target: "_blank", rel: "noopener noreferrer", title: l.url }, ic(l.icon), full ? l.full : l.label);
 const noteEl = (s) => s.note ? h("span", { class: "note" }, ic("note"), s.note) : null;
@@ -613,9 +664,9 @@ const GOAL_HELP = [
 ];
 function renderLegend() {
   $("legendBtn").setAttribute("aria-expanded", ui.legend ? "true" : "false");
-  $("legendBtn").setAttribute("aria-label", ui.view === "prs" ? "Legend: what the PR steps mean" : ui.view === "goals" ? "Legend: how goals work" : "Legend: what the states mean");
+  $("legendBtn").setAttribute("aria-label", ui.view === "prs" || ui.view === "stacks" ? "Legend: what the PR steps mean" : ui.view === "goals" ? "Legend: how goals work" : "Legend: what the states mean");
   const gicon = (i) => h("span", { class: "gicon", style: "width: 18px; height: 18px; border-radius: 4px; display: grid; place-items: center; background: var(--g-tint); color: var(--g)" }, ic(i, "i-xs"));
-  if (ui.legend && ui.view === "prs") return $("legendHost").replaceChildren(h("div", { class: "legend", role: "dialog", "aria-label": "PR steps legend", onclick: (e) => e.stopPropagation() },
+  if (ui.legend && (ui.view === "prs" || ui.view === "stacks")) return $("legendHost").replaceChildren(h("div", { class: "legend", role: "dialog", "aria-label": "PR steps legend", onclick: (e) => e.stopPropagation() },
     STEPS.map((st) => h("div", { "data-g": st.g, "data-key": "lg:" + st.s },
       h("h4", {}, gicon(st.i), st.s + ". " + st.l),
       h("ul", {}, st.d.map((t) => h("li", {}, h("span", {}, t)))))),
@@ -706,6 +757,7 @@ function render() {
   $("cOld").textContent = oldCount; $("tOld").setAttribute("aria-pressed", ui.showOld ? "true" : "false");
   $("tDone").title = { goals: "Done goals and the to-dos you marked done", prs: "Merged and closed PRs of your sessions" }[tab] || "Sessions you marked done or whose PR merged";
   $("tOld").title = { goals: "Goals' sessions closed more than a day ago", prs: "Also merged and closed PRs of sessions closed more than a day ago" }[tab] || "Sessions closed more than a day ago";
+  $("tDone").hidden = $("tOld").hidden = tab === "stacks";  // the Stacks view lists open PRs only
   renderHint(); renderLegend(); renderContours(all, isOff);
 
   const visibleGroup = (k) => isOff ? k === "need" : ui.filter === "all" ? (k !== "done" || ui.showDone) : ui.filter === k;
@@ -722,9 +774,9 @@ function render() {
   const out = [];
   renderInbox();
   if (!isOff && data.plan) out.push(viewSwitch(all.length - doneN));
-  if (!isOff && (ui.view === "prs" && data.plan || ui.view === "goals")) {
+  if (!isOff && ((ui.view === "prs" || ui.view === "stacks") && data.plan || ui.view === "goals")) {
     lastById = Object.fromEntries(all.map((s) => [s.id, s]));
-    out.push(...(ui.view === "goals" ? goalsView(q) : planView(q)));
+    out.push(...(ui.view === "goals" ? goalsView(q) : ui.view === "stacks" ? stacksView(q) : planView(q)));
     $("main").replaceChildren(...out);
     renderDrawer(all);
     if (keep) focusKey(keep);
@@ -860,12 +912,54 @@ function viewSwitch(nSessions) {
   const yours = rows.filter((r) => r.actor === "you").length;
   const pick = (v) => { ui.view = v; ls.set("view", v); render(); };
   return h("nav", { class: "filters viewsw", "aria-label": "View" },
-    h("button", { class: "fchip", "aria-pressed": ui.view !== "prs" && ui.view !== "goals" ? "true" : "false", "data-key": "v:sessions", onclick: () => pick("sessions") },
+    h("button", { class: "fchip", "aria-pressed": !["prs", "goals", "stacks"].includes(ui.view) ? "true" : "false", "data-key": "v:sessions", onclick: () => pick("sessions") },
       ic("deck", "i-sm"), "Sessions ", h("b", {}, nSessions)),
     h("button", { class: "fchip", "aria-pressed": ui.view === "goals" ? "true" : "false", "data-key": "v:goals", onclick: () => pick("goals"),
       title: "What your sessions work toward, from their reports (ccdeck report)" }, ic("plan", "i-sm"), "Goals ", h("b", {}, (data.goals || []).filter((g) => g.open && !g.other).length)),
     h("button", { class: "fchip", "aria-pressed": ui.view === "prs" ? "true" : "false", "data-key": "v:prs", onclick: () => pick("prs"),
-      title: yours + " of " + rows.length + " open PRs wait on you" }, ic("pr", "i-sm"), "PRs ", h("b", {}, rows.length)));
+      title: yours + " of " + rows.length + " open PRs wait on you" }, ic("pr", "i-sm"), "PRs ", h("b", {}, rows.length)),
+    h("button", { class: "fchip", "aria-pressed": ui.view === "stacks" ? "true" : "false", "data-key": "v:stacks", onclick: () => pick("stacks"),
+      title: "Your stacked PRs, in the order to merge them" }, ic("branch", "i-sm"), "Stacks ", h("b", {}, prStacks().length)));
+}
+// Your stacks of open PRs: PRs of one repo that target each other's branches, forks included, bottom first
+function prStacks() {
+  const rows = ((data.plan && data.plan.rows) || []).filter((r) => r.step !== 3 && r.head);  // step 3: colleagues' PRs
+  const stacks = [];
+  for (const c of prChains(rows)) {
+    const home = c.onto && stacks.find((x) => x.includes(c.onto));  // a fork joins the stack it sits on
+    if (home) home.push(...c); else stacks.push([...c]);
+  }
+  return stacks.filter((c) => c.length > 1);
+}
+// The bottom PR merges first, so its step says what the whole stack needs
+const STACK_STEP = {
+  1: ["Ready to merge", "The bottom PR is green: merge it, and the next one is up"],
+  2: ["Fix the bottom PR", "Nothing above it can merge until it's fixed"],
+  4: ["Waiting", "The bottom PR waits on CI, a review, or a PR below it you didn't author"],
+  5: ["Gone quiet", "The bottom PR has had no activity for 14 days"],
+};
+function stacksView(q) {
+  const lq = q.toLowerCase();
+  const stacks = prStacks().filter((c) => !q || c.some((r) => [r.repo, r.title, r.head, "#" + r.number, r.session ? "@" + r.session.name : ""].join(" ").toLowerCase().includes(lq)));
+  const out = [];
+  if (!data.plan.fetched) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, "No PR data yet"), h("p", {}, "The PRs view says why.")));
+  else if (!stacks.length) out.push(h("div", { class: "empty", style: "padding-top: 48px" }, h("h2", {}, q ? "No stacks match “" + q + "”" : "No stacked PRs"),
+    h("p", {}, "A stack is PRs of one repo where each targets the branch of the one below, as ", h("span", { class: "mono" }, "gh stack"), " makes them.")));
+  for (const st of STEPS) {
+    const part = stacks.filter((c) => c[0].step === st.s);
+    if (!part.length) continue;
+    const [l, hint] = STACK_STEP[st.s] || [st.l, st.hint];
+    out.push(h("section", { class: "section", "data-g": st.g, "aria-labelledby": "h-stk" + st.s },
+      h("div", { class: st.s === 2 ? "ghdr ghdr-strong" : st.s >= 4 ? "ghdr ghdr-quiet" : "ghdr" },
+        h("h2", { id: "h-stk" + st.s }, h("span", { class: "gicon" }, ic(st.i)), l + " ", h("span", { class: "gcount" }, part.length)),
+        h("span", { class: "rule" }), h("span", { class: "ghint" }, hint)),
+      part.map((c) => h("div", { class: "stack", "data-key": "stk:" + c[0].url },
+        h("div", { class: "stack-h" }, ic("branch", "i-xs"), h("span", { class: "mono" }, c[0].repo),
+          h("span", {}, "into ", h("span", { class: "mono" }, c[0].base)), h("span", {}, plural(c.length, "PR") + ", merge in this order")),
+        h("ol", { class: "rrlist plan", "data-g": st.g }, c.map((r) => planRow(r, STEPS.find((x) => x.s === r.step) || st)))))));
+  }
+  out.push(h("footer", { class: "foot" }, h("span", {}, ic("refresh", "i-sm"), "Stacks from your open PRs' branches · states from GitHub, as in PRs · no AI")));
+  return out;
 }
 function planView(q) {
   let rows = planRows();
@@ -1078,8 +1172,44 @@ const linkLi = (l) => h("li", {},
   h("a", { class: "lchip", href: l.url, target: "_blank", rel: "noopener noreferrer", title: l.url }, ic(l.icon), l.name),
   h("a", { class: "ref-title", href: l.url, target: "_blank", rel: "noopener noreferrer" }, l.title || shortUrl(l.url)),
   h("span", { class: "ref-src" }, SOURCE[l.source] || ""));
-const prCard = (p) => h("div", { class: "prcard" },
-  h("div", { class: "prcard-h" }, prChip(p), h("span", { class: "ttl" }, p.title || p.repo), h("span", { class: "muted", style: "font-size: 12px; white-space: nowrap" }, p.repo)));
+// The details' PRs, by repo: a stack as a rail, top first, down to the branch its bottom PR targets; other
+// PRs as rows of their own. Each PR: its title, then CI, review, merge and draft as separate items, and what failed
+function prStack(prs) {
+  const repos = new Set(prs.map((p) => p.repo)).size > 1;
+  let last = null;
+  return h("div", { class: "prstacks" }, prChains(prs).map((c) => {
+    const head = repos && c[0].repo !== last ? h("h4", { class: "pst-repo-h mono" }, c[0].repo) : null;
+    last = c[0].repo;
+    return [head, prRail(c, c.onto)];
+  }));
+}
+function prRail(prs, onto) {
+  const top = [...prs].reverse(), stacked = prs.length > 1 || !!onto;
+  const item = (cls, icon, text, title) => h("span", { class: "pst-i " + cls, title }, icon ? ic(icon, "i-xs") : null, text);
+  const meta = (p) => {
+    if (p.state === "merged") return [item("ok-pr", "merge", "Merged")];
+    if (p.state === "closed") return [item("", "slash", "Closed")];
+    if (p.error) return [item("", "info", "State unknown", p.error)];
+    return [
+      p.checks === "failing" ? item("bad", "x-circle", "CI failing" + (p.failing.length > 1 ? " · " + p.failing.length : ""))
+        : p.checks === "pending" ? item("run", "clock", "CI running") : p.checks === "passing" ? item("ok", "check", "CI passing") : item("", null, "No checks"),
+      p.review === "approved" ? item("ok", "check-circle", "Approved") : p.review === "changes_requested" ? item("chg", "changes", "Changes requested")
+        : p.review === "review_required" ? item("", "reply", "Review required") : null,
+      p.mergeable === "conflicting" ? item("bad", "conflict", "Conflicts") : null,
+      p.draft ? item("", "draft", "Draft") : null,
+    ];
+  };
+  return h("ol", { class: "prstack", "data-stacked": stacked ? "1" : null },
+    top.map((p) => h("li", { class: "pst", "data-k": p.k },
+      h("span", { class: "pst-node", title: p.label }, ic(p.icon, "i-xs")),
+      h("div", { class: "pst-body" },
+        h("a", { class: "pst-h", href: p.url, target: "_blank", rel: "noopener noreferrer", title: p.url },
+          h("span", { class: "num" }, p.n), h("span", { class: "ttl" }, p.title || p.repo)),
+        h("div", { class: "pst-meta" }, meta(p)),
+        p.failing.length ? h("div", { class: "pst-fail" }, h("span", {}, "Failing"), p.failing.map((n) => h("code", {}, n))) : null))),
+    stacked && prs[0].base ? h("li", { class: "pst pst-trunk" }, h("span", { class: "pst-node" }, ic("branch", "i-xs")),
+      h("div", { class: "pst-body" }, h("span", {}, h("span", { class: "mono" }, prs[0].base), onto ? " · on " + onto.n : ""))) : null);
+}
 let drawerSig = "";
 const expanded = {}; // drawer sections opened with "Show all", per session
 let lastAll = [];
@@ -1165,7 +1295,7 @@ function renderDrawer(all) {
           h("div", { class: "cmd" }, h("span", {}, s.resumeCmd), h("button", { class: "btn btn-sm", onclick: () => copy(s.resumeCmd, "Resume command") }, ic("copy", "i-xs"), "Copy"))),
         s.main.issues.length ? h("section", { class: "dsec" }, h("h3", {}, s.main.issues.length === 1 ? "Linear ticket" : "Linear tickets · " + s.main.issues.length),
           h("ul", { class: "reflist" }, capped(s, "issues", s.main.issues, 4, issueLi, true))) : null,
-        s.main.prs.length ? h("section", { class: "dsec" }, h("h3", {}, "Pull requests · " + s.main.prs.length), capped(s, "prs", s.main.prs, 3, prCard)) : null,
+        s.main.prs.length ? h("section", { class: "dsec" }, h("h3", {}, (s.main.prs.some((p) => p.stacked) ? "Stacked pull requests · " : "Pull requests · ") + s.main.prs.length), prStack(s.main.prs)) : null,
         s.main.links.length ? h("section", { class: "dsec" }, h("h3", {}, "Pages and documents · " + s.main.links.length),
           h("ul", { class: "reflist" }, capped(s, "links", s.main.links, 5, linkLi, true))) : null,
         s.fileList.length ? h("section", { class: "dsec" }, h("h3", {}, "Files written · " + s.fileList.length),
