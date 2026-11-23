@@ -418,7 +418,7 @@ function prView(p) {
   } else if (p.error) { label = short = "State unknown"; }
   return { k, icon, n, label, short, url: p.url, title: p.title || "", repo: p.repo || "", error: p.error, own: p.own !== false, source: p.source,
     state: p.state || "", checks: p.checks || "", review: p.review || "", mergeable: p.mergeable || "", draft: !!p.draft,
-    failing: p.failing || [], head: p.head || "", base: p.base || "", bad: BAD_PR.has(k) };
+    failing: p.failing || [], head: p.head || "", base: p.base || "", fork: !!p.fork, bad: BAD_PR.has(k) };
 }
 const BAD_PR = new Set(["fail", "changes", "conflict"]);  // a PR that needs fixing before anything else
 const PR_RANK = ["fail", "changes", "conflict", "run", "draft", "ready", "approved", "merged"];
@@ -428,7 +428,9 @@ const PR_RANK = ["fail", "changes", "conflict", "run", "draft", "ready", "approv
 // into main), and a branch name only links PRs of the same repo.
 function prChains(prs) {
   const key = (p, branch) => p.repo + "\n" + branch;
-  const byHead = new Map(prs.filter((p) => p.head).map((p) => [key(p, p.head), p]));
+  // a parent's branch must be in the repo its child merges into: a fork's main isn't that repo's main
+  const inRepo = (p) => p.head && !p.fork && (!p.head_repo || p.head_repo === p.repo);
+  const byHead = new Map(prs.filter(inRepo).map((p) => [key(p, p.head), p]));
   const below = (p) => { const q = p.base ? byHead.get(key(p, p.base)) : null; return q && q !== p ? q : null; };
   const above = new Map();
   for (const p of prs) { const b = below(p); if (b) { if (!above.has(b)) above.set(b, []); above.get(b).push(p); } }
@@ -740,7 +742,7 @@ function render() {
   const isOld = (s) => isOldClosed(s, now);
   // the two header toggles count what they'd show in the current view
   const tab = isOff || !data.plan ? "sessions" : ui.view;
-  const [doneCount, oldCount] = tab === "goals" ? goalToggleCounts(all, now) : tab === "prs" || tab === "stacks" ? [donePrs(all, now, false).length, donePrs(all, now, true).length - donePrs(all, now, false).length]
+  const [doneCount, oldCount] = tab === "goals" ? goalToggleCounts(all, now) : tab === "prs" ? [donePrs(all, now, false).length, donePrs(all, now, true).length - donePrs(all, now, false).length]
     : [doneN, all.filter(isOld).length];
   const oldClosed = all.filter(isOld).length;
 
@@ -755,6 +757,7 @@ function render() {
   $("cOld").textContent = oldCount; $("tOld").setAttribute("aria-pressed", ui.showOld ? "true" : "false");
   $("tDone").title = { goals: "Done goals and the to-dos you marked done", prs: "Merged and closed PRs of your sessions" }[tab] || "Sessions you marked done or whose PR merged";
   $("tOld").title = { goals: "Goals' sessions closed more than a day ago", prs: "Also merged and closed PRs of sessions closed more than a day ago" }[tab] || "Sessions closed more than a day ago";
+  $("tDone").hidden = $("tOld").hidden = tab === "stacks";  // the Stacks view lists open PRs only
   renderHint(); renderLegend(); renderContours(all, isOff);
 
   const visibleGroup = (k) => isOff ? k === "need" : ui.filter === "all" ? (k !== "done" || ui.showDone) : ui.filter === k;

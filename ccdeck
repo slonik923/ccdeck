@@ -1037,9 +1037,12 @@ def current_checks(rollup):
     nothing: a run cancelled halfway still has a cancelled check."""
     checks = [ch for ch in rollup or [] if isinstance(ch, dict)]
     newest = {}
+    # newest by run, then by start: concurrent runs start their jobs in any order, so an older run's
+    # cancelled job can start after the newer run's failed one
+    order = lambda ch: (run_id(ch), ch.get("startedAt") or "")  # noqa: E731
     for ch in checks:
         key = (ch.get("workflowName") or "", ch.get("name") or ch.get("context") or "")
-        if key not in newest or (ch.get("startedAt") or "") >= (newest[key].get("startedAt") or ""):
+        if key not in newest or order(ch) >= order(newest[key]):
             newest[key] = ch
     last_run = {}  # workflow -> its newest run's id
     for ch in checks:
@@ -1086,7 +1089,7 @@ def fetch_pr(url):
     try:
         r = subprocess.run(
             ["gh", "pr", "view", url, "--json",
-             "number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,headRefName,baseRefName"],
+             "number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,headRefName,baseRefName,isCrossRepository"],
             capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as e:
         return {"error": str(e)}
@@ -1106,6 +1109,7 @@ def fetch_pr(url):
         "failing": failing_checks(d.get("statusCheckRollup"))[:8],  # what to fix, for the details
         "head": d.get("headRefName") or "",
         "base": d.get("baseRefName") or "",  # with head: a stack's order
+        "fork": bool(d.get("isCrossRepository")),  # its branch is in another repo: no PR can stack on it
     }
 
 

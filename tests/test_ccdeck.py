@@ -2637,6 +2637,8 @@ class ChecksTest(unittest.TestCase):
     def test_real_failures_still_count(self):
         c = self.ch
         self.assertEqual(cc.summarize_checks([c("deploy", "CANCELLED", "10:00:00")]), "failing")  # nothing newer replaced it
+        # run 2 failed; run 1's job started later and was cancelled: run 2's failure is the one in effect
+        self.assertEqual(cc.summarize_checks([c("unit", "FAILURE", "10:00:00", run=2), c("unit", "CANCELLED", "10:01:00", run=1)]), "failing")
         # cancelled halfway: lint, started later in the same run, is no newer run
         self.assertEqual(cc.summarize_checks([c("unit", "CANCELLED", "10:00:00"), c("lint", "SUCCESS", "10:01:00")]), "failing")
         no_link = dict(c("unit", "CANCELLED", "10:00:00"), detailsUrl="")  # not from Actions: can't tell, so it counts
