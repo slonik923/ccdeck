@@ -2549,8 +2549,10 @@ class MacDesktopTest(unittest.TestCase):
         self.assertIn('tell application "iTerm"', i)
         self.assertTrue(any("write text" in x for x in i))
         ti = cc.mac_terminal_command("/tmp", ["claude"], "iterm", tab=True)
-        self.assertIn("tell w to create tab with default profile", ti)
-        self.assertIn("set w to (create window with default profile)", ti)  # when no window is open
+        self.assertIn("tell current window to set t to (create tab with default profile)", ti)
+        self.assertIn("set s to current session of t", ti)  # the tab made here, not whichever is selected by then
+        self.assertIn("set s to current session of (create window with default profile)", ti)  # when no window is open
+        self.assertIn('tell s to write text "cd /tmp && claude"', ti)
         tt = cc.mac_terminal_command("/tmp", ["claude"], "terminal", tab=True)
         self.assertIn('tell application "System Events" to keystroke "t" using command down', tt)
         self.assertIn('do script "cd /tmp && claude" in front window', tt)

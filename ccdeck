@@ -2741,10 +2741,13 @@ def mac_terminal_command(cwd, argv, app=None, tab=False):
         has_iterm = Path("/Applications/iTerm.app").exists() or (HOME / "Applications" / "iTerm.app").exists()
         app = (mac_terminal_used() or "iterm") if has_iterm else "terminal"
     if app == "iterm" and tab:
+        # write to the session of the tab made here: "current session of" the window would be whatever tab is
+        # selected when the write runs, which another Resume can have changed
         return ["osascript", "-e", 'tell application "iTerm"', "-e", "activate",
-                "-e", "if current window is missing value then", "-e", "set w to (create window with default profile)",
-                "-e", "else", "-e", "set w to current window", "-e", "tell w to create tab with default profile", "-e", "end if",
-                "-e", f"tell current session of w to write text {line}", "-e", "end tell"]
+                "-e", "if current window is missing value then", "-e", "set s to current session of (create window with default profile)",
+                "-e", "else", "-e", "tell current window to set t to (create tab with default profile)",
+                "-e", "set s to current session of t", "-e", "end if",
+                "-e", f"tell s to write text {line}", "-e", "end tell"]
     if app == "iterm":
         return ["osascript", "-e", 'tell application "iTerm"', "-e", "activate",
                 "-e", "set w to (create window with default profile)",
