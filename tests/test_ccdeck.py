@@ -62,7 +62,7 @@ if sys.argv[1:3] == ["api", "graphql"]:
 url = sys.argv[3]
 n = int(url.rsplit("/", 1)[1])
 fixtures = {
-    1: {"state": "OPEN", "isDraft": True, "reviewDecision": "", "mergeable": "MERGEABLE",
+    1: {"state": "OPEN", "isDraft": True, "reviewDecision": "", "mergeable": "MERGEABLE", "headRefOid": "c1",
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]},
     2: {"state": "OPEN", "isDraft": False, "reviewDecision": "", "mergeable": "MERGEABLE",
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]},
@@ -440,7 +440,7 @@ class ClassifyTest(unittest.TestCase):
         against the full check list, which can say it passes (fake gh: #1 passes, #2 fails)."""
         node = {"url": "https://github.com/me/app/pull/1", "number": 1, "isInMergeQueue": True, "mergeQueueEntry": {"position": 3},
                 "autoMergeRequest": {"enabledAt": "2026-01-01T00:00:00Z"}, "reviewRequests": {"totalCount": 2},
-                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}}
+                "commits": {"nodes": [{"commit": {"oid": "c1", "statusCheckRollup": {"state": "FAILURE"}}}]}}
         plan = cc.parse_pr_plan({"mine": {"nodes": [node, dict(node, url="https://github.com/me/app/pull/2", isInMergeQueue=False)]}})
         one, two = plan["prs"]
         self.assertEqual((one["queue"], one["auto_merge"], one["review_requests"], two["queue"]), (3, True, 2, 0))
@@ -449,6 +449,9 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(two["checks"], "failing")
         cc.verify_failing(plan, time.monotonic() - 1)  # out of time: what GitHub said stays
         self.assertEqual(two["checks"], "failing")
+        moved = dict(node, commits={"nodes": [{"commit": {"oid": "c0", "statusCheckRollup": {"state": "FAILURE"}}}]})
+        stale = cc.verify_failing(cc.parse_pr_plan({"mine": {"nodes": [moved]}}), time.monotonic() + 30)["prs"][0]
+        self.assertEqual(stale["checks"], "failing")  # a new commit since: its checks don't go with the old merge state
 
     def test_review_requests_setting(self):
         """mine leaves out team requests; a cache fetched for another setting isn't shown; off fetches nothing."""

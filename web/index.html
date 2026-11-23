@@ -1023,7 +1023,8 @@ function planRow(r, st, inGoal) {
     h(validUrl ? "a" : "span", Object.assign({ class: "prchip", "data-k": st.k, title: st.l, "data-key": "prn:" + r.url }, link), ic(st.i), h("span", { class: "num" }, "#" + r.number)),
     h("div", { class: "plan-main" },
       h(validUrl ? "a" : "span", Object.assign({ class: "rr-title", title: r.title, "data-key": "prt:" + r.url }, link), r.title),
-      h("span", { class: "plan-next" }, r.texts.join(" · "), ...afterLinks(r.after)),
+      // the status line drops a "CI failing" the next action already says, so its list of failed checks shows here
+      h("span", { class: "plan-next", title: (r.failing || []).length ? "Failing: " + r.failing.join(", ") : null }, r.texts.join(" · "), ...afterLinks(r.after)),
       st.s !== 3 ? h("span", { class: "plan-status pst-meta" }, planStatus(r)) : null,
       !inGoal && (r.session_next || r.goal) ? h("span", { class: "plan-say" }, goalChip(r.goal, "g:" + r.url), r.session_next ? h("span", { title: "What the session reported" }, r.session_next) : null) : null),
     h("span", { class: "rr-repo mono" }, r.repo),

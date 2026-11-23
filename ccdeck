@@ -1191,7 +1191,7 @@ PR_PLAN_QUERY = """query {
     isInMergeQueue mergeQueueEntry { position } autoMergeRequest { enabledAt } reviewRequests { totalCount }
     headRepository { nameWithOwner }
     repository { nameWithOwner defaultBranchRef { name } } author { login }
-    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    commits(last: 1) { nodes { commit { oid statusCheckRollup { state } } } }
     reviewThreads(first: 100) { pageInfo { hasNextPage endCursor } nodes { isResolved comments(last: 1) { nodes { author { login } } } } }
   } } }
 }"""
@@ -1258,15 +1258,19 @@ def fetch_pr_plan():
 def verify_failing(plan, deadline):
     """GitHub's rollup state can read FAILURE while every check passed in a newer run (and flips
     between reads), so a failing PR is checked against its full check list, as sessions' PRs are.
-    Also gives the failing check names. Out of time or on an error, the rollup's answer stays."""
+    Also gives the failing check names. Out of time, on an error, or when the PR got a new commit in
+    between (its checks would go with the old commit's merge and review state), the rollup's answer stays."""
     for p in plan["prs"]:
         if p["checks"] != "failing" or time.monotonic() > deadline:
             continue
         try:
-            r = subprocess.run(["gh", "pr", "view", p["url"], "--json", "statusCheckRollup"],
+            r = subprocess.run(["gh", "pr", "view", p["url"], "--json", "statusCheckRollup,headRefOid"],
                                capture_output=True, text=True, timeout=max(1, min(20, deadline - time.monotonic())))
-            rollup = json.loads(r.stdout).get("statusCheckRollup") if r.returncode == 0 else None
+            d = json.loads(r.stdout) if r.returncode == 0 else {}
+            rollup = d.get("statusCheckRollup")
         except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            continue
+        if p.get("head_oid") and d.get("headRefOid") != p["head_oid"]:
             continue
         if isinstance(rollup, list) and rollup:
             p["checks"], p["failing"] = summarize_checks(rollup), failing_checks(rollup)[:8]
@@ -1338,6 +1342,7 @@ def parse_pr_plan(d):
             "merge": (n.get("mergeStateStatus") or "unknown").lower(),  # clean | blocked | behind | dirty | unstable | unknown
             "review": (n.get("reviewDecision") or "").lower(),
             "checks": ROLLUP.get(rollup, "none") if rollup else "none",
+            "head_oid": commit.get("oid") or "",  # the commit the checks are for
             # someone else spoke last: work for the author; you did: only you can resolve the thread
             "threads": sum(1 for a in last if a != viewer), "threads_yours": sum(1 for a in last if a == viewer),
             "threads_more": bool((((n.get("reviewThreads") or {}).get("pageInfo")) or {}).get("hasNextPage")),
