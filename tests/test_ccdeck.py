@@ -2555,7 +2555,12 @@ class MacDesktopTest(unittest.TestCase):
         self.assertIn('tell s to write text "cd /tmp && claude"', ti)
         tt = cc.mac_terminal_command("/tmp", ["claude"], "terminal", tab=True)
         self.assertIn('tell application "System Events" to keystroke "t" using command down', tt)
-        self.assertIn('do script "cd /tmp && claude" in front window', tt)
+        # the window is taken before ⌘T, not resolved as "front window" after the delay
+        self.assertLess(tt.index("set w to id of front window"), tt.index('tell application "System Events" to keystroke "t" using command down'))
+        self.assertIn('do script "cd /tmp && claude" in selected tab of window id w', tt)
+        # a refused keystroke (no Accessibility permission) opens a window instead, and the command runs once
+        self.assertEqual(tt[tt.index("try") + 2:tt.index("end try")][::2], ['tell application "System Events" to keystroke "t" using command down', "set made to true"])
+        self.assertIn("else", tt[tt.index("if made then"):])
 
     def test_resume_opens_the_terminal_you_use(self):
         """Both installed: the app most open sessions run in, else the one the dashboard started from."""

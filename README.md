@@ -177,7 +177,7 @@ The terminal used for **Resume ▸**:
 
 Any other terminal works through `CCDECK_TERMINAL`, for example `CCDECK_TERMINAL="wezterm start --"`. macOS asks once whether ccdeck may control Terminal or iTerm.
 
-**Resume in a new tab** (in the dashboard's settings, saved as `terminal_tabs` in `config.json`) opens a tab in the terminal's window instead of a new window. It works in GNOME Terminal, Ptyxis, Konsole, xfce4-terminal, iTerm and Terminal; the others, and a `CCDECK_TERMINAL` command, still open a window. Terminal.app has no scripting command for tabs, so ccdeck presses ⌘T, and macOS asks once for the Accessibility permission.
+**Resume in a new tab** (in the dashboard's settings, saved as `terminal_tabs` in `config.json`) opens a tab in the terminal's window instead of a new window. It works in GNOME Terminal, Ptyxis, Konsole, xfce4-terminal, iTerm and Terminal; the others, and a `CCDECK_TERMINAL` command, still open a window. Terminal.app has no scripting command for tabs, so ccdeck presses ⌘T, and macOS asks once for the Accessibility permission. Without it, the session opens in a new window.
 
 ## Trying a change before it's released
 

@@ -2753,11 +2753,17 @@ def mac_terminal_command(cwd, argv, app=None, tab=False):
                 "-e", "set w to (create window with default profile)",
                 "-e", f"tell current session of w to write text {line}", "-e", "end tell"]
     if tab:
-        # Terminal has no scripting command for a new tab: press ⌘T, which needs the Accessibility permission
+        # Terminal has no scripting command for a new tab: press ⌘T, which needs the Accessibility permission.
+        # The window is taken before the keystroke, so bringing another window forward meanwhile changes
+        # nothing; without the permission the keystroke fails and the command opens a new window instead.
         return ["osascript", "-e", 'tell application "Terminal"', "-e", "activate",
                 "-e", "if (count of windows) is 0 then", "-e", f"do script {line}", "-e", "else",
-                "-e", 'tell application "System Events" to keystroke "t" using command down', "-e", "delay 0.3",
-                "-e", f"do script {line} in front window", "-e", "end if", "-e", "end tell"]
+                "-e", "set w to id of front window", "-e", "set made to false",
+                "-e", "try", "-e", 'tell application "System Events" to keystroke "t" using command down',
+                "-e", "set made to true", "-e", "end try",
+                "-e", "if made then", "-e", "delay 0.3", "-e", f"do script {line} in selected tab of window id w",
+                "-e", "else", "-e", f"do script {line}", "-e", "end if",
+                "-e", "end if", "-e", "end tell"]
     return ["osascript", "-e", f'tell application "Terminal" to do script {line}',
             "-e", 'tell application "Terminal" to activate']
 
