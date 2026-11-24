@@ -109,9 +109,13 @@ def pr(n, title, state="OPEN", draft=False, review="", checks="SUCCESS", mergeab
             "mergeable": mergeable, "statusCheckRollup": roll, "headRefName": head, "baseRefName": base}
 
 
-def gql(repo, n, title, head, base="main", draft=False, merge="CLEAN", review=None, checks="SUCCESS", said=(), mins=60):
-    """One PR as the PR view's GraphQL query returns it. said: who wrote last on each open review thread."""
+def gql(repo, n, title, head, base="main", draft=False, merge="CLEAN", review=None, checks="SUCCESS", said=(), mins=60,
+        queue=0, auto=False, asked=0):
+    """One PR as the PR view's GraphQL query returns it. said: who wrote last on each open review thread.
+    queue: its place in the merge queue (0: not queued). auto: auto-merge on. asked: reviewers asked."""
     return {"url": REPO.format(repo, n), "number": n, "title": title, "isDraft": draft, "updatedAt": ts(mins),
+            "isInMergeQueue": bool(queue), "mergeQueueEntry": {"position": queue} if queue else None,
+            "autoMergeRequest": {"enabledAt": ts(mins)} if auto else None, "reviewRequests": {"totalCount": asked},
             "headRefName": head, "baseRefName": base, "mergeStateStatus": merge, "reviewDecision": review,
             "repository": {"nameWithOwner": "acme/" + repo, "defaultBranchRef": {"name": "main"}}, "author": {"login": "you"},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": checks} if checks else None}}]},
@@ -172,7 +176,7 @@ def build(home, pid):
     for s in sessions:
         s.write()
     prs = {
-        REPO.format("dashboard", 212): pr(212, "CSV export for reports", checks="FAILURE"),
+        REPO.format("dashboard", 212): pr(212, "CSV export for reports", checks="FAILURE", failing=("typecheck", "e2e-download")),
         REPO.format("billing-api", 88): pr(88, "Rate-limit public API", review="CHANGES_REQUESTED"),
         REPO.format("web-app", 301): pr(301, "Node 22 LTS", checks="PENDING"),
         REPO.format("web-app", 299): pr(299, "Settings dark mode", draft=True),
@@ -194,13 +198,15 @@ def build(home, pid):
         gql("billing-api", 88, "Rate-limit public API", "feat/rate-limit", review="CHANGES_REQUESTED", said=("dana", "reviewbot"), mins=34),
         gql("web-app", 301, "Node 22 LTS", "chore/node-22", checks="PENDING", mins=3),
         gql("web-app", 299, "Settings dark mode", "feat/settings-dark", draft=True, mins=7),
-        gql("billing-api", 90, "Cache exchange rates", "feat/fx-cache", merge="BLOCKED", review="REVIEW_REQUIRED", mins=49),
+        gql("billing-api", 90, "Cache exchange rates", "feat/fx-cache", merge="BLOCKED", review="REVIEW_REQUIRED", mins=49, asked=2),
         gql("billing-api", 93, "Refresh cached rates hourly", "feat/fx-refresh", base="feat/fx-cache", mins=45),
         gql("billing-api", 95, "Ledger export: query entries by period", "feat/ledger-1-query", review="APPROVED", mins=25),
         gql("billing-api", 96, "Ledger export: stream entries as CSV", "feat/ledger-2-csv", base="feat/ledger-1-query", checks="FAILURE", mins=24),
         gql("billing-api", 97, "Ledger export: download button", "feat/ledger-3-ui", base="feat/ledger-2-csv", draft=True, mins=23),
         gql("tooling", 55, "Pin GitHub Actions to commit SHAs", "ci/pin-actions", said=("you", "you"), mins=300),
-        gql("storefront", 140, "Lazy-load product images", "perf/lazy-images", mins=150),
+        gql("storefront", 140, "Lazy-load product images", "perf/lazy-images", review="APPROVED", mins=150),
+        gql("storefront", 142, "Preload hero image", "perf/hero-preload", review="APPROVED", queue=2, mins=20),
+        gql("web-app", 305, "Upgrade ESLint to v9", "chore/eslint-9", merge="BLOCKED", review="APPROVED", checks="PENDING", auto=True, mins=12),
         gql("web-app", 256, "Remove old feature flags", "chore/flags", merge="DIRTY", mins=30 * 1440),
     ]
     gh.write_text(FAKE_GH.replace("__PRS__", repr(prs)).replace("__REVIEWS__", repr(reviews)).replace("__PLAN__", repr(plan)))

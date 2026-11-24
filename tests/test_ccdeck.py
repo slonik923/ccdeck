@@ -62,7 +62,7 @@ if sys.argv[1:3] == ["api", "graphql"]:
 url = sys.argv[3]
 n = int(url.rsplit("/", 1)[1])
 fixtures = {
-    1: {"state": "OPEN", "isDraft": True, "reviewDecision": "", "mergeable": "MERGEABLE",
+    1: {"state": "OPEN", "isDraft": True, "reviewDecision": "", "mergeable": "MERGEABLE", "headRefOid": "c1",
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]},
     2: {"state": "OPEN", "isDraft": False, "reviewDecision": "", "mergeable": "MERGEABLE",
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]},
@@ -397,9 +397,13 @@ class ClassifyTest(unittest.TestCase):
             ({"threads_more": True, "threads": 1}, None, None, (2, ["1 review comment to answer, maybe more"], "you")),
             ({"checks": "failing"}, 9, None, (2, ["CI failing"], "you")),  # a fix comes before waiting for the base PR
             ({}, 9, None, (4, ["After #9 merges"], None)),
+            ({"queue": 2}, 9, None, (4, ["In the merge queue, #2"], None)),  # queued: its base already merged in the queue's view
+            ({"auto_merge": True, "merge": "blocked"}, None, None, (4, ["Merges by itself when ready (auto-merge)"], None)),
+            ({"auto_merge": True, "checks": "failing"}, None, None, (2, ["CI failing"], "you")),  # auto-merge won't fix CI
             ({"checks": "pending"}, None, None, (4, ["CI running"], None)),
             ({"merge": "blocked", "threads_yours": 1}, None, None, (2, ["Resolve 1 thread", "Waiting for a review or a required check"], "you")),
             ({"merge": "blocked"}, None, None, (4, ["Waiting for a review or a required check"], None)),
+            ({"merge": "blocked", "review": "review_required"}, None, None, (4, ["Waiting for a review"], None)),
             ({"merge": "unknown"}, None, None, (4, ["GitHub is still checking whether it can merge"], None)),
             ({"draft": True}, None, "s1", (2, ["Draft: look it over, then mark it ready"], "you")),  # its session waits for you
             ({"draft": True}, None, None, (2, ["Draft: look it over, then mark it ready"], "you")),
@@ -430,6 +434,27 @@ class ClassifyTest(unittest.TestCase):
             self.assertIn(step, (1, 2, 4, 5))
             self.assertTrue(texts and all(texts))
             self.assertEqual(who is None, step == 4)
+
+    def test_plan_reads_queue_and_checks_failing_ci(self):
+        """The plan keeps merge queue, auto-merge and requested reviews; a FAILURE rollup is checked
+        against the full check list, which can say it passes (fake gh: #1 passes, #2 fails)."""
+        node = {"url": "https://github.com/me/app/pull/1", "number": 1, "isInMergeQueue": True, "mergeQueueEntry": {"position": 3},
+                "autoMergeRequest": {"enabledAt": "2026-01-01T00:00:00Z"}, "reviewRequests": {"totalCount": 2},
+                "commits": {"nodes": [{"commit": {"oid": "c1", "statusCheckRollup": {"state": "FAILURE"}}}]}}
+        plan = cc.parse_pr_plan({"mine": {"nodes": [node, dict(node, url="https://github.com/me/app/pull/2", isInMergeQueue=False)]}})
+        one, two = plan["prs"]
+        self.assertEqual((one["queue"], one["auto_merge"], one["review_requests"], two["queue"]), (3, True, 2, 0))
+        cc.verify_failing(plan, time.monotonic() + 30)
+        self.assertEqual((one["checks"], one["failing"]), ("passing", []))
+        self.assertEqual(two["checks"], "failing")
+        # out of time: what GitHub said stays, and gh isn't asked (#1 would read passing if it were)
+        late = cc.parse_pr_plan({"mine": {"nodes": [node]}})
+        with mock.patch.object(cc.subprocess, "run", side_effect=AssertionError("gh called after the deadline")):
+            cc.verify_failing(late, time.monotonic() - 1)
+        self.assertEqual(late["prs"][0]["checks"], "failing")
+        moved = dict(node, commits={"nodes": [{"commit": {"oid": "c0", "statusCheckRollup": {"state": "FAILURE"}}}]})
+        stale = cc.verify_failing(cc.parse_pr_plan({"mine": {"nodes": [moved]}}), time.monotonic() + 30)["prs"][0]
+        self.assertEqual(stale["checks"], "failing")  # a new commit since: its checks don't go with the old merge state
 
     def test_review_requests_setting(self):
         """mine leaves out team requests; a cache fetched for another setting isn't shown; off fetches nothing."""
