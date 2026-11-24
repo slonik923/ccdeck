@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.11"
+VERSION = "0.9.12"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -2690,17 +2690,17 @@ def setup_notifications(interactive):
         open_path(NOTIFY_SETTINGS_URL)
 
 
-TERMINALS = [  # (binary, args before the command)
-    ("gnome-terminal", ["--"]),
-    ("ptyxis", ["--new-window", "--"]),
-    ("kgx", ["-e"]),
-    ("konsole", ["-e"]),
-    ("xfce4-terminal", ["-x"]),
-    ("tilix", ["-e"]),
-    ("kitty", []),
-    ("alacritty", ["-e"]),
-    ("x-terminal-emulator", ["-e"]),
-    ("xterm", ["-e"]),
+TERMINALS = [  # (binary, args before the command for a window, for a tab or None if it can't open one)
+    ("gnome-terminal", ["--"], ["--tab", "--"]),
+    ("ptyxis", ["--new-window", "--"], ["--tab", "--"]),
+    ("kgx", ["-e"], None),
+    ("konsole", ["-e"], ["--new-tab", "-e"]),
+    ("xfce4-terminal", ["-x"], ["--tab", "-x"]),
+    ("tilix", ["-e"], None),
+    ("kitty", [], None),  # tabs need remote control turned on in kitty.conf
+    ("alacritty", ["-e"], None),
+    ("x-terminal-emulator", ["-e"], None),
+    ("xterm", ["-e"], None),
 ]
 
 
@@ -2733,31 +2733,71 @@ def mac_terminal_used():
     return {"Apple_Terminal": "terminal", "iTerm.app": "iterm"}.get(os.environ.get("TERM_PROGRAM", ""))
 
 
-def mac_terminal_command(cwd, argv, app=None):
-    """osascript that opens Terminal or iTerm and runs the command in a new window."""
+def mac_terminal_command(cwd, argv, app=None, tab=False):
+    """osascript that opens Terminal or iTerm and runs the command in a new window, or a new tab of the
+    front window when tab is set and one is open."""
     line = applescript_str(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}")
     if app is None:
         has_iterm = Path("/Applications/iTerm.app").exists() or (HOME / "Applications" / "iTerm.app").exists()
         app = (mac_terminal_used() or "iterm") if has_iterm else "terminal"
+    if app == "iterm" and tab:
+        # write to the session of the tab made here: "current session of" the window would be whatever tab is
+        # selected when the write runs, which another Resume can have changed
+        return ["osascript", "-e", 'tell application "iTerm"', "-e", "activate",
+                "-e", "if current window is missing value then", "-e", "set s to current session of (create window with default profile)",
+                "-e", "else", "-e", "tell current window to set t to (create tab with default profile)",
+                "-e", "set s to current session of t", "-e", "end if",
+                "-e", f"tell s to write text {line}", "-e", "end tell"]
     if app == "iterm":
         return ["osascript", "-e", 'tell application "iTerm"', "-e", "activate",
                 "-e", "set w to (create window with default profile)",
                 "-e", f"tell current session of w to write text {line}", "-e", "end tell"]
+    if tab:
+        # Terminal has no scripting command for a new tab: press ⌘T, which needs the Accessibility permission.
+        # The window is taken before the keystroke, so bringing another window forward meanwhile changes
+        # nothing; without the permission the keystroke fails and the command opens a new window instead.
+        return ["osascript", "-e", 'tell application "Terminal"', "-e", "activate",
+                "-e", "if (count of windows) is 0 then", "-e", f"do script {line}", "-e", "else",
+                "-e", "set w to id of front window", "-e", "set made to false",
+                "-e", "try", "-e", 'tell application "System Events" to keystroke "t" using command down',
+                "-e", "set made to true", "-e", "end try",
+                "-e", "if made then", "-e", "delay 0.3", "-e", f"do script {line} in selected tab of window id w",
+                "-e", "else", "-e", f"do script {line}", "-e", "end if",
+                "-e", "end if", "-e", "end tell"]
     return ["osascript", "-e", f'tell application "Terminal" to do script {line}',
             "-e", 'tell application "Terminal" to activate']
 
 
-def terminal_command(cwd, argv):
+def terminal_tabs_enabled():
+    """config.json's terminal_tabs: Resume opens a tab in the terminal's window instead of a new window."""
+    return bool(load_json(CONFIG_FILE, {}).get("terminal_tabs"))
+
+
+def terminal_command(cwd, argv, tab=None):
+    tab = terminal_tabs_enabled() if tab is None else tab
     custom = os.environ.get("CCDECK_TERMINAL")
     if IS_MAC and (not custom or custom.strip().lower() in ("iterm", "terminal")):
-        return mac_terminal_command(cwd, argv, custom.strip().lower() if custom else None)
+        return mac_terminal_command(cwd, argv, custom.strip().lower() if custom else None, tab)
     script = f"cd {shlex.quote(cwd)} && {shlex.join(argv)}; exec \"${{SHELL:-bash}}\""
     inner = ["bash", "-lc", script]
-    candidates = [(shlex.split(custom)[0], shlex.split(custom)[1:])] if custom else TERMINALS
-    for binary, pre in candidates:
+    # a custom command is used as given: ccdeck doesn't know its tab flag
+    candidates = [(shlex.split(custom)[0], shlex.split(custom)[1:], None)] if custom else TERMINALS
+    for binary, pre, tab_pre in candidates:
         if shutil.which(binary):
-            return [binary] + pre + inner
+            return [binary] + (tab_pre if tab and tab_pre else pre) + inner
     return None
+
+
+# The Claude Code session whose hook started the dashboard: its own marks, which a claude started from the
+# dashboard must not inherit (CLAUDE_CODE_CHILD_SESSION turns its transcript saving off).
+# shortcut: names seen in Claude Code 2.x; add new per-session ones here when they turn up
+SESSION_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_TMPDIR", "CLAUDE_CODE_TMPDIR",
+               "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SSE_PORT")
+SESSION_ENV_PREFIXES = ("CLAUDE_CODE_CHILD_", "CLAUDE_CODE_SESSION_", "CLAUDE_CODE_MESSAGING_", "CLAUDE_CODE_HOST_")
+
+
+def without_session_env(env):
+    return {k: v for k, v in env.items() if k not in SESSION_ENV and not k.startswith(SESSION_ENV_PREFIXES)}
 
 
 def open_terminal(cwd, argv):
@@ -2765,7 +2805,8 @@ def open_terminal(cwd, argv):
     cmd = terminal_command(cwd, argv)
     if not cmd:
         raise RuntimeError("No terminal emulator found; set CCDECK_TERMINAL")
-    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=user_env(desktop_env()),
+    env = without_session_env(user_env(desktop_env()))
+    subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else None, env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     if cmd[0] == "osascript":
         return "iTerm" if 'tell application "iTerm"' in cmd else "Terminal"
@@ -4293,6 +4334,7 @@ def settings_view():
     return {
         "review_requests": {"value": review_scope(),
                             "locked": "CCDECK_REVIEW_REQUESTS=0" if env("CCDECK_REVIEW_REQUESTS") == "0" else None},
+        "terminal_tabs": {"value": terminal_tabs_enabled(), "locked": None},
         "approvals": {"value": approvals_enabled(),
                       "locked": f"CCDECK_APPROVALS={env('CCDECK_APPROVALS')}" if env("CCDECK_APPROVALS") is not None else None},
         "notifications": {c: {"value": notify_enabled(c),
@@ -4302,13 +4344,13 @@ def settings_view():
 
 
 def set_setting(key, value):
-    """Save one setting to config.json. key is review_requests, approvals or notifications.<channel>.
+    """Save one setting to config.json. key is review_requests, approvals, terminal_tabs or notifications.<channel>.
     Raises ValueError for an unknown key or a value it can't take.
     The dashboard (a thread per request) and the ccdeck commands (other processes) all write config.json,
     each reading the whole file and saving it back, so a file lock keeps one from undoing another's change."""
     import fcntl
     if not (key == "review_requests" and isinstance(value, str) and value in REVIEW_SCOPES
-            or key == "approvals" and isinstance(value, bool)
+            or key in ("approvals", "terminal_tabs") and isinstance(value, bool)
             or key.startswith("notifications.") and key.split(".", 1)[1] in NOTIFY_CHANNELS and isinstance(value, bool)):
         raise ValueError(f"can't set {key} to {value!r}")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
