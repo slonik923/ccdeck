@@ -447,8 +447,11 @@ class ClassifyTest(unittest.TestCase):
         cc.verify_failing(plan, time.monotonic() + 30)
         self.assertEqual((one["checks"], one["failing"]), ("passing", []))
         self.assertEqual(two["checks"], "failing")
-        cc.verify_failing(plan, time.monotonic() - 1)  # out of time: what GitHub said stays
-        self.assertEqual(two["checks"], "failing")
+        # out of time: what GitHub said stays, and gh isn't asked (#1 would read passing if it were)
+        late = cc.parse_pr_plan({"mine": {"nodes": [node]}})
+        with mock.patch.object(cc.subprocess, "run", side_effect=AssertionError("gh called after the deadline")):
+            cc.verify_failing(late, time.monotonic() - 1)
+        self.assertEqual(late["prs"][0]["checks"], "failing")
         moved = dict(node, commits={"nodes": [{"commit": {"oid": "c0", "statusCheckRollup": {"state": "FAILURE"}}}]})
         stale = cc.verify_failing(cc.parse_pr_plan({"mine": {"nodes": [moved]}}), time.monotonic() + 30)["prs"][0]
         self.assertEqual(stale["checks"], "failing")  # a new commit since: its checks don't go with the old merge state
