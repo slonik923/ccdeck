@@ -1490,6 +1490,15 @@ class HookTest(unittest.TestCase):
         self.assertEqual(cc.load_json(path, {}), {"session_id": "s-overlap", "status": "idle", "active_ts": 200.0})
         cc.save_hook_state(path, {"session_id": "s-overlap", "status": "working", "active_ts": 300.0})
         self.assertEqual(cc.load_json(path, {})["active_ts"], 300.0)
+        # a lock file that can't be opened doesn't stop the save, and nothing raises out of the hook
+        lock = cc.STATE_DIR / ".lock"
+        lock.unlink(missing_ok=True)
+        lock.mkdir()
+        try:
+            cc.save_hook_state(path, {"session_id": "s-overlap", "status": "stopped", "active_ts": 250.0})
+        finally:
+            lock.rmdir()
+        self.assertEqual(cc.load_json(path, {}), {"session_id": "s-overlap", "status": "stopped", "active_ts": 300.0})
         path.unlink()
 
     def test_hook_activity_just_after_the_error_clears_it(self):
