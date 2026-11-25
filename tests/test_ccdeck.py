@@ -1468,6 +1468,50 @@ class HookTest(unittest.TestCase):
         finally:
             cc.running_claude_processes = saved
 
+    def test_hook_activity_after_the_transcript_clears_its_error(self):
+        """Under /remote-control Claude Code stops writing the transcript; the hooks still fire."""
+        build_fixtures()
+        sid = "s-error"
+        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        self.assertEqual(by_id(cc.collect(True, 10 ** 6))[sid]["state"], "error")
+        self.run_hook({"session_id": sid, "hook_event_name": "Stop"})  # ending the turn isn't activity
+        self.assertEqual(by_id(cc.collect(True, 10 ** 6))[sid]["state"], "error")
+        self.run_hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+        self.run_hook({"session_id": sid, "hook_event_name": "Stop"})
+        row = by_id(cc.collect(True, 10 ** 6))[sid]
+        self.assertNotEqual(row["state"], "error")
+        self.assertGreater(row["last_ts"], time.time() - 60)
+
+    def test_overlapping_hooks_keep_the_newest_activity(self):
+        """A hook that read the state before another one saved newer activity doesn't write it back older."""
+        path = cc.STATE_DIR / "s-overlap.json"
+        cc.save_json(path, {"session_id": "s-overlap", "status": "working", "active_ts": 200.0})
+        cc.save_hook_state(path, {"session_id": "s-overlap", "status": "idle", "active_ts": 100.0})
+        self.assertEqual(cc.load_json(path, {}), {"session_id": "s-overlap", "status": "idle", "active_ts": 200.0})
+        cc.save_hook_state(path, {"session_id": "s-overlap", "status": "working", "active_ts": 300.0})
+        self.assertEqual(cc.load_json(path, {})["active_ts"], 300.0)
+        # a lock file that can't be opened doesn't stop the save, and nothing raises out of the hook
+        lock = cc.STATE_DIR / ".lock"
+        lock.unlink(missing_ok=True)
+        lock.mkdir()
+        try:
+            cc.save_hook_state(path, {"session_id": "s-overlap", "status": "stopped", "active_ts": 250.0})
+        finally:
+            lock.rmdir()
+        self.assertEqual(cc.load_json(path, {}), {"session_id": "s-overlap", "status": "stopped", "active_ts": 300.0})
+        path.unlink()
+
+    def test_hook_activity_just_after_the_error_clears_it(self):
+        """A prompt half a second after the transcript's last entry is still newer: no one-second margin."""
+        build_fixtures()
+        sid = "s-error"
+        (cc.STATE_DIR / f"{sid}.json").unlink(missing_ok=True)
+        error_ts = by_id(cc.collect(True, 10 ** 6))[sid]["last_ts"]
+        cc.save_json(cc.STATE_DIR / f"{sid}.json", {"session_id": sid, "status": "stopped", "ts": error_ts + 0.6, "active_ts": error_ts + 0.5})
+        row = by_id(cc.collect(True, 10 ** 6))[sid]
+        self.assertNotEqual(row["state"], "error")
+        self.assertEqual(row["last_ts"], error_ts + 0.5)
+
     def test_print_resume_does_not_mark_session_alive(self):
         build_fixtures()
         (cc.STATE_DIR / "s-closed.json").unlink(missing_ok=True)  # only the -p process may speak for it

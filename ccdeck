@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-VERSION = "0.9.13"
+VERSION = "0.9.14"
 HOME = Path.home()
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -1771,6 +1771,12 @@ def collect(include_all=False, days=DEFAULT_DAYS):
         else:
             alive = sid in peers or sid in resumed or sid in guessed_live
             s["live_source"] = "guess"
+        active = (hook or {}).get("active_ts") or 0
+        if active > s.get("last_ts", 0):
+            # The hooks saw the session work after its transcript's last entry: Claude Code stops writing the
+            # transcript in some modes (/remote-control). That entry's API error is over, and its age is wrong.
+            # No margin is needed: Claude Code waits for these hooks, so an entry they come before is newer.
+            sessions[sid] = s = dict(s, last_ts=active, api_error=False)
         if (sid in resumed or sid in peers) and not hook_live:
             hook = None  # another process resumed it; the ended one's status (ended, permission) isn't the live one's
         s["alive"] = alive
@@ -4085,6 +4091,33 @@ def start_preview(args):
 INBOX_ACTED = ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "PermissionDenied", "SessionEnd")
 
 
+def save_hook_state(path, state):
+    """Save a session's hook state, keeping the newest activity time. Hooks of one session can overlap
+    (parallel tool calls, a Notification), and each writes back what it read a moment earlier: a lost
+    active_ts would bring back a stale transcript error. The lock covers only the re-read and the write,
+    and gives up after half a second, because a hook must exit fast. The lock is a nicety: when it can't be
+    had (a stuck holder, an unwritable lock file) the state is still saved, as losing the event would be worse."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        lock = open(STATE_DIR / ".lock", "a")
+    except OSError:
+        lock = None
+    try:
+        for _ in range(50 if lock else 0):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.01)
+        saved = load_json(path, {}).get("active_ts") or 0
+        if saved > (state.get("active_ts") or 0):
+            state["active_ts"] = saved
+        save_json(path, state)
+    finally:
+        if lock:
+            lock.close()  # releases the lock
+
+
 def cmd_hook(_args):
     try:
         data = json.load(sys.stdin)
@@ -4123,6 +4156,7 @@ def cmd_hook(_args):
         state["status"] = "stopped"
     elif event in ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure"):
         state["status"] = "working"
+        state["active_ts"] = state["ts"]  # the session did something; Stop and SessionEnd don't count
         state.pop("message", None)
     elif event == "PermissionRequest":
         state["status"] = "permission"
@@ -4154,7 +4188,7 @@ def cmd_hook(_args):
             inbox_clear_session(sid, keep_pr=event == "SessionEnd")
         except OSError:
             pass
-    save_json(path, state)
+    save_hook_state(path, state)
     close_requests(sid, event, data)
     if event == "PermissionRequest":
         decision = wait_for_approval(sid, data, state)
